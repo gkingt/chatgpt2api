@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
 from threading import Condition, Lock
 from typing import Any
 from datetime import datetime
+
+from curl_cffi import requests
 
 from services.config import config
 from services.log_service import (
     LOG_TYPE_ACCOUNT,
     log_service,
 )
+from services.proxy_service import proxy_settings
 from services.storage.base import StorageBackend
 from utils.helper import anonymize_token
 
@@ -69,9 +74,151 @@ class AccountService:
         normalized["last_used_at"] = normalized.get("last_used_at")
         return normalized
 
+    @staticmethod
+    def _decode_jwt_payload(token: str) -> dict[str, Any]:
+        try:
+            payload = token.split(".")[1]
+            padding = 4 - len(payload) % 4
+            if padding != 4:
+                payload += "=" * padding
+            decoded = json.loads(base64.urlsafe_b64decode(payload))
+            return decoded if isinstance(decoded, dict) else {}
+        except Exception:
+            return {}
+
+    def _exchange_refresh_token(self, refresh_token: str) -> dict[str, Any]:
+        candidate = str(refresh_token or "").strip()
+        if not candidate:
+            raise RuntimeError("refresh_token is empty")
+        session = requests.Session(**proxy_settings.build_session_kwargs(
+            impersonate="edge101",
+            verify=True,
+        ))
+        try:
+            response = session.post(
+                "https://auth.openai.com/oauth/token",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": candidate,
+                    "client_id": "app_2SKx67EdpoN0G6j64rFvigXD",
+                    "redirect_uri": "https://platform.openai.com/auth/callback",
+                },
+                timeout=60,
+            )
+        finally:
+            session.close()
+
+        body: dict[str, Any]
+        try:
+            body = response.json()
+            if not isinstance(body, dict):
+                body = {}
+        except Exception:
+            body = {}
+
+        if response.status_code != 200:
+            raw_text = str(getattr(response, "text", "") or "")
+            if len(raw_text) > 1200:
+                raw_text = f"{raw_text[:1200]}...<truncated>"
+            raise RuntimeError(f"oauth_refresh_http_{response.status_code}, body={raw_text}")
+
+        new_access_token = str(body.get("access_token") or "").strip()
+        if not new_access_token:
+            raise RuntimeError("oauth_refresh_missing_access_token")
+        payload = self._decode_jwt_payload(str(body.get("id_token") or "")) or self._decode_jwt_payload(new_access_token)
+        return {
+            "email": str(payload.get("email") or "").strip(),
+            "access_token": new_access_token,
+            "refresh_token": str(body.get("refresh_token") or "").strip(),
+            "id_token": str(body.get("id_token") or "").strip(),
+        }
+
+    def _apply_refreshed_tokens_locked(self, old_access_token: str, refreshed: dict[str, Any]) -> dict | None:
+        current = self._accounts.get(old_access_token)
+        if current is None:
+            return None
+        new_access_token = str(refreshed.get("access_token") or "").strip()
+        if not new_access_token:
+            return None
+
+        target_existing = self._accounts.get(new_access_token) if new_access_token != old_access_token else None
+        merged = {
+            **(target_existing or {}),
+            **current,
+            "access_token": new_access_token,
+            "email": str(refreshed.get("email") or current.get("email") or "").strip() or current.get("email"),
+            "refresh_token": str(refreshed.get("refresh_token") or current.get("refresh_token") or "").strip(),
+            "id_token": str(refreshed.get("id_token") or current.get("id_token") or "").strip(),
+            "status": "正常" if str(current.get("status") or "") == "异常" else current.get("status"),
+            "last_used_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        account = self._normalize_account(merged)
+        if account is None:
+            return None
+
+        if new_access_token != old_access_token:
+            self._accounts.pop(old_access_token, None)
+        self._accounts[new_access_token] = account
+
+        inflight = int(self._image_inflight.pop(old_access_token, 0))
+        if inflight:
+            self._image_inflight[new_access_token] = int(self._image_inflight.get(new_access_token, 0)) + inflight
+
+        self._save_accounts()
+        return dict(account)
+
+    def try_refresh_access_token(self, access_token: str, event: str) -> str:
+        old_access_token = str(access_token or "").strip()
+        if not old_access_token:
+            return ""
+
+        with self._lock:
+            current = self._accounts.get(old_access_token)
+            refresh_token = str((current or {}).get("refresh_token") or "").strip()
+        if not refresh_token:
+            return ""
+
+        try:
+            refreshed = self._exchange_refresh_token(refresh_token)
+        except Exception as exc:
+            log_service.add(LOG_TYPE_ACCOUNT, "refresh_token 刷新 access_token 失败", {
+                "source": event,
+                "token": anonymize_token(old_access_token),
+                "error": str(exc),
+            })
+            return ""
+
+        with self._lock:
+            updated = self._apply_refreshed_tokens_locked(old_access_token, refreshed)
+        if not updated:
+            return ""
+
+        new_access_token = str(updated.get("access_token") or "").strip()
+        if not new_access_token or new_access_token == old_access_token:
+            log_service.add(LOG_TYPE_ACCOUNT, "refresh_token 刷新未更换 access_token", {
+                "source": event,
+                "token": anonymize_token(old_access_token),
+            })
+            return ""
+        log_service.add(LOG_TYPE_ACCOUNT, "refresh_token 自动刷新 access_token 成功", {
+            "source": event,
+            "old_token": anonymize_token(old_access_token),
+            "new_token": anonymize_token(new_access_token),
+        })
+        return new_access_token
+
     def list_tokens(self) -> list[str]:
         with self._lock:
             return list(self._accounts)
+
+    def list_refreshable_tokens(self) -> list[str]:
+        with self._lock:
+            return [
+                token
+                for token, account in self._accounts.items()
+                if str((account or {}).get("refresh_token") or "").strip()
+            ]
 
     def _list_ready_candidate_tokens(self, excluded_tokens: set[str] | None = None) -> list[str]:
         excluded = set(excluded_tokens or set())
@@ -305,6 +452,10 @@ class AccountService:
             from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
             result = OpenAIBackendAPI(access_token).get_user_info()
         except InvalidAccessTokenError:
+            refreshed_access_token = self.try_refresh_access_token(access_token, event)
+            if refreshed_access_token:
+                result = OpenAIBackendAPI(refreshed_access_token).get_user_info()
+                return self.update_account(refreshed_access_token, result)
             self.remove_invalid_token(access_token, event)
             raise
         return self.update_account(access_token, result)

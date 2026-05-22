@@ -89,6 +89,7 @@ def _normalize_backup_state(value: object) -> dict[str, object]:
 class LoadedSettings:
     auth_key: str
     refresh_account_interval_minute: int
+    access_token_renew_interval_days: int
 
 
 def _normalize_auth_key(value: object) -> str:
@@ -129,10 +130,15 @@ def _load_settings() -> LoadedSettings:
         refresh_interval = int(raw_config.get("refresh_account_interval_minute", 5))
     except (TypeError, ValueError):
         refresh_interval = 5
+    try:
+        renew_days = max(1, int(raw_config.get("access_token_renew_interval_days", 3)))
+    except (TypeError, ValueError):
+        renew_days = 3
 
     return LoadedSettings(
         auth_key=auth_key,
         refresh_account_interval_minute=refresh_interval,
+        access_token_renew_interval_days=renew_days,
     )
 
 
@@ -172,6 +178,13 @@ class ConfigStore:
             return int(self.data.get("refresh_account_interval_minute", 5))
         except (TypeError, ValueError):
             return 5
+
+    @property
+    def access_token_renew_interval_days(self) -> int:
+        try:
+            return max(1, int(self.data.get("access_token_renew_interval_days", 3)))
+        except (TypeError, ValueError):
+            return 3
 
     @property
     def image_retention_days(self) -> int:
@@ -265,6 +278,19 @@ class ConfigStore:
         ).strip().rstrip("/")
 
     @property
+    def upstream_base_url(self) -> str:
+        value = str(
+            os.getenv("CHATGPT2API_UPSTREAM_BASE_URL")
+            or self.data.get("upstream_base_url")
+            or "https://chatgpt.com"
+        ).strip()
+        if not value:
+            value = "https://chatgpt.com"
+        if not value.startswith(("http://", "https://")):
+            value = f"https://{value}"
+        return value.rstrip("/")
+
+    @property
     def app_version(self) -> str:
         try:
             value = VERSION_FILE.read_text(encoding="utf-8").strip()
@@ -275,6 +301,7 @@ class ConfigStore:
     def get(self) -> dict[str, object]:
         data = dict(self.data)
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
+        data["access_token_renew_interval_days"] = self.access_token_renew_interval_days
         data["image_retention_days"] = self.image_retention_days
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
         data["image_account_concurrency"] = self.image_account_concurrency
@@ -284,6 +311,7 @@ class ConfigStore:
         data["sensitive_words"] = self.sensitive_words
         data["ai_review"] = self.ai_review
         data["global_system_prompt"] = self.global_system_prompt
+        data["upstream_base_url"] = self.upstream_base_url
         data["backup"] = self.get_backup_settings()
         data.pop("auth-key", None)
         return data

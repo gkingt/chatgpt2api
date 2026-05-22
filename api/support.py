@@ -98,6 +98,36 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
     return thread
 
 
+def start_access_token_renew_watcher(stop_event: Event) -> Thread:
+    interval_seconds = max(60, int(config.access_token_renew_interval_days) * 86400)
+
+    def worker() -> None:
+        while not stop_event.is_set():
+            refreshed = 0
+            attempted = 0
+            try:
+                tokens = account_service.list_refreshable_tokens()
+                if tokens:
+                    print(f"[access-token-renew-watcher] checking {len(tokens)} refreshable accounts")
+                for token in tokens:
+                    if stop_event.is_set():
+                        break
+                    attempted += 1
+                    if account_service.try_refresh_access_token(token, "scheduled_renew"):
+                        refreshed += 1
+                if attempted:
+                    print(
+                        f"[access-token-renew-watcher] done attempted={attempted}, refreshed={refreshed}, unchanged_or_failed={attempted - refreshed}"
+                    )
+            except Exception as exc:
+                print(f"[access-token-renew-watcher] fail {exc}")
+            stop_event.wait(interval_seconds)
+
+    thread = Thread(target=worker, name="access-token-renew-watcher", daemon=True)
+    thread.start()
+    return thread
+
+
 def resolve_web_asset(requested_path: str) -> Path | None:
     if not WEB_DIST_DIR.exists():
         return None

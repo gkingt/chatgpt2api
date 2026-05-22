@@ -46,7 +46,14 @@ def _xor_string(text: str, key: str) -> str:
     return "".join(chr(ord(ch) ^ ord(key[i % len(key)])) for i, ch in enumerate(text))
 
 
-def solve_turnstile_token(dx: str, p: str) -> Optional[str]:
+def _normalize_base_url(value: str) -> str:
+    normalized = str(value or "https://chatgpt.com").strip() or "https://chatgpt.com"
+    if not normalized.startswith(("http://", "https://")):
+        normalized = f"https://{normalized}"
+    return normalized.rstrip("/")
+
+
+def solve_turnstile_token(dx: str, p: str, base_url: str = "https://chatgpt.com") -> Optional[str]:
     try:
         decoded = base64.b64decode(dx).decode()
         token_list = json.loads(_xor_string(decoded, p))
@@ -56,6 +63,7 @@ def solve_turnstile_token(dx: str, p: str) -> Optional[str]:
     process_map: Dict[Any, Any] = {}
     start_time = time.time()
     result = ""
+    location_origin = _normalize_base_url(base_url)
 
     def func_1(e: float, t: float) -> None:
         process_map[e] = _xor_string(_turnstile_to_str(process_map[e]), _turnstile_to_str(process_map[t]))
@@ -83,7 +91,7 @@ def solve_turnstile_token(dx: str, p: str) -> Optional[str]:
         nv = process_map[n]
         if isinstance(tv, str) and isinstance(nv, str):
             value = f"{tv}.{nv}"
-            process_map[e] = "https://chatgpt.com/" if value == "window.document.location" else value
+            process_map[e] = f"{location_origin}/" if value == "window.document.location" else value
 
     def func_7(e: float, *args: float) -> None:
         target = process_map[e]

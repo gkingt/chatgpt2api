@@ -37,7 +37,7 @@ def test_proxy(url: str, *, timeout: float = 15.0) -> dict:
     started = time.perf_counter()
     try:
         response = session.get(
-            "https://chatgpt.com/api/auth/csrf",
+            f"{config.upstream_base_url}/api/auth/csrf",
             headers={"user-agent": "Mozilla/5.0 (chatgpt2api proxy test)"},
             timeout=timeout,
         )

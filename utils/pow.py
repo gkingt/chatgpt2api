@@ -9,12 +9,18 @@ from typing import Any, Sequence
 
 import pybase64
 
-DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
 from utils.helper import new_uuid
 
 
 CORES = [8, 16, 24, 32]
 DOCUMENT_KEYS = ["_reactListeningo743lnnpvdg", "location"]
+
+
+def default_pow_script(base_url: str = "https://chatgpt.com") -> str:
+    normalized = str(base_url or "https://chatgpt.com").strip() or "https://chatgpt.com"
+    if not normalized.startswith(("http://", "https://")):
+        normalized = f"https://{normalized}"
+    return f"{normalized.rstrip('/')}/backend-api/sentinel/sdk.js"
 
 
 class ScriptSrcParser(HTMLParser):
@@ -36,10 +42,10 @@ class ScriptSrcParser(HTMLParser):
             self.data_build = match.group(0)
 
 
-def parse_pow_resources(html_content: str) -> tuple[list[str], str]:
+def parse_pow_resources(html_content: str, base_url: str = "https://chatgpt.com") -> tuple[list[str], str]:
     parser = ScriptSrcParser()
     parser.feed(html_content)
-    script_sources = parser.script_sources or [DEFAULT_POW_SCRIPT]
+    script_sources = parser.script_sources or [default_pow_script(base_url)]
     data_build = parser.data_build
     if not data_build:
         match = re.search(r'<html[^>]*data-build="([^"]*)"', html_content)
@@ -57,6 +63,7 @@ def build_pow_config(
     user_agent: str,
     script_sources: Sequence[str] | None = None,
     data_build: str = "",
+    base_url: str = "https://chatgpt.com",
 ) -> list[Any]:
     navigator_key = random.choice([
         "registerProtocolHandler−function registerProtocolHandler() { [native code] }",
@@ -139,7 +146,7 @@ def build_pow_config(
         "__BUILD_MANIFEST",
         "__NEXT_PRELOADREADY",
     ])
-    script_source = random.choice(list(script_sources)) if script_sources else DEFAULT_POW_SCRIPT
+    script_source = random.choice(list(script_sources)) if script_sources else default_pow_script(base_url)
     return [
         random.choice([3000, 4000, 5000]),
         _legacy_parse_time(),
@@ -183,9 +190,10 @@ def build_legacy_requirements_token(
     user_agent: str,
     script_sources: Sequence[str] | None = None,
     data_build: str = "",
+    base_url: str = "https://chatgpt.com",
 ) -> str:
     seed = format(random.random())
-    config = build_pow_config(user_agent, script_sources=script_sources, data_build=data_build)
+    config = build_pow_config(user_agent, script_sources=script_sources, data_build=data_build, base_url=base_url)
     answer, _ = _pow_generate(seed, "0fffff", config)
     return "gAAAAAC" + answer
 
@@ -196,8 +204,9 @@ def build_proof_token(
     user_agent: str,
     script_sources: Sequence[str] | None = None,
     data_build: str = "",
+    base_url: str = "https://chatgpt.com",
 ) -> str:
-    config = build_pow_config(user_agent, script_sources=script_sources, data_build=data_build)
+    config = build_pow_config(user_agent, script_sources=script_sources, data_build=data_build, base_url=base_url)
     answer, solved = _pow_generate(seed, difficulty, config)
     if not solved:
         raise RuntimeError(f"failed to solve proof token: difficulty={difficulty}")

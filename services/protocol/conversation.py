@@ -501,6 +501,10 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
         except Exception as exc:
             error_message = str(exc)
             if token and not emitted and is_token_invalid_error(error_message):
+                refreshed_token = account_service.try_refresh_access_token(token, "text_stream")
+                if refreshed_token:
+                    token = refreshed_token
+                    continue
                 account_service.remove_invalid_token(token, "text_stream")
                 token = account_service.get_text_access_token(attempted_tokens)
                 if token:
@@ -632,6 +636,9 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
                 last_error = str(exc)
                 logger.warning({"event": "image_stream_fail", "request_token": token, "error": last_error})
                 if not emitted_for_token and is_token_invalid_error(last_error):
+                    refreshed_token = account_service.try_refresh_access_token(token, "image_stream")
+                    if refreshed_token:
+                        continue
                     account_service.remove_invalid_token(token, "image_stream")
                     continue
                 raise ImageGenerationError(image_stream_error_message(last_error)) from exc

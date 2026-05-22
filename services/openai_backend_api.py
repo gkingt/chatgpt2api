@@ -36,7 +36,6 @@ class ChatRequirements:
 
 DEFAULT_CLIENT_VERSION = "prod-be885abbfcfe7b1f511e88b3003d9ee44757fbad"
 DEFAULT_CLIENT_BUILD_NUMBER = "5955942"
-DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
 
 
@@ -58,7 +57,7 @@ class OpenAIBackendAPI:
         参数：
         - `access_token`：可选。传入后表示使用已登录链路；不传则使用未登录链路。
         """
-        self.base_url = "https://chatgpt.com"
+        self.base_url = config.upstream_base_url
         self.client_version = DEFAULT_CLIENT_VERSION
         self.client_build_number = DEFAULT_CLIENT_BUILD_NUMBER
         self.access_token = access_token
@@ -257,12 +256,13 @@ class OpenAIBackendAPI:
                 self.user_agent,
                 script_sources=self.pow_script_sources,
                 data_build=self.pow_data_build,
+                base_url=self.base_url,
             )
 
         turnstile_token = ""
         turnstile_info = data.get("turnstile") or {}
         if turnstile_info.get("required") and turnstile_info.get("dx"):
-            turnstile_token = solve_turnstile_token(turnstile_info["dx"], source_p) or ""
+            turnstile_token = solve_turnstile_token(turnstile_info["dx"], source_p, base_url=self.base_url) or ""
 
         return ChatRequirements(
             token=data.get("token", ""),
@@ -842,15 +842,22 @@ class OpenAIBackendAPI:
             timeout=30,
         )
         ensure_ok(response, "bootstrap")
-        self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
+        self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text, base_url=self.base_url)
         if not self.pow_script_sources:
-            self.pow_script_sources = [DEFAULT_POW_SCRIPT]
+            self.pow_script_sources = [f"{self.base_url}/backend-api/sentinel/sdk.js"]
 
     def _get_chat_requirements(self) -> ChatRequirements:
         """获取当前模式对话所需的 sentinel token。"""
         path = "/backend-api/sentinel/chat-requirements" if self.access_token else "/backend-anon/sentinel/chat-requirements"
         context = "auth_chat_requirements" if self.access_token else "noauth_chat_requirements"
-        body = {"p": build_legacy_requirements_token(self.user_agent, self.pow_script_sources, self.pow_data_build)}
+        body = {
+            "p": build_legacy_requirements_token(
+                self.user_agent,
+                self.pow_script_sources,
+                self.pow_data_build,
+                base_url=self.base_url,
+            )
+        }
         response = self.session.post(
             self.base_url + path,
             headers=self._headers(path, {"Content-Type": "application/json"}),
