@@ -634,14 +634,27 @@ class PlatformRegistrar:
             # 处理可能的 invalid_state (409) 冲突
             if resp is not None and resp.status_code == 409:
                 step(index, "邮箱提交 invalid_state，重新 authorize 后重试")
-                login_session.cookies.clear(domain=".auth.openai.com")
-                login_session.cookies.clear(domain="auth.openai.com")
+                # requests/cookiejar 在 domain 不存在时可能抛异常，这里做安全清理
+                try:
+                    for cookie in list(login_session.cookies):
+                        domain = str(getattr(cookie, "domain", "") or "")
+                        if "auth.openai.com" not in domain:
+                            continue
+                        try:
+                            login_session.cookies.clear(domain=domain, path=cookie.path, name=cookie.name)
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
                 login_session.cookies.set("oai-did", login_device_id, domain=".auth.openai.com")
                 login_session.cookies.set("oai-did", login_device_id, domain="auth.openai.com")
                 resp, error = request_with_local_retry(login_session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=self._navigate_headers(f"{platform_base}/"), allow_redirects=True, verify=False)
                 if resp is None:
                     raise RuntimeError(error or "platform_login_authorize_retry_failed")
                 resp, error = _do_authorize_continue()
+                if resp is not None and resp.status_code == 409:
+                    detail = _response_error_detail(resp, 1200)
+                    raise RuntimeError(f"email_submit_http_409_invalid_state_after_retry{', ' + detail if detail else ''}")
 
             if resp is None or resp.status_code != 200:
                 data = _response_json(resp) if resp is not None else {}
