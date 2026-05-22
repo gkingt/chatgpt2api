@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
+from urllib.parse import urljoin, urlparse
 
 from curl_cffi import requests
 from PIL import Image
@@ -841,6 +842,19 @@ class OpenAIBackendAPI:
         })
         return urls
 
+    def _normalize_download_url(self, url: str) -> str:
+        candidate = str(url or "").strip()
+        if not candidate:
+            return ""
+        if candidate.startswith("//"):
+            candidate = f"https:{candidate}"
+        elif candidate.startswith("/"):
+            candidate = urljoin(self.base_url + "/", candidate)
+        parsed = urlparse(candidate)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return ""
+        return candidate
+
     def resolve_conversation_image_urls(
             self,
             conversation_id: str,
@@ -860,7 +874,14 @@ class OpenAIBackendAPI:
 
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         images = []
-        for url in urls:
+        for raw_url in urls:
+            url = self._normalize_download_url(raw_url)
+            if not url:
+                logger.warning({
+                    "event": "image_download_url_invalid",
+                    "raw_url": str(raw_url or ""),
+                })
+                continue
             response = self.session.get(url, timeout=120)
             ensure_ok(response, "image_download")
             images.append(response.content)
