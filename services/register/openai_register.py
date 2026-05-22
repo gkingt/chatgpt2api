@@ -733,6 +733,11 @@ def worker(index: int) -> dict:
         cost = time.time() - start
         access_token = str(result["access_token"])
         account_service.add_account_items([result])
+        account_service.update_account(access_token, {
+            "email": str(result.get("email") or "").strip() or None,
+            "refresh_token": str(result.get("refresh_token") or "").strip(),
+            "id_token": str(result.get("id_token") or "").strip(),
+        })
         account_service.refresh_accounts([access_token])
         with stats_lock:
             stats["done"] += 1

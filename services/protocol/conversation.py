@@ -50,6 +50,9 @@ def is_token_invalid_error(message: str) -> bool:
         or "token_revoked" in text
         or "authentication token has been invalidated" in text
         or "invalidated oauth token" in text
+        or "http 401" in text
+        or "unauthorized" in text
+        or "invalid accesstoken" in text
     )
 
 
