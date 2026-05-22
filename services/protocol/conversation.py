@@ -1,19 +1,18 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import re
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 import tiktoken
 
 from services.account_service import account_service
 from services.config import config
-from services.openai_backend_api import OpenAIBackendAPI
+from services.image_storage_service import image_storage_service
+from services.openai_backend_api import ImagePollTimeoutError, OpenAIBackendAPI
 from utils.helper import IMAGE_MODELS, extract_image_from_message_content
 from utils.log import logger
 
@@ -57,6 +56,8 @@ def is_token_invalid_error(message: str) -> bool:
 def image_stream_error_message(message: str) -> str:
     text = str(message or "")
     lower = text.lower()
+    if is_token_invalid_error(text):
+        return "image generation failed"
     if "curl: (35)" in lower or "tls connect error" in lower or "openssl_internal" in lower:
         return "upstream image connection failed, please retry later"
     return text or "image generation failed"
@@ -67,14 +68,7 @@ def encode_images(images: Iterable[tuple[bytes, str, str]]) -> list[str]:
 
 
 def save_image_bytes(image_data: bytes, base_url: str | None = None) -> str:
-    config.cleanup_old_images()
-    file_hash = hashlib.md5(image_data).hexdigest()
-    filename = f"{int(time.time())}_{file_hash}.png"
-    relative_dir = Path(time.strftime("%Y"), time.strftime("%m"), time.strftime("%d"))
-    file_path = config.images_dir / relative_dir / filename
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_path.write_bytes(image_data)
-    return f"{(base_url or config.base_url)}/images/{relative_dir.as_posix()}/{filename}"
+    return image_storage_service.save(image_data, base_url).url
 
 
 def message_text(content: Any) -> str:
@@ -362,7 +356,8 @@ def add_unique(values: list[str], candidates: list[str]) -> None:
 def extract_conversation_ids(payload: str) -> tuple[str, list[str], list[str]]:
     conversation_match = re.search(r'"conversation_id"\s*:\s*"([^"]+)"', payload)
     conversation_id = conversation_match.group(1) if conversation_match else ""
-    file_ids = re.findall(r"(file[-_][A-Za-z0-9]+)", payload)
+    # Negative lookahead excludes "file-service" (URI prefix, not a real id).
+    file_ids = re.findall(r"(file[-_](?!service\b)[A-Za-z0-9]+)", payload)
     sediment_ids = re.findall(r"sediment://([A-Za-z0-9_-]+)", payload)
     return conversation_id, file_ids, sediment_ids
 
@@ -374,14 +369,39 @@ def is_image_tool_event(event: dict[str, Any]) -> bool:
         return False
     metadata = message.get("metadata") or {}
     author = message.get("author") or {}
-    return author.get("role") == "tool" and metadata.get("async_task_type") == "image_gen"
+    content = message.get("content") or {}
+    if author.get("role") != "tool":
+        return False
+    if metadata.get("async_task_type") == "image_gen":
+        return True
+    if content.get("content_type") != "multimodal_text":
+        return False
+    return any(
+        isinstance(part, dict) and (
+                part.get("content_type") == "image_asset_pointer"
+                or str(part.get("asset_pointer") or "").startswith(("file-service://", "sediment://"))
+        )
+        for part in content.get("parts") or []
+    )
 
 
 def update_conversation_state(state: ConversationState, payload: str, event: dict[str, Any] | None = None) -> None:
     conversation_id, file_ids, sediment_ids = extract_conversation_ids(payload)
     if conversation_id and not state.conversation_id:
         state.conversation_id = conversation_id
-    if isinstance(event, dict) and is_image_tool_event(event):
+    # Accept file_id / sediment_id when any of:
+    #   1) event is a complete image_gen tool message
+    #   2) prior server_ste_metadata already flipped tool_invoked True (in an image_gen turn)
+    #   3) patch event whose payload references asset_pointer / file-service://
+    # User messages (type=conversation.message) never satisfy these, so attacker-controlled
+    # substrings in user input cannot inject file ids into state.
+    is_patch_event = isinstance(event, dict) and event.get("o") == "patch"
+    image_context = (
+        (isinstance(event, dict) and is_image_tool_event(event))
+        or state.tool_invoked is True
+        or (is_patch_event and ("asset_pointer" in payload or "file-service://" in payload))
+    )
+    if image_context:
         add_unique(state.file_ids, file_ids)
         add_unique(state.sediment_ids, sediment_ids)
     if not isinstance(event, dict):
@@ -556,7 +576,6 @@ def stream_image_outputs(
     file_ids = [str(item) for item in last.get("file_ids") or []]
     sediment_ids = [str(item) for item in last.get("sediment_ids") or []]
     message = str(last.get("text") or "").strip()
-    is_text_response = last.get("tool_invoked") is False or last.get("turn_use_case") == "text"
     logger.info({
         "event": "image_stream_resolve_start",
         "conversation_id": conversation_id,
@@ -565,7 +584,11 @@ def stream_image_outputs(
         "tool_invoked": last.get("tool_invoked"),
         "turn_use_case": last.get("turn_use_case"),
     })
-    if message and not file_ids and not sediment_ids and (last.get("blocked") or is_text_response):
+    if message and not file_ids and not sediment_ids and last.get("blocked"):
+        yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=message)
+        return
+    should_poll_for_image = bool(request.images) or last.get("turn_use_case") == "image gen"
+    if message and not file_ids and not sediment_ids and not should_poll_for_image:
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=message)
         return
 
@@ -628,6 +651,8 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
                     return
                 account_service.mark_image_result(token, True)
                 break
+            except ImagePollTimeoutError:
+                raise
             except ImageGenerationError:
                 account_service.mark_image_result(token, False)
                 raise
@@ -644,6 +669,8 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
                 raise ImageGenerationError(image_stream_error_message(last_error)) from exc
 
     if not emitted:
+        if not last_error:
+            last_error = "no account in the pool could generate images — check account quota and rate-limit status"
         raise ImageGenerationError(image_stream_error_message(last_error))
 
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { LoaderCircle, PlugZap, Save } from "lucide-react";
+import { Cloud, LoaderCircle, PlugZap, RefreshCw, Save } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
 
@@ -8,7 +8,9 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import type { ImageStorageMode } from "@/lib/api";
 import { testProxy, type ProxyTestResult } from "@/lib/api";
 
 import { useSettingsStore } from "../store";
@@ -32,6 +34,11 @@ export function ConfigCard() {
   const setGlobalSystemPrompt = useSettingsStore((state) => state.setGlobalSystemPrompt);
   const setSensitiveWordsText = useSettingsStore((state) => state.setSensitiveWordsText);
   const setAIReviewField = useSettingsStore((state) => state.setAIReviewField);
+  const setImageStorageField = useSettingsStore((state) => state.setImageStorageField);
+  const testImageStorage = useSettingsStore((state) => state.testImageStorage);
+  const syncImagesToWebDAV = useSettingsStore((state) => state.syncImagesToWebDAV);
+  const isTestingImageStorage = useSettingsStore((state) => state.isTestingImageStorage);
+  const isSyncingImageStorage = useSettingsStore((state) => state.isSyncingImageStorage);
   const saveConfig = useSettingsStore((state) => state.saveConfig);
 
   const handleTestProxy = async () => {
@@ -212,6 +219,124 @@ export function ConfigCard() {
               className="min-h-28 rounded-xl border-stone-200 bg-white font-mono text-xs shadow-none"
             />
             <p className="text-xs text-stone-500">只要用户请求包含任意敏感词，就直接返回拒绝。</p>
+          </div>
+          <div className="space-y-4 rounded-xl border border-stone-200 bg-white px-4 py-3 md:col-span-2">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <label className="flex items-center gap-3 text-sm text-stone-700">
+                <Checkbox
+                  checked={Boolean(config?.image_storage?.enabled)}
+                  onCheckedChange={(checked) => setImageStorageField("enabled", Boolean(checked))}
+                />
+                启用 WebDAV 图片存储
+              </label>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="h-9 rounded-xl border-stone-200 bg-white px-4 text-stone-700"
+                  onClick={() => void testImageStorage()}
+                  disabled={isTestingImageStorage || !config?.image_storage?.enabled}
+                >
+                  {isTestingImageStorage ? <LoaderCircle className="size-4 animate-spin" /> : <Cloud className="size-4" />}
+                  测试 WebDAV
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="h-9 rounded-xl border-stone-200 bg-white px-4 text-stone-700"
+                  onClick={() => void syncImagesToWebDAV()}
+                  disabled={isSyncingImageStorage || !config?.image_storage?.enabled || config?.image_storage?.mode === "local"}
+                >
+                  {isSyncingImageStorage ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+                  全量同步
+                </Button>
+              </div>
+            </div>
+            <p className="text-xs leading-6 text-stone-500">
+              生成时只处理本次新图片；全量同步用于把已有本地图片补传到 WebDAV。
+            </p>
+            <div className="rounded-lg border border-stone-100 bg-stone-50 px-3 py-2 text-xs text-stone-600">
+              当前待保存模式：
+              <span className="ml-1 font-medium text-stone-900">
+                {config?.image_storage?.enabled
+                  ? config.image_storage.mode === "both"
+                    ? "本机 + WebDAV"
+                    : config.image_storage.mode === "webdav"
+                      ? "仅 WebDAV"
+                      : "仅本机"
+                  : "仅本机"}
+              </span>
+              <span className="ml-2 text-stone-400">修改后需要点保存，或通过测试/同步按钮自动保存。</span>
+            </div>
+            <div className="grid gap-4 md:grid-cols-3">
+              <div className="space-y-2">
+                <label className="text-sm text-stone-700">保存模式</label>
+                <Select
+                  value={String(config?.image_storage?.mode || "local")}
+                  onValueChange={(value) => setImageStorageField("mode", value as ImageStorageMode)}
+                  disabled={!config?.image_storage?.enabled}
+                >
+                  <SelectTrigger className="h-10 rounded-xl border-stone-200 bg-white shadow-none">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="local">仅本机</SelectItem>
+                    <SelectItem value="webdav">仅 WebDAV</SelectItem>
+                    <SelectItem value="both">本机 + WebDAV</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2 md:col-span-2">
+                <label className="text-sm text-stone-700">WebDAV URL</label>
+                <Input
+                  value={String(config?.image_storage?.webdav_url || "")}
+                  onChange={(event) => setImageStorageField("webdav_url", event.target.value)}
+                  placeholder="https://example.com/dav"
+                  className="h-10 rounded-xl border-stone-200 bg-white"
+                  disabled={!config?.image_storage?.enabled}
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm text-stone-700">用户名</label>
+                <Input
+                  value={String(config?.image_storage?.webdav_username || "")}
+                  onChange={(event) => setImageStorageField("webdav_username", event.target.value)}
+                  className="h-10 rounded-xl border-stone-200 bg-white"
+                  disabled={!config?.image_storage?.enabled}
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm text-stone-700">密码</label>
+                <Input
+                  type="password"
+                  value={String(config?.image_storage?.webdav_password || "")}
+                  onChange={(event) => setImageStorageField("webdav_password", event.target.value)}
+                  className="h-10 rounded-xl border-stone-200 bg-white"
+                  disabled={!config?.image_storage?.enabled}
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm text-stone-700">远端目录</label>
+                <Input
+                  value={String(config?.image_storage?.webdav_root_path || "")}
+                  onChange={(event) => setImageStorageField("webdav_root_path", event.target.value)}
+                  placeholder="chatgpt2api/images"
+                  className="h-10 rounded-xl border-stone-200 bg-white"
+                  disabled={!config?.image_storage?.enabled}
+                />
+              </div>
+              <div className="space-y-2 md:col-span-3">
+                <label className="text-sm text-stone-700">公开访问前缀</label>
+                <Input
+                  value={String(config?.image_storage?.public_base_url || "")}
+                  onChange={(event) => setImageStorageField("public_base_url", event.target.value)}
+                  placeholder="https://cdn.example.com/chatgpt2api/images"
+                  className="h-10 rounded-xl border-stone-200 bg-white"
+                  disabled={!config?.image_storage?.enabled}
+                />
+                <p className="text-xs text-stone-500">留空时返回本应用 /images/... 代理地址；填入后直接返回公开图片地址。</p>
+              </div>
+            </div>
           </div>
           <div className="space-y-4 rounded-xl border border-stone-200 bg-white px-4 py-3 md:col-span-2">
             <label className="flex items-center gap-3 text-sm text-stone-700">

@@ -446,7 +446,7 @@ def exchange_platform_tokens(session: requests.Session, device_id: str, code_ver
 
     if not callback_params:
         raise RuntimeError(f"oauth_callback_failed (all methods failed): {callback_error}")
-        
+
     code = str(callback_params.get("code") or "").strip()
     if not code:
         raise RuntimeError("oauth_callback_missing_code")
@@ -552,7 +552,12 @@ class PlatformRegistrar:
         step(index, f"开始校验验证码 {code}")
         resp, error = validate_otp(self.session, self.device_id, code)
         if resp is None or resp.status_code != 200:
-            raise RuntimeError(error or f"validate_otp_http_{getattr(resp, 'status_code', 'unknown')}")
+            body = ""
+            try:
+                body = (resp.text or "")[:500] if resp is not None else ""
+            except Exception:
+                pass
+            raise RuntimeError(error or f"validate_otp_http_{getattr(resp, 'status_code', 'unknown')}_body={body}")
         step(index, "验证码校验完成")
 
     def _create_account(self, name: str, birthdate: str, index: int) -> str:
@@ -637,7 +642,7 @@ class PlatformRegistrar:
                 if resp is None:
                     raise RuntimeError(error or "platform_login_authorize_retry_failed")
                 resp, error = _do_authorize_continue()
-                
+
             if resp is None or resp.status_code != 200:
                 data = _response_json(resp) if resp is not None else {}
                 detail = json.dumps(data, ensure_ascii=False) if data else ""
@@ -694,7 +699,8 @@ class PlatformRegistrar:
         email = str(mailbox.get("address") or "").strip()
         if not email:
             raise RuntimeError("邮箱服务未返回 address")
-        step(index, f"邮箱创建完成: {email}")
+        label = str(mailbox.get("label") or "")
+        step(index, f"邮箱创建完成[{label}]: {email}")
         password = _random_password()
         first_name, last_name = _random_name()
         code_verifier = self._platform_authorize(email, index)
@@ -726,12 +732,7 @@ def worker(index: int) -> dict:
         result = registrar.register(index)
         cost = time.time() - start
         access_token = str(result["access_token"])
-        account_service.add_accounts([access_token])
-        account_service.update_account(access_token, {
-            "email": str(result.get("email") or "").strip() or None,
-            "refresh_token": str(result.get("refresh_token") or "").strip(),
-            "id_token": str(result.get("id_token") or "").strip(),
-        })
+        account_service.add_account_items([result])
         account_service.refresh_accounts([access_token])
         with stats_lock:
             stats["done"] += 1

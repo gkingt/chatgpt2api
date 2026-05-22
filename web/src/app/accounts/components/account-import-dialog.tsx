@@ -26,7 +26,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
-import { createAccounts, type Account } from "@/lib/api";
+import { createAccounts, type Account, type AccountImportPayload } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 type ImportMethod = "menu" | "token" | "session" | "cpa";
@@ -38,6 +38,7 @@ type AccountImportDialogProps = {
 
 type PendingCpaImport = {
   tokens: string[];
+  accounts: AccountImportPayload[];
   parsedFileCount: number;
   errorCount: number;
 };
@@ -56,9 +57,27 @@ function getSessionAccessToken(value: unknown) {
   return typeof token === "string" ? token.trim() : "";
 }
 
-function getCpaAccessToken(value: unknown) {
-  const token = (value as { access_token?: unknown })?.access_token;
-  return typeof token === "string" ? token.trim() : "";
+function getCpaAccount(value: unknown): AccountImportPayload | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const raw = value as Record<string, unknown>;
+  const tokenValue = raw.access_token ?? raw.accessToken;
+  const token = typeof tokenValue === "string" ? tokenValue.trim() : "";
+  if (!token) {
+    return null;
+  }
+
+  const payload: AccountImportPayload = {
+    ...raw,
+    access_token: token,
+  };
+  delete payload.accessToken;
+  if (payload.type === "codex") {
+    payload.export_type = "codex";
+    delete payload.type;
+  }
+  return payload;
 }
 
 function readFileAsText(file: File) {
@@ -130,7 +149,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
     }
   };
 
-  const submitTokens = async (tokens: string[], successText?: string) => {
+  const submitTokens = async (tokens: string[], successText?: string, accountPayloads: AccountImportPayload[] = []) => {
     const normalizedTokens = tokens.map((item) => item.trim()).filter(Boolean);
 
     if (normalizedTokens.length === 0) {
@@ -140,7 +159,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
 
     setIsSubmitting(true);
     try {
-      const data = await createAccounts(normalizedTokens);
+      const data = await createAccounts(normalizedTokens, accountPayloads);
       onImported(data.items);
       setOpen(false);
       resetState();
@@ -230,15 +249,16 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
         files.map(async (file) => {
           const raw = await readFileAsText(file);
           const parsed = JSON.parse(raw) as unknown;
-          const token = getCpaAccessToken(parsed);
+          const account = getCpaAccount(parsed);
           return {
-            token,
+            account,
           };
         }),
       );
 
-      const tokens = results.map((item) => item.token).filter((item): item is string => Boolean(item));
-      const parsedFileCount = tokens.length;
+      const accounts = results.map((item) => item.account).filter((item): item is AccountImportPayload => Boolean(item));
+      const tokens = accounts.map((item) => item.access_token);
+      const parsedFileCount = accounts.length;
       const errorCount = results.length - parsedFileCount;
 
       if (parsedFileCount === 0) {
@@ -248,6 +268,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
 
       setPendingCpaImport({
         tokens,
+        accounts,
         parsedFileCount,
         errorCount,
       });
@@ -553,7 +574,13 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
             </Button>
             <Button
               className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
-              onClick={() => void submitTokens(pendingCpaImport?.tokens ?? [], "CPA JSON 导入完成")}
+              onClick={() =>
+                void submitTokens(
+                  pendingCpaImport?.tokens ?? [],
+                  "CPA JSON 导入完成",
+                  pendingCpaImport?.accounts ?? [],
+                )
+              }
               disabled={isSubmitting || !pendingCpaImport}
             >
               {isSubmitting ? <LoaderCircle className="size-4 animate-spin" /> : null}

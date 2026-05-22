@@ -230,7 +230,11 @@ class ImageTaskService:
                 raise RuntimeError("image task returned streaming result unexpectedly")
             data = result.get("data")
             if not isinstance(data, list) or not data:
-                message = _clean(result.get("message")) or "image task returned no image data"
+                upstream = _clean(result.get("message"))
+                if upstream:
+                    message = upstream
+                else:
+                    message = "号池中没有可用账号或所有账号均被限流，请检查号池状态（账号额度、是否被封禁、是否到达生图上限）"
                 raise RuntimeError(message)
             self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, error="")
             self._log_call(

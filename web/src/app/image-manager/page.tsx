@@ -18,6 +18,16 @@ import { useAuthGuard } from "@/lib/use-auth-guard";
 
 const LONG_PRESS_MS = 800;
 
+function storageBadge(item: ManagedImage) {
+  if (item.local && item.webdav) {
+    return { label: "双端", className: "border-sky-200 bg-sky-50 text-sky-700" };
+  }
+  if (item.webdav || item.storage === "webdav") {
+    return { label: "WebDAV", className: "border-violet-200 bg-violet-50 text-violet-700" };
+  }
+  return { label: "本机", className: "border-stone-200 bg-stone-50 text-stone-600" };
+}
+
 function formatSize(size: number) {
   return size > 1024 * 1024 ? `${(size / 1024 / 1024).toFixed(2)} MB` : `${Math.ceil(size / 1024)} KB`;
 }
@@ -364,6 +374,7 @@ function ImageManagerContent() {
           <div className="grid gap-0 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
             {currentRows.map((item) => {
               const imageIndex = filteredItems.findIndex((row) => row.url === item.url);
+              const storage = storageBadge(item);
               return (
               <div key={item.rel} className="group border-r border-b border-stone-100 p-4 transition hover:bg-stone-50">
                 <div className="relative">
@@ -387,6 +398,9 @@ function ImageManagerContent() {
                     />
                     <span className="absolute right-2 bottom-2 rounded-full bg-black/50 p-2 text-white opacity-100 transition sm:opacity-0 sm:group-hover:opacity-100">
                       <Maximize2 className="size-4" />
+                    </span>
+                    <span className={`absolute top-2 left-2 rounded-md border px-2 py-1 text-[10px] font-medium ${storage.className}`}>
+                      {storage.label}
                     </span>
                   </button>
                   <button
@@ -433,7 +447,12 @@ function ImageManagerContent() {
                   </div>
                   <div className="flex items-center justify-between gap-2">
                     <span>{formatSize(item.size)}</span>
-                    <span>{item.width && item.height ? `${item.width} x ${item.height}` : "-"}</span>
+                    <span className="inline-flex items-center gap-2">
+                      <Badge variant="outline" className={`rounded-md px-2 py-0 text-[10px] ${storage.className}`}>
+                        {storage.label}
+                      </Badge>
+                      {item.width && item.height ? `${item.width} x ${item.height}` : "-"}
+                    </span>
                   </div>
                   <div className="flex flex-wrap items-center gap-1">
                     {(item.tags ?? []).map((tag) => (

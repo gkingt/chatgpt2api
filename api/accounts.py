@@ -1,7 +1,15 @@
 from __future__ import annotations
 
+import io
+import json
+import re
+import zipfile
+from datetime import datetime
+from typing import Any, Literal
+
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from services.auth_service import auth_service
@@ -36,6 +44,7 @@ class UserKeyUpdateRequest(BaseModel):
 
 class AccountCreateRequest(BaseModel):
     tokens: list[str] = Field(default_factory=list)
+    accounts: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class AccountDeleteRequest(BaseModel):
@@ -44,6 +53,11 @@ class AccountDeleteRequest(BaseModel):
 
 class AccountRefreshRequest(BaseModel):
     access_tokens: list[str] = Field(default_factory=list)
+
+
+class AccountExportRequest(BaseModel):
+    access_tokens: list[str] = Field(default_factory=list)
+    format: Literal["json", "zip"] = "json"
 
 
 class AccountUpdateRequest(BaseModel):
@@ -89,6 +103,43 @@ class Sub2APIServerUpdateRequest(BaseModel):
 
 class Sub2APIImportRequest(BaseModel):
     account_ids: list[str] = Field(default_factory=list)
+
+
+def _account_payload_token(item: dict[str, Any]) -> str:
+    return str(item.get("access_token") or item.get("accessToken") or "").strip()
+
+
+def _unique_tokens(tokens: list[str]) -> list[str]:
+    return list(dict.fromkeys(str(token or "").strip() for token in tokens if str(token or "").strip()))
+
+
+def _download_timestamp() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def _safe_export_name(value: str, fallback: str) -> str:
+    clean = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip("-._")
+    return (clean or fallback)[:80]
+
+
+def _account_zip_bytes(items: list[dict[str, str]]) -> bytes:
+    buf = io.BytesIO()
+    used_names: set[str] = set()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as archive:
+        for index, item in enumerate(items, start=1):
+            raw_name = item.get("email") or item.get("account_id") or f"account-{index:03d}"
+            base_name = _safe_export_name(raw_name, f"account-{index:03d}")
+            name = base_name
+            suffix = 2
+            while name in used_names:
+                name = f"{base_name}-{suffix}"
+                suffix += 1
+            used_names.add(name)
+            archive.writestr(
+                f"{name}.json",
+                json.dumps(item, ensure_ascii=False, indent=2) + "\n",
+            )
+    return buf.getvalue()
 
 
 def create_router() -> APIRouter:
@@ -149,10 +200,21 @@ def create_router() -> APIRouter:
     @router.post("/api/accounts")
     async def create_accounts(body: AccountCreateRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        tokens = [str(token or "").strip() for token in body.tokens if str(token or "").strip()]
+        account_payloads = [item for item in body.accounts if isinstance(item, dict)]
+        payload_tokens = [_account_payload_token(item) for item in account_payloads]
+        tokens = _unique_tokens([*body.tokens, *payload_tokens])
         if not tokens:
             raise HTTPException(status_code=400, detail={"error": "tokens is required"})
-        result = account_service.add_accounts(tokens)
+        if account_payloads:
+            result = account_service.add_account_items(account_payloads)
+            payload_token_set = set(_unique_tokens(payload_tokens))
+            extra_tokens = [token for token in tokens if token not in payload_token_set]
+            if extra_tokens:
+                extra_result = account_service.add_accounts(extra_tokens)
+                result["added"] = int(result.get("added") or 0) + int(extra_result.get("added") or 0)
+                result["skipped"] = int(result.get("skipped") or 0) + int(extra_result.get("skipped") or 0)
+        else:
+            result = account_service.add_accounts(tokens)
         refresh_result = account_service.refresh_accounts(tokens)
         return {
             **result,
@@ -178,6 +240,33 @@ def create_router() -> APIRouter:
         if not access_tokens:
             raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
         return account_service.refresh_accounts(access_tokens)
+
+    @router.post("/api/accounts/export")
+    async def export_accounts(body: AccountExportRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        access_tokens = _unique_tokens(body.access_tokens)
+        items = account_service.build_export_items(access_tokens)
+        if not items:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "没有可导出的完整账号，需要同时有 access_token、refresh_token 和 id_token"},
+            )
+
+        timestamp = _download_timestamp()
+        if body.format == "zip":
+            content = _account_zip_bytes(items)
+            return Response(
+                content,
+                media_type="application/zip",
+                headers={"Content-Disposition": f'attachment; filename="codex-accounts-{timestamp}.zip"'},
+            )
+
+        payload: dict[str, str] | list[dict[str, str]] = items[0] if len(items) == 1 else items
+        return Response(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="codex-accounts-{timestamp}.json"'},
+        )
 
     @router.post("/api/accounts/update")
     async def update_account(body: AccountUpdateRequest, authorization: str | None = Header(default=None)):

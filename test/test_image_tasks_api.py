@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import unittest
 from unittest import mock
 
@@ -10,6 +11,8 @@ import api.image_tasks as image_tasks_module
 
 
 AUTH_HEADERS = {"Authorization": "Bearer chatgpt2api"}
+PNG_BYTES = b"\x89PNG\r\n\x1a\n"
+DATA_IMAGE_URL = f"data:image/png;base64,{base64.b64encode(PNG_BYTES).decode('ascii')}"
 
 
 class FakeImageTaskService:
@@ -80,6 +83,7 @@ class ImageTasksApiTests(unittest.TestCase):
         self.assertEqual(len(self.fake_service.generation_calls), 1)
 
     def test_create_edit_task_accepts_multiple_images(self):
+        """测试图片编辑任务接口支持多个上传图片。"""
         response = self.client.post(
             "/api/image-tasks/edits",
             headers=AUTH_HEADERS,
@@ -95,6 +99,24 @@ class ImageTasksApiTests(unittest.TestCase):
         self.assertEqual(len(self.fake_service.edit_calls), 1)
         images = self.fake_service.edit_calls[0][1]["images"]
         self.assertEqual(len(images), 2)
+
+    def test_create_edit_task_accepts_image_url(self):
+        """测试图片编辑任务接口支持表单 image_url 引用。"""
+        response = self.client.post(
+            "/api/image-tasks/edits",
+            headers=AUTH_HEADERS,
+            data={
+                "client_task_id": "edit-url-1",
+                "prompt": "edit",
+                "model": "gpt-image-2",
+                "image_url": DATA_IMAGE_URL,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(self.fake_service.edit_calls), 1)
+        images = self.fake_service.edit_calls[0][1]["images"]
+        self.assertEqual(images, [(PNG_BYTES, "image_url.png", "image/png")])
 
     def test_list_tasks_reports_missing_ids(self):
         response = self.client.get("/api/image-tasks?ids=task-1,missing", headers=AUTH_HEADERS)
