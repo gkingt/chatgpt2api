@@ -156,18 +156,7 @@ function renderPrivacyEmail(email?: string | null) {
   if (!value) {
     return <span>—</span>;
   }
-  const atIndex = value.indexOf("@");
-  if (atIndex < 0) {
-    return <span className="transition duration-150 blur-sm hover:blur-none">{value}</span>;
-  }
-  const localPart = value.slice(0, atIndex + 1);
-  const domain = value.slice(atIndex + 1);
-  return (
-    <span className="group inline-flex max-w-full items-center">
-      <span className="truncate">{localPart}</span>
-      <span className="truncate transition duration-150 blur-sm group-hover:blur-none">{domain}</span>
-    </span>
-  );
+  return <span className="block max-w-full truncate">{value}</span>;
 }
 
 function downloadBlob(blob: Blob, filename: string) {
@@ -700,7 +689,7 @@ function AccountsPageContent() {
                         <td className="px-4 py-3">
                           <div className="flex items-center gap-2">
                             <span
-                              className="max-w-[240px] truncate font-medium tracking-tight text-stone-700 transition duration-150 blur-sm hover:blur-none"
+                              className="max-w-[240px] truncate font-medium tracking-tight text-stone-700"
                               title={account.access_token}
                             >
                               {account.access_token}
@@ -725,7 +714,7 @@ function AccountsPageContent() {
                         <td className="px-4 py-3">
                           <Badge
                             variant={status.badge}
-                            className="inline-flex items-center gap-1 rounded-md px-2 py-1"
+                            className="inline-flex items-center gap-1 rounded-md px-2 py-1 whitespace-nowrap"
                           >
                             <StatusIcon className="size-3.5" />
                             {account.status}
