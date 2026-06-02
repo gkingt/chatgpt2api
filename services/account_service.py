@@ -39,6 +39,13 @@ class AccountService:
         "Chrome/145.0.0.0 Safari/537.36"
     )
 
+    # 刷新进度追踪
+    _refresh_progress: dict[str, dict] = {}
+    _refresh_progress_lock = Lock()
+    # 重新登录进度追踪
+    _relogin_progress: dict[str, dict] = {}
+    _relogin_progress_lock = Lock()
+
     def __init__(self, storage_backend: StorageBackend):
         self.storage = storage_backend
         self._lock = Lock()
@@ -466,7 +473,7 @@ class AccountService:
                 return active_token
             return self._apply_refreshed_tokens(active_token, token_data, event)
 
-    def _password_re_login_thread(self, access_token: str, email: str, password: str, event: str) -> None:
+    def _password_re_login_thread(self, access_token: str, email: str, password: str, event: str, progress_id: str | None = None) -> None:
         """密码重新登录线程入口"""
         try:
             result = self._login_with_password(email, password)
@@ -476,26 +483,26 @@ class AccountService:
                 new_refresh_token = result.get("refresh_token", "")
                 new_id_token = result.get("id_token", "")
                 new_expires_at = result.get("expires_at")
-                
+
                 # 构建 token_data 供 _apply_refreshed_tokens 使用
                 token_data = {
                     "access_token": new_access_token,
                     "refresh_token": new_refresh_token,
                     "id_token": new_id_token,
                 }
-                
+
                 # 使用 _apply_refreshed_tokens 更新账号（处理 token 别名）
                 new_token = self._apply_refreshed_tokens(access_token, token_data, f"{event}:password_relogin")
-                
-                # 额外更新 source_type 和 status
+
+                # 额外更新 source_type 和 status（静默，避免重复日志）
                 self.update_account(new_token, {
                     "source_type": result.get("source_type", "password"),
                     "status": "正常",
-                })
-                
+                }, quiet=True)
+
                 log_service.add(
                     LOG_TYPE_ACCOUNT,
-                    "重新登录",
+                    "更新账号",
                     {
                         "source": event,
                         "old_token": anonymize_token(access_token),
@@ -504,50 +511,67 @@ class AccountService:
                         "status": "成功",
                     },
                 )
+                if progress_id:
+                    self.update_relogin_progress(progress_id, access_token, "成功")
             else:
                 # 登录失败
                 error_type = result.get("error", "")
-                log_service.add(
-                    LOG_TYPE_ACCOUNT,
-                    "重新登录",
-                    {
-                        "source": event,
-                        "token": anonymize_token(access_token),
-                        "email": email,
-                        "status": "失败",
-                        "error": error_type,
-                        "detail": result.get("detail", {}),
-                    },
-                )
-                # 临时故障（验证码超时、邮箱API异常等）不删除账号，只记录日志
-                temporary_errors = {
-                    "otp_code_timeout",        # 等待验证码超时
-                    "wait_code_exception",     # 临时邮箱API请求异常
-                    "otp_resend_exception",    # 验证码重发异常
-                    "otp_resend_failed",       # 验证码重发失败
-                    "create_mailbox_failed",   # 创建邮箱会话失败
-                    "no_mail_config",          # 未配置邮箱提供商
-                }
-                is_temporary = any(error_type.startswith(e) for e in temporary_errors)
-                if is_temporary:
+                if error_type == "password_verify_failed_403" and isinstance(result.get("detail"), dict):
                     log_service.add(
                         LOG_TYPE_ACCOUNT,
-                        "临时故障-跳过删除",
+                        "更新账号",
                         {
                             "source": event,
                             "token": anonymize_token(access_token),
                             "email": email,
+                            "status": "失败",
                             "error": error_type,
                             "detail": result.get("detail", {}),
                         },
                     )
+                    detail_error = result["detail"].get("error", {})
+                    if isinstance(detail_error, dict) and detail_error.get("code") == "account_deactivated":
+                        # 账号已删除/停用 → 标记为禁用
+                        self.update_account(access_token, {"status": "禁用", "quota": 0}, quiet=True)
+                        account = self.get_account(access_token) or {}
+                        log_service.add(
+                            LOG_TYPE_ACCOUNT,
+                            "账号已停用-标记禁用",
+                            {
+                                "source": event,
+                                "token": anonymize_token(access_token),
+                                "email": email,
+                                "detail": result.get("detail", {}),
+                            },
+                        )
+                        if progress_id:
+                            self.update_relogin_progress(progress_id, access_token, "禁用")
+                    else:
+                        # 永久故障：将账号标记为异常（或自动移除）
+                        self.remove_invalid_token(access_token, f"{event}:password_relogin_failed", quiet=True)
+                        if progress_id:
+                            self.update_relogin_progress(progress_id, access_token, "异常", error_type)
                 else:
+                    log_service.add(
+                        LOG_TYPE_ACCOUNT,
+                        "更新账号",
+                        {
+                            "source": event,
+                            "token": anonymize_token(access_token),
+                            "email": email,
+                            "status": "失败",
+                            "error": error_type,
+                            "detail": result.get("detail", {}),
+                        },
+                    )
                     # 永久故障：将账号标记为异常（或自动移除）
-                    self.remove_invalid_token(access_token, f"{event}:password_relogin_failed")
+                    self.remove_invalid_token(access_token, f"{event}:password_relogin_failed", quiet=True)
+                    if progress_id:
+                        self.update_relogin_progress(progress_id, access_token, "异常", error_type)
         except Exception as exc:
             log_service.add(
                 LOG_TYPE_ACCOUNT,
-                "重新登录",
+                "更新账号",
                 {
                     "source": event,
                     "token": anonymize_token(access_token),
@@ -557,7 +581,9 @@ class AccountService:
                 },
             )
             # 将账号标记为异常（或自动移除）
-            self.remove_invalid_token(access_token, f"{event}:password_relogin_exception")
+            self.remove_invalid_token(access_token, f"{event}:password_relogin_exception", quiet=True)
+            if progress_id:
+                self.update_relogin_progress(progress_id, access_token, "异常", str(exc))
 
     def _login_with_password(self, email: str, password: str) -> dict:
         """通过邮箱+密码登录，返回 {access_token, refresh_token, id_token, ...}"""
@@ -717,13 +743,8 @@ class AccountService:
                     page_type = str(page_info.get("type") or "")
                 
                 if page_type == "email_otp_verification":
-                    otp_result = self._handle_email_otp_verification(
-                        session, auth_base, device_id, email, user_agent, login_data,
-                    )
-                    if otp_result.get("auth_code"):
-                        auth_code = otp_result["auth_code"]
-                    else:
-                        return {"ok": False, "error": otp_result.get("error", "email_otp_failed"), "detail": login_data}
+                    # 需要验证码才能登录，直接标记为账号异常
+                    return {"ok": False, "error": "need_verification_code", "detail": login_data}
                 else:
                     return {"ok": False, "error": "no_auth_code", "detail": login_data}
             
@@ -815,144 +836,6 @@ class AccountService:
         finally:
             session.close()
 
-    def _handle_email_otp_verification(
-        self, session, auth_base: str, device_id: str, email: str,
-        user_agent: str, login_data: dict,
-    ) -> dict:
-        """处理邮箱 OTP 验证流程：发送验证码 → 等待验证码 → 提交验证 → 获取 auth_code。
-
-        返回 {"auth_code": "..."} 或 {"error": "..."}。
-        """
-        from services.register import mail_provider as _mail_provider
-
-        otp_headers = {
-            "accept": "application/json",
-            "accept-language": "zh-CN,zh;q=0.9",
-            "content-type": "application/json",
-            "origin": auth_base,
-            "priority": "u=1, i",
-            "user-agent": user_agent,
-            "sec-ch-ua": '"Chromium";v="145", "Google Chrome";v="145", "Not/A)Brand";v="99"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-            "referer": f"{auth_base}/email-verification",
-            "oai-device-id": device_id,
-        }
-
-        # ─── 步骤 1: 发送验证码 ──────────────────────────
-        try:
-            resend_resp = session.post(
-                f"{auth_base}/api/accounts/email-otp/resend",
-                headers={**otp_headers, "content-length": "0"},
-                timeout=30,
-            )
-            resend_data = {}
-            try:
-                resend_data = resend_resp.json() if resend_resp.text else {}
-            except Exception:
-                pass
-            if resend_resp.status_code != 200 or not resend_data.get("success"):
-                return {"error": f"otp_resend_failed_{resend_resp.status_code}", "detail": resend_data}
-        except Exception as exc:
-            return {"error": f"otp_resend_exception", "detail": str(exc)}
-
-        # ─── 步骤 2: 等待验证码 ──────────────────────────
-        mail_config = self._get_mail_config()
-        if not mail_config:
-            return {"error": "no_mail_config", "detail": "未配置邮箱提供商，无法自动获取验证码"}
-
-        mailbox = self._create_mailbox_for_email(mail_config, email)
-        if not mailbox:
-            return {"error": "create_mailbox_failed", "detail": f"无法为 {email} 创建邮箱会话"}
-
-        try:
-            code = _mail_provider.wait_for_code(mail_config, mailbox)
-        except Exception as exc:
-            return {"error": "wait_code_exception", "detail": str(exc)}
-
-        if not code:
-            return {"error": "otp_code_timeout", "detail": "等待验证码超时"}
-
-        # ─── 步骤 3: 提交验证码 ──────────────────────────
-        try:
-            validate_resp = session.post(
-                f"{auth_base}/api/accounts/email-otp/validate",
-                headers=otp_headers,
-                json={"code": code},
-                timeout=30,
-            )
-            validate_data = {}
-            try:
-                validate_data = validate_resp.json() if validate_resp.text else {}
-            except Exception:
-                pass
-
-            # 检查错误（如 account_deactivated）
-            error_obj = validate_data.get("error")
-            if isinstance(error_obj, dict) and error_obj.get("code"):
-                return {"error": f"otp_validate_error_{error_obj['code']}", "detail": validate_data}
-
-            # 从 continue_url 提取 auth_code
-            continue_url = str(validate_data.get("continue_url") or "").strip()
-            if continue_url:
-                from urllib.parse import parse_qs as _pq, urlparse as _up
-                parsed = _pq(_up(continue_url).query)
-                auth_code = str((parsed.get("code") or [""])[0]).strip()
-                if auth_code:
-                    return {"auth_code": auth_code}
-
-            # 如果 validate 返回的是 email_otp_verification，可能需要再调用 authorize/continue
-            page_info = validate_data.get("page")
-            if isinstance(page_info, dict) and str(page_info.get("type") or "") == "email_otp_verification":
-                # 调用 authorize/continue 获取 auth_code
-                continue_resp = session.post(
-                    f"{auth_base}/api/accounts/authorize/continue",
-                    headers={**otp_headers, "content-length": "0"},
-                    timeout=30,
-                )
-                continue_data = {}
-                try:
-                    continue_data = continue_resp.json() if continue_resp.text else {}
-                except Exception:
-                    pass
-                continue_url2 = str(continue_data.get("continue_url") or "").strip()
-                if continue_url2:
-                    from urllib.parse import parse_qs as _pq2, urlparse as _up2
-                    parsed2 = _pq2(_up2(continue_url2).query)
-                    auth_code2 = str((parsed2.get("code") or [""])[0]).strip()
-                    if auth_code2:
-                        return {"auth_code": auth_code2}
-
-            return {"error": "otp_validate_no_code", "detail": validate_data}
-
-        except Exception as exc:
-            return {"error": "otp_validate_exception", "detail": str(exc)}
-
-    def _get_mail_config(self) -> dict | None:
-        """读取 register.json 中的 mail 配置"""
-        try:
-            register_config_file = Path(__file__).resolve().parent.parent / "data" / "register.json"
-            saved = json.loads(register_config_file.read_text(encoding="utf-8"))
-            mail_conf = saved.get("mail")
-            if isinstance(mail_conf, dict) and mail_conf.get("providers"):
-                return mail_conf
-        except Exception:
-            pass
-        return None
-
-    def _create_mailbox_for_email(self, mail_config: dict, email: str) -> dict | None:
-        """为指定邮箱地址查询已有 mailbox（用于等待 OTP 验证码）。"""
-        from services.register import mail_provider as _mail_provider
-
-        try:
-            mailbox = _mail_provider.get_existing_mailbox(mail_config, email)
-            return mailbox
-        except Exception:
-            return None
-
     def list_expiring_access_tokens(self) -> list[str]:
         with self._lock:
             return [
@@ -999,6 +882,7 @@ class AccountService:
             "refreshed": refreshed,
             "errors": errors,
             "items": self.list_accounts(),
+            "relogined": 0,
         }
 
     def list_tokens(self) -> list[str]:
@@ -1148,16 +1032,16 @@ class AccountService:
             self._accounts[access_token] = account
             self._save_accounts()
 
-    def remove_invalid_token(self, access_token: str, event: str) -> bool:
+    def remove_invalid_token(self, access_token: str, event: str, quiet: bool = False) -> bool:
         if not config.auto_remove_invalid_accounts:
-            self.update_account(access_token, {"status": "异常", "quota": 0})
+            self.update_account(access_token, {"status": "异常", "quota": 0}, quiet=quiet)
             return False
         removed = bool(self.delete_accounts([access_token])["removed"])
         if removed:
             log_service.add(LOG_TYPE_ACCOUNT, "自动移除异常账号",
                             {"source": event, "token": anonymize_token(access_token)})
         elif access_token:
-            self.update_account(access_token, {"status": "异常", "quota": 0})
+            self.update_account(access_token, {"status": "异常", "quota": 0}, quiet=quiet)
         return removed
 
     def get_account(self, access_token: str) -> dict | None:
@@ -1292,7 +1176,7 @@ class AccountService:
             items = [dict(item) for item in self._accounts.values()]
         return {"removed": removed, "items": items}
 
-    def update_account(self, access_token: str, updates: dict) -> dict | None:
+    def update_account(self, access_token: str, updates: dict, quiet: bool = False) -> dict | None:
         if not access_token:
             return None
         with self._lock:
@@ -1310,8 +1194,9 @@ class AccountService:
                 return None
             self._accounts[access_token] = account
             self._save_accounts()
-            log_service.add(LOG_TYPE_ACCOUNT, "更新账号",
-                            {"token": anonymize_token(access_token), "status": account.get("status")})
+            if not quiet:
+                log_service.add(LOG_TYPE_ACCOUNT, "更新账号",
+                                {"token": anonymize_token(access_token), "status": account.get("status")})
             return dict(account)
         return None
 
@@ -1431,14 +1316,121 @@ class AccountService:
         self._record_refresh_success(active_token)
         return self.update_account(active_token, result)
 
-    def refresh_accounts(self, access_tokens: list[str]) -> dict[str, Any]:
+    # ---- 刷新进度追踪 ----
+
+    def init_refresh_progress(self, progress_id: str, total: int) -> None:
+        """初始化刷新进度记录。"""
+        with self._refresh_progress_lock:
+            self._refresh_progress[progress_id] = {
+                "total": total,
+                "processed": 0,
+                "done": False,
+                "error": None,
+                "status_counts": {"正常": 0, "限流": 0, "异常": 0, "禁用": 0},
+                "total_quota": 0,
+            }
+
+    def update_refresh_progress(self, progress_id: str, token: str) -> None:
+        """刷新单个账号后，更新进度计数。"""
+        account = self.get_account(token)
+        status = str(account.get("status") or "正常").strip() if account else "正常"
+        quota = max(0, int(account.get("quota") or 0)) if account else 0
+
+        with self._refresh_progress_lock:
+            progress = self._refresh_progress.get(progress_id)
+            if progress is None:
+                return
+            progress["processed"] += 1
+            progress["status_counts"][status] = progress["status_counts"].get(status, 0) + 1
+            progress["total_quota"] += quota
+
+    def finish_refresh_progress(self, progress_id: str, result: dict | None = None, error: str | None = None) -> None:
+        """标记刷新完成。"""
+        with self._refresh_progress_lock:
+            progress = self._refresh_progress.get(progress_id)
+            if progress is None:
+                return
+            progress["done"] = True
+            progress["result"] = result
+            if error:
+                progress["error"] = error
+
+    def get_refresh_progress(self, progress_id: str) -> dict | None:
+        """查询刷新进度。"""
+        with self._refresh_progress_lock:
+            progress = self._refresh_progress.get(progress_id)
+            return dict(progress) if progress else None
+
+    def clean_refresh_progress(self, progress_id: str) -> None:
+        """清理过期进度记录。"""
+        with self._refresh_progress_lock:
+            self._refresh_progress.pop(progress_id, None)
+
+    # ---- 重新登录进度追踪 ----
+
+    def init_relogin_progress(self, progress_id: str, total: int) -> None:
+        """初始化重新登录进度记录。"""
+        with self._relogin_progress_lock:
+            self._relogin_progress[progress_id] = {
+                "total": total,
+                "processed": 0,
+                "done": False,
+                "error": None,
+                "results": [],
+            }
+
+    def update_relogin_progress(self, progress_id: str, token: str, status: str, error: str | None = None) -> None:
+        """更新单个重新登录进度。当所有账号处理完毕时自动标记完成。"""
+        with self._relogin_progress_lock:
+            progress = self._relogin_progress.get(progress_id)
+            if progress is None:
+                return
+            progress["processed"] += 1
+            progress["results"].append({
+                "token": anonymize_token(token),
+                "status": status,
+                "error": error,
+            })
+            if progress["processed"] >= progress["total"]:
+                progress["done"] = True
+
+    def finish_relogin_progress(self, progress_id: str, result: dict | None = None, error: str | None = None) -> None:
+        """标记重新登录完成。"""
+        with self._relogin_progress_lock:
+            progress = self._relogin_progress.get(progress_id)
+            if progress is None:
+                return
+            progress["done"] = True
+            progress["result"] = result
+            if error:
+                progress["error"] = error
+
+    def get_relogin_progress(self, progress_id: str) -> dict | None:
+        """查询重新登录进度。"""
+        with self._relogin_progress_lock:
+            progress = self._relogin_progress.get(progress_id)
+            return dict(progress) if progress else None
+
+    def clean_relogin_progress(self, progress_id: str) -> None:
+        """清理过期进度记录。"""
+        with self._relogin_progress_lock:
+            self._relogin_progress.pop(progress_id, None)
+
+    def refresh_accounts(self, access_tokens: list[str], progress_id: str | None = None) -> dict[str, Any]:
         access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
         if not access_tokens:
-            return {"refreshed": 0, "errors": [], "items": self.list_accounts()}
+            items = self.list_accounts()
+            result = {"refreshed": 0, "errors": [], "items": items, "relogined": 0}
+            if progress_id:
+                self.finish_refresh_progress(progress_id, result)
+            return result
 
         refreshed = 0
         errors = []
         max_workers = min(10, len(access_tokens))
+
+        if progress_id:
+            self.init_refresh_progress(progress_id, len(access_tokens))
 
         executor = ThreadPoolExecutor(max_workers=max_workers)
         try:
@@ -1447,27 +1439,125 @@ class AccountService:
                 for token in access_tokens
             }
             for future in as_completed(futures):
+                token = futures[future]
                 try:
                     account = future.result()
                 except (KeyboardInterrupt, SystemExit):
                     executor.shutdown(wait=False, cancel_futures=True)
                     raise
                 except Exception as exc:
-                    errors.append({"token": anonymize_token(futures[future]), "error": str(exc)})
-                    continue
-                if account is not None:
-                    refreshed += 1
+                    error_str = str(exc)
+                    # TLS/代理连接错误是网络问题，不计入账号失败
+                    from services.protocol.conversation import is_tls_connection_error
+                    if not is_tls_connection_error(error_str):
+                        errors.append({"token": anonymize_token(token), "error": error_str})
+                else:
+                    if account is not None:
+                        refreshed += 1
+
+                if progress_id:
+                    self.update_refresh_progress(progress_id, token)
         except (KeyboardInterrupt, SystemExit):
+            if progress_id:
+                self.finish_refresh_progress(progress_id, error="cancelled")
             executor.shutdown(wait=False, cancel_futures=True)
             raise
         else:
             executor.shutdown(wait=True, cancel_futures=True)
 
-        return {
+        # 自动重新登录异常账号（仅当配置开启时）
+        relogined = 0
+        if config.auto_relogin_after_refresh:
+            for token in access_tokens:
+                account = self.get_account(token)
+                if not account:
+                    continue
+                status = str(account.get("status") or "").strip()
+                if status != "异常":
+                    continue
+                email = str(account.get("email") or "").strip()
+                password = str(account.get("password") or "").strip()
+                if not email or not password:
+                    continue
+                t = Thread(
+                    target=self._password_re_login_thread,
+                    args=(token, email, password, "auto_relogin_after_refresh"),
+                    daemon=True,
+                )
+                t.start()
+                relogined += 1
+
+        result = {
             "refreshed": refreshed,
             "errors": errors,
             "items": self.list_accounts(),
+            "relogined": relogined,
         }
+
+        if progress_id:
+            self.finish_refresh_progress(progress_id, result)
+
+        return result
+
+    def re_login_accounts(self, access_tokens: list[str], progress_id: str | None = None) -> dict[str, Any]:
+        """对选中账号执行密码重新登录流程。
+
+        仅对包含 email + password 的账号有效。
+        登录成功后自动将状态设为"正常"。
+        """
+        access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
+        if not access_tokens:
+            result = {"relogined": 0, "skipped": 0, "errors": [], "items": self.list_accounts()}
+            if progress_id:
+                self.finish_relogin_progress(progress_id, result)
+            return result
+
+        if progress_id:
+            self.init_relogin_progress(progress_id, len(access_tokens))
+
+        relogined = 0
+        skipped = 0
+        errors = []
+
+        for token in access_tokens:
+            account = self.get_account(token)
+            if not account:
+                errors.append({"token": anonymize_token(token), "error": "账号不存在"})
+                if progress_id:
+                    self.update_relogin_progress(progress_id, token, "跳过", "账号不存在")
+                continue
+
+            email = str(account.get("email") or "").strip()
+            password = str(account.get("password") or "").strip()
+            if not email or not password:
+                skipped += 1
+                if progress_id:
+                    self.update_relogin_progress(progress_id, token, "跳过", "无邮箱密码")
+                continue
+
+            # 在新线程中执行密码重新登录
+            t = Thread(
+                target=self._password_re_login_thread,
+                args=(token, email, password, "manual_relogin", progress_id),
+                daemon=True,
+            )
+            t.start()
+            relogined += 1
+
+        result = {
+            "relogined": relogined,
+            "skipped": skipped,
+            "errors": errors,
+            "items": self.list_accounts(),
+        }
+        if progress_id:
+            # 如果所有账号都已同步处理完毕（没有启动线程），直接标记完成
+            if relogined == 0:
+                self.finish_relogin_progress(progress_id, result)
+            else:
+                # 有线程在运行，等线程结束后再完成
+                pass
+        return result
 
     def build_export_items(self, access_tokens: list[str] | None = None) -> list[dict[str, str]]:
         target_tokens = set(token for token in (access_tokens or []) if token)
