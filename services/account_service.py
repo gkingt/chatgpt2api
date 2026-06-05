@@ -332,11 +332,22 @@ class AccountService:
                 if account is not None:
                     refreshed += 1
 
-        return {
+        result = {
             "refreshed": refreshed,
             "errors": errors,
             "items": self.list_accounts(),
         }
+        if config.auto_start_register_enabled:
+            try:
+                from services.register_service import register_service
+
+                result["auto_register"] = register_service.auto_start_if_quota_low(
+                    config.auto_start_register_min_quota
+                )
+            except Exception as exc:
+                result["auto_register"] = {"started": False, "reason": "error", "error": str(exc)}
+
+        return result
 
 
 account_service = AccountService(config.get_storage_backend())

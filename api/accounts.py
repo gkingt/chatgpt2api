@@ -159,6 +159,7 @@ def create_router() -> APIRouter:
             "refreshed": refresh_result.get("refreshed", 0),
             "errors": refresh_result.get("errors", []),
             "items": refresh_result.get("items", result.get("items", [])),
+            "auto_register": refresh_result.get("auto_register"),
         }
 
     @router.delete("/api/accounts")

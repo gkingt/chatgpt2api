@@ -67,6 +67,8 @@ export type SettingsConfig = {
   image_account_concurrency?: number | string;
   auto_remove_invalid_accounts?: boolean;
   auto_remove_rate_limited_accounts?: boolean;
+  auto_start_register_enabled?: boolean;
+  auto_start_register_min_quota?: number | string;
   log_levels?: string[];
   backup?: BackupSettings;
   backup_state?: BackupState;
