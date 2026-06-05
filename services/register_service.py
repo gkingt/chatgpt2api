@@ -46,6 +46,7 @@ class RegisterService:
         self._store_file = store_file
         self._lock = threading.RLock()
         self._runner: threading.Thread | None = None
+        self._auto_stop_when_target_reached = False
         self._logs: list[dict] = []
         openai_register.register_log_sink = self._append_log
         self._config = self._load()
@@ -79,12 +80,13 @@ class RegisterService:
             self._save()
             return self.get()
 
-    def start(self) -> dict:
+    def start(self, auto_stop_when_target_reached: bool = False) -> dict:
         with self._lock:
             if self._runner and self._runner.is_alive():
                 self._config["enabled"] = True
                 self._save()
                 return self.get()
+            self._auto_stop_when_target_reached = bool(auto_stop_when_target_reached)
             self._config["enabled"] = True
             self._inject_proxy_to_mail()
             self._logs = []
@@ -118,7 +120,7 @@ class RegisterService:
             if metrics["current_quota"] >= threshold:
                 self._bump(**metrics)
                 return {"started": False, "reason": "quota_enough", **metrics}
-        self.start()
+        self.start(auto_stop_when_target_reached=True)
         self._append_log(
             f"自动启动注册：当前剩余额度={metrics['current_quota']}，最低额度={threshold}",
             "yellow",
@@ -187,11 +189,17 @@ class RegisterService:
             futures = set()
             while True:
                 cfg = self.get()
-                while self.get()["enabled"] and not self._target_reached(cfg, submitted) and len(futures) < threads:
+                target_reached = self._target_reached(cfg, submitted)
+                while self.get()["enabled"] and not target_reached and len(futures) < threads:
                     submitted += 1
                     futures.add(executor.submit(openai_register.worker, submitted))
+                    target_reached = self._target_reached(cfg, submitted)
                 self._bump(running=len(futures), done=done, success=success, fail=fail)
-                if not futures and (not self.get()["enabled"] or str(cfg.get("mode") or "total") == "total"):
+                if not futures and (
+                    not self.get()["enabled"]
+                    or str(cfg.get("mode") or "total") == "total"
+                    or (target_reached and self._auto_stop_when_target_reached)
+                ):
                     break
                 if not futures:
                     time.sleep(max(1, int(cfg.get("check_interval") or 5)))
