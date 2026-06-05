@@ -1519,6 +1519,15 @@ class AccountService:
             "items": self.list_accounts(),
             "relogined": relogined,
         }
+        if config.auto_start_register_enabled:
+            try:
+                from services.register_service import register_service
+
+                result["auto_register"] = register_service.auto_start_if_quota_low(
+                    config.auto_start_register_min_quota
+                )
+            except Exception as exc:
+                result["auto_register"] = {"started": False, "reason": "error", "error": str(exc)}
 
         if progress_id:
             self.finish_refresh_progress(progress_id, result)

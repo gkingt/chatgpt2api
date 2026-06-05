@@ -123,6 +123,8 @@ export type SettingsConfig = {
   auto_remove_invalid_accounts?: boolean;
   auto_remove_rate_limited_accounts?: boolean;
   auto_relogin_after_refresh?: boolean;
+  auto_start_register_enabled?: boolean;
+  auto_start_register_min_quota?: number | string;
   log_levels?: string[];
   image_storage?: ImageStorageSettings;
   backup?: BackupSettings;

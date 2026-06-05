@@ -351,6 +351,20 @@ class ConfigStore:
         return bool(value)
 
     @property
+    def auto_start_register_enabled(self) -> bool:
+        value = self.data.get("auto_start_register_enabled", False)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    @property
+    def auto_start_register_min_quota(self) -> int:
+        try:
+            return max(1, int(self.data.get("auto_start_register_min_quota", 1)))
+        except (TypeError, ValueError):
+            return 1
+
+    @property
     def log_levels(self) -> list[str]:
         levels = self.data.get("log_levels")
         if not isinstance(levels, list):
@@ -426,6 +440,8 @@ class ConfigStore:
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
         data["auto_remove_rate_limited_accounts"] = self.auto_remove_rate_limited_accounts
         data["auto_relogin_after_refresh"] = self.auto_relogin_after_refresh
+        data["auto_start_register_enabled"] = self.auto_start_register_enabled
+        data["auto_start_register_min_quota"] = self.auto_start_register_min_quota
         data["log_levels"] = self.log_levels
         data["sensitive_words"] = self.sensitive_words
         data["ai_review"] = self.ai_review

@@ -32,6 +32,8 @@ export function ConfigCard() {
   const setAutoRemoveInvalidAccounts = useSettingsStore((state) => state.setAutoRemoveInvalidAccounts);
   const setAutoRemoveRateLimitedAccounts = useSettingsStore((state) => state.setAutoRemoveRateLimitedAccounts);
   const setAutoReloginAfterRefresh = useSettingsStore((state) => state.setAutoReloginAfterRefresh);
+  const setAutoStartRegisterEnabled = useSettingsStore((state) => state.setAutoStartRegisterEnabled);
+  const setAutoStartRegisterMinQuota = useSettingsStore((state) => state.setAutoStartRegisterMinQuota);
   const setLogLevel = useSettingsStore((state) => state.setLogLevel);
   const setProxy = useSettingsStore((state) => state.setProxy);
   const setBaseUrl = useSettingsStore((state) => state.setBaseUrl);
@@ -226,6 +228,27 @@ export function ConfigCard() {
               <p className="text-xs text-stone-500">开启后刷新时自动尝试密码登录恢复账号。</p>
             </div>
             <div className="flex-1" aria-hidden="true" />
+          </div>
+          <div className="space-y-2">
+            <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
+              <Checkbox
+                checked={Boolean(config?.auto_start_register_enabled)}
+                onCheckedChange={(checked) => setAutoStartRegisterEnabled(Boolean(checked))}
+              />
+              自动启动注册
+            </label>
+            <p className="text-xs text-stone-500">开启后账号刷新完成时会检查剩余额度，低于最低额度则自动触发注册机启动注册。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">自动启动注册最低额度</label>
+            <Input
+              value={String(config?.auto_start_register_min_quota || "1")}
+              onChange={(event) => setAutoStartRegisterMinQuota(event.target.value)}
+              placeholder="1"
+              className="h-10 rounded-xl border-stone-200 bg-white disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={!config?.auto_start_register_enabled}
+            />
+            <p className="text-xs text-stone-500">当正常账号的剩余额度低于该值时触发。</p>
           </div>
           <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
             <Checkbox

@@ -94,6 +94,8 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     auto_remove_invalid_accounts: Boolean(config.auto_remove_invalid_accounts),
     auto_remove_rate_limited_accounts: Boolean(config.auto_remove_rate_limited_accounts),
     auto_relogin_after_refresh: Boolean(config.auto_relogin_after_refresh),
+    auto_start_register_enabled: Boolean(config.auto_start_register_enabled),
+    auto_start_register_min_quota: Number(config.auto_start_register_min_quota || 1),
     log_levels: Array.isArray(config.log_levels) ? config.log_levels : [],
     proxy: typeof config.proxy === "string" ? config.proxy : "",
     base_url: typeof config.base_url === "string" ? config.base_url : "",
@@ -216,6 +218,8 @@ type SettingsStore = {
   setAutoRemoveInvalidAccounts: (value: boolean) => void;
   setAutoRemoveRateLimitedAccounts: (value: boolean) => void;
   setAutoReloginAfterRefresh: (value: boolean) => void;
+  setAutoStartRegisterEnabled: (value: boolean) => void;
+  setAutoStartRegisterMinQuota: (value: string) => void;
   setLogLevel: (level: string, enabled: boolean) => void;
   setProxy: (value: string) => void;
   setBaseUrl: (value: string) => void;
@@ -357,6 +361,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         auto_remove_invalid_accounts: Boolean(config.auto_remove_invalid_accounts),
         auto_remove_rate_limited_accounts: Boolean(config.auto_remove_rate_limited_accounts),
         auto_relogin_after_refresh: Boolean(config.auto_relogin_after_refresh),
+        auto_start_register_enabled: Boolean(config.auto_start_register_enabled),
+        auto_start_register_min_quota: Math.max(1, Number(config.auto_start_register_min_quota) || 1),
         proxy: config.proxy.trim(),
         base_url: String(config.base_url || "").trim(),
         global_system_prompt: String(config.global_system_prompt || "").trim(),
@@ -454,6 +460,14 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   setAutoReloginAfterRefresh: (value) => {
     set((state) => state.config ? { config: { ...state.config, auto_relogin_after_refresh: value } } : {});
+  },
+
+  setAutoStartRegisterEnabled: (value) => {
+    set((state) => state.config ? { config: { ...state.config, auto_start_register_enabled: value } } : {});
+  },
+
+  setAutoStartRegisterMinQuota: (value) => {
+    set((state) => state.config ? { config: { ...state.config, auto_start_register_min_quota: value } } : {});
   },
 
   setLogLevel: (level, enabled) => {

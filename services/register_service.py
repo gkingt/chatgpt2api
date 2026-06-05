@@ -107,6 +107,24 @@ class RegisterService:
             self._append_log("已请求停止注册任务，正在等待当前运行任务结束", "yellow")
             return self.get()
 
+    def auto_start_if_quota_low(self, min_quota: int) -> dict:
+        threshold = max(1, int(min_quota or 1))
+        metrics = self._pool_metrics()
+        with self._lock:
+            running = bool(self._runner and self._runner.is_alive())
+            if running:
+                self._bump(**metrics)
+                return {"started": False, "reason": "running", **metrics}
+            if metrics["current_quota"] >= threshold:
+                self._bump(**metrics)
+                return {"started": False, "reason": "quota_enough", **metrics}
+        self.start()
+        self._append_log(
+            f"自动启动注册：当前剩余额度={metrics['current_quota']}，最低额度={threshold}",
+            "yellow",
+        )
+        return {"started": True, "reason": "quota_low", **metrics}
+
     def reset(self) -> dict:
         with self._lock:
             self._logs = []
