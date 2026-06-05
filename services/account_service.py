@@ -932,6 +932,7 @@ class AccountService:
         with self._image_slot_condition:
             while True:
                 if not self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types):
+                    self._schedule_auto_start_register_if_needed("no_ready_image_quota")
                     raise RuntimeError(
                         f"no available {plan_type or source_type or ''} image quota".replace("  ", " ").strip()
                         if plan_type or source_type else "no available image quota"
@@ -955,6 +956,30 @@ class AccountService:
             else:
                 self._image_inflight[access_token] = current_inflight - 1
             self._image_slot_condition.notify_all()
+
+    def _schedule_auto_start_register_if_needed(self, reason: str = "") -> None:
+        if not config.auto_start_register_enabled:
+            return
+
+        def worker() -> None:
+            try:
+                from services.register_service import register_service
+
+                result = register_service.auto_start_if_quota_low(config.auto_start_register_min_quota)
+                if result.get("started"):
+                    log_service.add(
+                        LOG_TYPE_ACCOUNT,
+                        "auto_start_register",
+                        {"reason": reason, **result},
+                    )
+            except Exception as exc:
+                log_service.add(
+                    LOG_TYPE_ACCOUNT,
+                    "auto_start_register_failed",
+                    {"reason": reason, "error": str(exc)},
+                )
+
+        Thread(target=worker, name="auto-start-register", daemon=True).start()
 
     def get_available_access_token(
             self,
@@ -995,6 +1020,7 @@ class AccountService:
             ):
                 return str((account or {}).get("access_token") or access_token)
             self.release_image_slot(access_token)
+        self._schedule_auto_start_register_if_needed("no_available_image_quota")
         raise RuntimeError(
             f"no available {plan_type or source_type or ''} image quota (tried {len(attempted_tokens)} tokens)".replace("  ", " ").strip()
             if plan_type or source_type else f"no available image quota (tried {len(attempted_tokens)} tokens)"
@@ -1277,6 +1303,7 @@ class AccountService:
                 next_item["success"] = int(next_item.get("success") or 0) + 1
                 if not image_quota_unknown:
                     next_item["quota"] = max(0, int(next_item.get("quota") or 0) - 1)
+                    self._schedule_auto_start_register_if_needed("image_quota_decrement")
                 if not image_quota_unknown and next_item["quota"] == 0:
                     next_item["status"] = "限流"
                     next_item["restore_at"] = next_item.get("restore_at") or None
