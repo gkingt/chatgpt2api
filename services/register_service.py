@@ -108,6 +108,7 @@ class RegisterService:
         with self._lock:
             running = bool(self._runner and self._runner.is_alive())
             if running:
+                self._auto_stop_when_target_reached = True
                 self._bump(**metrics)
                 return {"started": False, "reason": "running", **metrics}
             if metrics["current_quota"] >= threshold:
@@ -191,8 +192,10 @@ class RegisterService:
                 if not futures and (
                     not self.get()["enabled"]
                     or str(cfg.get("mode") or "total") == "total"
-                    or (target_reached and self._auto_stop_when_target_reached)
+                    or target_reached
                 ):
+                    if target_reached and str(cfg.get("mode") or "total") != "total":
+                        self._append_log("注册目标已满足，停止注册任务", "yellow")
                     break
                 if not futures:
                     time.sleep(max(1, int(cfg.get("check_interval") or 5)))
