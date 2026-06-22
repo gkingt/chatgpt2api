@@ -498,11 +498,44 @@ def request_platform_oauth_token(session: requests.Session, code: str, code_veri
 def exchange_platform_tokens(session: requests.Session, device_id: str, code_verifier: str, consent_url: str) -> dict | None:
     callback_params = extract_oauth_callback_params_from_consent_session(session, consent_url, device_id)
     if not callback_params:
+        try:
+            response = session.get(consent_url, headers=navigate_headers, allow_redirects=True, verify=False, timeout=30)
+            callback_params = extract_oauth_callback_params_from_url(str(response.url))
+            if not callback_params:
+                for history_response in getattr(response, "history", []) or []:
+                    callback_params = extract_oauth_callback_params_from_url(str(history_response.headers.get("Location") or ""))
+                    if callback_params:
+                        break
+        except Exception:
+            callback_params = None
+    if not callback_params:
         return None
     code = str(callback_params.get("code") or "").strip()
     if not code:
         return None
-    return request_platform_oauth_token(session, code, code_verifier)
+    resp = create_session(config["proxy"]).post(
+        f"{auth_base}/oauth/token",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": platform_oauth_redirect_uri,
+            "client_id": platform_oauth_client_id,
+            "code_verifier": code_verifier,
+        },
+        verify=False,
+        timeout=60,
+    )
+    data = _response_json(resp)
+    if resp.status_code != 200 or not data.get("access_token") or not data.get("refresh_token") or not data.get("id_token"):
+        return None
+    payload = _decode_jwt_payload(str(data.get("id_token") or "")) or _decode_jwt_payload(str(data.get("access_token") or ""))
+    return {
+        "email": str(payload.get("email") or "").strip(),
+        "access_token": str(data.get("access_token") or "").strip(),
+        "refresh_token": str(data.get("refresh_token") or "").strip(),
+        "id_token": str(data.get("id_token") or "").strip(),
+    }
 
 
 class PlatformRegistrar:
@@ -654,6 +687,12 @@ class PlatformRegistrar:
 
     def _login_and_exchange_tokens(self, email: str, password: str, mailbox: dict, index: int) -> dict:
         step(index, "开始独立登录换 token")
+        for cookie in list(self.session.cookies):
+            if "auth.openai.com" in cookie.domain:
+                self.session.cookies.clear(domain=cookie.domain, path=cookie.path, name=cookie.name)
+        self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
+        self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
+
         code_verifier, code_challenge = _generate_pkce()
         params = {
             "issuer": auth_base,
@@ -677,9 +716,62 @@ class PlatformRegistrar:
         if resp is None:
             raise RuntimeError(error or "platform_login_authorize_failed")
         step(index, "登录 authorize 完成")
-        headers = self._json_headers(f"{auth_base}/log-in/password")
-        headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "password_verify")
-        resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/password/verify", json={"password": password}, headers=headers, allow_redirects=False, verify=False)
+
+        def _do_authorize_continue():
+            headers = self._json_headers(f"{auth_base}/log-in?usernameKind=email")
+            headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "authorize_continue")
+            return request_with_local_retry(
+                self.session,
+                "post",
+                f"{auth_base}/api/accounts/authorize/continue",
+                json={"username": {"kind": "email", "value": email}},
+                headers=headers,
+                allow_redirects=False,
+                verify=False,
+            )
+
+        step(index, "开始提交邮箱")
+        resp, error = _do_authorize_continue()
+        if resp is not None and resp.status_code == 409:
+            step(index, "邮箱提交 invalid_state，重新 authorize 后重试")
+            for cookie in list(self.session.cookies):
+                if "auth.openai.com" in cookie.domain:
+                    self.session.cookies.clear(domain=cookie.domain, path=cookie.path, name=cookie.name)
+            self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
+            self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
+            resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=self._navigate_headers(f"{platform_base}/"), allow_redirects=True, verify=False)
+            if resp is None:
+                raise RuntimeError(error or "platform_login_authorize_retry_failed")
+            resp, error = _do_authorize_continue()
+        if resp is None or resp.status_code != 200:
+            data = _response_json(resp) if resp is not None else {}
+            detail = json.dumps(data, ensure_ascii=False) if data else ""
+            raise RuntimeError(error or f"email_submit_http_{getattr(resp, 'status_code', 'unknown')}{f': {detail}' if detail else ''}")
+        step(index, "邮箱提交完成")
+
+        step(index, "开始密码校验")
+        def _do_password_verify():
+            headers = self._json_headers(f"{auth_base}/log-in/password")
+            headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "password_verify")
+            return request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/password/verify", json={"password": password}, headers=headers, allow_redirects=False, verify=False)
+
+        resp, error = _do_password_verify()
+        if resp is not None and resp.status_code == 409:
+            step(index, "密码校验 invalid_state，重新 authorize 后重试")
+            for cookie in list(self.session.cookies):
+                if "auth.openai.com" in cookie.domain:
+                    self.session.cookies.clear(domain=cookie.domain, path=cookie.path, name=cookie.name)
+            self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
+            self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
+            resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=self._navigate_headers(f"{platform_base}/"), allow_redirects=True, verify=False)
+            if resp is None:
+                raise RuntimeError(error or "platform_login_authorize_password_retry_failed")
+            resp, error = _do_authorize_continue()
+            if resp is None or resp.status_code != 200:
+                data = _response_json(resp) if resp is not None else {}
+                detail = json.dumps(data, ensure_ascii=False) if data else ""
+                raise RuntimeError(error or f"email_submit_retry_http_{getattr(resp, 'status_code', 'unknown')}{f': {detail}' if detail else ''}")
+            resp, error = _do_password_verify()
         if resp is None or resp.status_code != 200:
             raise RuntimeError(error or f"password_verify_http_{getattr(resp, 'status_code', 'unknown')}")
         step(index, "密码校验完成")
