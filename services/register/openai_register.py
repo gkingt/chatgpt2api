@@ -693,26 +693,39 @@ class PlatformRegistrar:
         self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
         self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
 
-        code_verifier, code_challenge = _generate_pkce()
-        params = {
-            "issuer": auth_base,
-            "client_id": platform_oauth_client_id,
-            "audience": platform_oauth_audience,
-            "redirect_uri": platform_oauth_redirect_uri,
-            "device_id": self.device_id,
-            "screen_hint": "login_or_signup",
-            "max_age": "0",
-            "login_hint": email,
-            "scope": "openid profile email offline_access",
-            "response_type": "code",
-            "response_mode": "query",
-            "state": secrets.token_urlsafe(32),
-            "nonce": secrets.token_urlsafe(32),
-            "code_challenge": code_challenge,
-            "code_challenge_method": "S256",
-            "auth0Client": platform_auth0_client,
-        }
-        resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=self._navigate_headers(f"{platform_base}/"), allow_redirects=True, verify=False)
+        code_verifier = ""
+
+        def _clear_login_cookies():
+            for cookie in list(self.session.cookies):
+                if "auth.openai.com" in cookie.domain:
+                    self.session.cookies.clear(domain=cookie.domain, path=cookie.path, name=cookie.name)
+            self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
+            self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
+
+        def _authorize_login():
+            nonlocal code_verifier
+            code_verifier, code_challenge = _generate_pkce()
+            params = {
+                "issuer": auth_base,
+                "client_id": platform_oauth_client_id,
+                "audience": platform_oauth_audience,
+                "redirect_uri": platform_oauth_redirect_uri,
+                "device_id": self.device_id,
+                "screen_hint": "login_or_signup",
+                "max_age": "0",
+                "login_hint": email,
+                "scope": "openid profile email offline_access",
+                "response_type": "code",
+                "response_mode": "query",
+                "state": secrets.token_urlsafe(32),
+                "nonce": secrets.token_urlsafe(32),
+                "code_challenge": code_challenge,
+                "code_challenge_method": "S256",
+                "auth0Client": platform_auth0_client,
+            }
+            return request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=self._navigate_headers(f"{platform_base}/"), allow_redirects=True, verify=False)
+
+        resp, error = _authorize_login()
         if resp is None:
             raise RuntimeError(error or "platform_login_authorize_failed")
         step(index, "登录 authorize 完成")
@@ -732,14 +745,12 @@ class PlatformRegistrar:
 
         step(index, "开始提交邮箱")
         resp, error = _do_authorize_continue()
-        if resp is not None and resp.status_code == 409:
-            step(index, "邮箱提交 invalid_state，重新 authorize 后重试")
-            for cookie in list(self.session.cookies):
-                if "auth.openai.com" in cookie.domain:
-                    self.session.cookies.clear(domain=cookie.domain, path=cookie.path, name=cookie.name)
-            self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
-            self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
-            resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=self._navigate_headers(f"{platform_base}/"), allow_redirects=True, verify=False)
+        for attempt in range(2):
+            if resp is None or resp.status_code != 409:
+                break
+            step(index, f"邮箱提交 invalid_state，第{attempt + 1}次重新 authorize 后重试")
+            _clear_login_cookies()
+            resp, error = _authorize_login()
             if resp is None:
                 raise RuntimeError(error or "platform_login_authorize_retry_failed")
             resp, error = _do_authorize_continue()
@@ -758,12 +769,8 @@ class PlatformRegistrar:
         resp, error = _do_password_verify()
         if resp is not None and resp.status_code == 409:
             step(index, "密码校验 invalid_state，重新 authorize 后重试")
-            for cookie in list(self.session.cookies):
-                if "auth.openai.com" in cookie.domain:
-                    self.session.cookies.clear(domain=cookie.domain, path=cookie.path, name=cookie.name)
-            self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
-            self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
-            resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=self._navigate_headers(f"{platform_base}/"), allow_redirects=True, verify=False)
+            _clear_login_cookies()
+            resp, error = _authorize_login()
             if resp is None:
                 raise RuntimeError(error or "platform_login_authorize_password_retry_failed")
             resp, error = _do_authorize_continue()
