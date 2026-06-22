@@ -14,12 +14,17 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
-from curl_cffi import requests
+import requests
+import urllib3
+from curl_cffi import requests as curl_requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from services.account_service import account_service
 from services.proxy_service import ClearanceBundle, proxy_settings
 from services.register import mail_provider
 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 base_dir = Path(__file__).resolve().parent
 config = {
     "mail": {
@@ -284,14 +289,30 @@ def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -
     return sentinel_val
 
 
+def _is_socks_proxy(proxy: str) -> bool:
+    candidate = str(proxy or "").strip().lower()
+    return candidate.startswith("socks5://") or candidate.startswith("socks5h://")
+
+
 def create_session(proxy: str = "") -> Any:
-    kwargs: dict[str, Any] = {"impersonate": "chrome", "verify": False}
     proxy = str(proxy or "").strip()
+    if _is_socks_proxy(proxy):
+        from services.proxy_service import normalize_proxy_url
+
+        return curl_requests.Session(impersonate="chrome", verify=False, proxy=normalize_proxy_url(proxy))
+
+    session = requests.Session()
+    retry = Retry(total=2, connect=2, read=2, backoff_factor=0.5, status_forcelist=(429, 500, 502, 503, 504))
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.verify = False
     if proxy:
         from services.proxy_service import normalize_proxy_url
 
-        kwargs["proxy"] = normalize_proxy_url(proxy)
-    return requests.Session(**kwargs)
+        normalized_proxy = normalize_proxy_url(proxy)
+        session.proxies.update({"http": normalized_proxy, "https": normalized_proxy})
+    return session
 
 
 def _apply_clearance_to_session(session: requests.Session, bundle: ClearanceBundle | None) -> None:
