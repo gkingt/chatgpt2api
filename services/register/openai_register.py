@@ -285,12 +285,12 @@ def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -
 
 
 def create_session(proxy: str = "") -> Any:
-    kwargs = proxy_settings.build_session_kwargs(
-        proxy=proxy,
-        upstream=True,
-        impersonate="chrome",
-        verify=False,
-    )
+    kwargs: dict[str, Any] = {"impersonate": "chrome", "verify": False}
+    proxy = str(proxy or "").strip()
+    if proxy:
+        from services.proxy_service import normalize_proxy_url
+
+        kwargs["proxy"] = normalize_proxy_url(proxy)
     return requests.Session(**kwargs)
 
 
@@ -562,10 +562,7 @@ class PlatformRegistrar:
             "audience": platform_oauth_audience,
             "redirect_uri": platform_oauth_redirect_uri,
             "device_id": self.device_id,
-            # 注册流程显式声明 signup：throwaway 域名 OpenAI 会自动当新账号走注册，
-            # 但 @outlook.com/@hotmail.com 这类真实消费邮箱会被 login_or_signup 路由到登录分支，
-            # 后续 user/register 落在错误的 auth step 上报 invalid_auth_step。
-            "screen_hint": "signup",
+            "screen_hint": "login_or_signup",
             "max_age": "0",
             "login_hint": email,
             "scope": "openid profile email offline_access",
