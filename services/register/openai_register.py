@@ -813,7 +813,7 @@ class PlatformRegistrar:
             step(index, f"收到注册验证码: {code}")
             self._validate_otp(code, index)
             self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
-            tokens = self._exchange_registered_tokens(index)
+            tokens = self._login_and_exchange_tokens(email, password, mailbox, index)
         except Exception as error:
             mail_provider.mark_mailbox_result(mailbox, success=False, error=error)
             raise
