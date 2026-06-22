@@ -15,10 +15,12 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from services.config import DATA_DIR
+from services.protocol.error_response import anthropic_error_response, openai_error_response
 from utils.helper import anthropic_sse_stream, sse_json_stream
 
 LOG_TYPE_CALL = "call"
 LOG_TYPE_ACCOUNT = "account"
+INTERNAL_RESPONSE_KEYS = {"_account_email", "_conversation_id"}
 
 
 class LogService:
@@ -127,6 +129,46 @@ def _collect_urls(value: object) -> list[str]:
     return urls
 
 
+def _collect_account_emails(value: object) -> list[str]:
+    emails: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in {"_account_email", "account_email"} and isinstance(item, str) and item.strip():
+                emails.append(item.strip())
+            else:
+                emails.extend(_collect_account_emails(item))
+    elif isinstance(value, list):
+        for item in value:
+            emails.extend(_collect_account_emails(item))
+    return emails
+
+
+def _collect_conversation_ids(value: object) -> list[str]:
+    ids: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key == "_conversation_id" and isinstance(item, str) and item.strip():
+                ids.append(item.strip())
+            else:
+                ids.extend(_collect_conversation_ids(item))
+    elif isinstance(value, list):
+        for item in value:
+            ids.extend(_collect_conversation_ids(item))
+    return ids
+
+
+def _strip_internal_response_fields(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: _strip_internal_response_fields(item)
+            for key, item in value.items()
+            if key not in INTERNAL_RESPONSE_KEYS
+        }
+    if isinstance(value, list):
+        return [_strip_internal_response_fields(item) for item in value]
+    return value
+
+
 def _request_excerpt(text: object, limit: int = 1000) -> str:
     value = str(text or "").strip()
     if not value:
@@ -138,11 +180,12 @@ def _request_excerpt(text: object, limit: int = 1000) -> str:
 
 
 def _image_error_response(exc: Exception) -> JSONResponse:
-    message = str(exc)
+    from services.protocol.conversation import public_image_error_message
+
+    message = public_image_error_message(str(exc))
     if "no available image quota" in message.lower():
-        return JSONResponse(
-            status_code=429,
-            content={
+        return openai_error_response(
+            {
                 "error": {
                     "message": "no available image quota",
                     "type": "insufficient_quota",
@@ -150,20 +193,18 @@ def _image_error_response(exc: Exception) -> JSONResponse:
                     "code": "insufficient_quota",
                 }
             },
+            429,
         )
     if hasattr(exc, "to_openai_error") and hasattr(exc, "status_code"):
         return JSONResponse(status_code=int(exc.status_code), content=exc.to_openai_error())
-    return JSONResponse(
-        status_code=502,
-        content={
-            "error": {
-                "message": message,
-                "type": "server_error",
-                "param": None,
-                "code": "upstream_error",
-            }
-        },
-    )
+    return openai_error_response(message, 502)
+
+
+def _protocol_error_response(exc: Exception, status_code: int, sse: str) -> JSONResponse:
+    message = str(exc)
+    if sse == "anthropic":
+        return anthropic_error_response(message, status_code)
+    return openai_error_response(message, status_code)
 
 
 def _next_item(items):
@@ -181,6 +222,7 @@ class LoggedCall:
     summary: str
     started: float = field(default_factory=time.time)
     request_text: str = ""
+    request_shape: dict[str, int] | None = None
 
     async def run(self, handler, *args, sse: str = "openai"):
         from services.protocol.conversation import ImageGenerationError
@@ -188,31 +230,39 @@ class LoggedCall:
         try:
             result = await run_in_threadpool(handler, *args)
         except ImageGenerationError as exc:
-            self.log("调用失败", status="failed", error=str(exc))
+            self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
+                     conversation_id=getattr(exc, "conversation_id", ""))
             return _image_error_response(exc)
         except HTTPException as exc:
             self.log("调用失败", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
-            self.log("调用失败", status="failed", error=str(exc))
-            raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
+            self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
+            if self.endpoint.startswith("/v1/images"):
+                return _image_error_response(exc)
+            return _protocol_error_response(exc, 502, sse)
 
         if isinstance(result, dict):
             self.log("调用完成", result)
-            return result
+            response = dict(result)
+            response.pop("_account_email", None)
+            return response
 
         sender = anthropic_sse_stream if sse == "anthropic" else sse_json_stream
         try:
             has_first, first = await run_in_threadpool(_next_item, result)
         except ImageGenerationError as exc:
-            self.log("调用失败", status="failed", error=str(exc))
+            self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
+                     conversation_id=getattr(exc, "conversation_id", ""))
             return _image_error_response(exc)
         except HTTPException as exc:
             self.log("调用失败", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
-            self.log("调用失败", status="failed", error=str(exc))
-            raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
+            self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
+            if self.endpoint.startswith("/v1/images"):
+                return _image_error_response(exc)
+            return _protocol_error_response(exc, 502, sse)
         if not has_first:
             self.log("流式调用结束")
             return StreamingResponse(sender(()), media_type="text/event-stream")
@@ -220,21 +270,37 @@ class LoggedCall:
 
     def stream(self, items):
         urls: list[str] = []
+        account_emails: list[str] = []
+        conversation_ids: list[str] = []
         failed = False
         try:
             for item in items:
                 urls.extend(_collect_urls(item))
-                yield item
+                account_emails.extend(_collect_account_emails(item))
+                conversation_ids.extend(_collect_conversation_ids(item))
+                yield _strip_internal_response_fields(item)
         except Exception as exc:
             failed = True
-            self.log("流式调用失败", status="failed", error=str(exc), urls=urls)
+            self.log(
+                "流式调用失败",
+                status="failed",
+                error=str(exc),
+                urls=urls,
+                account_email=(account_emails[0] if account_emails else getattr(exc, "account_email", "")),
+                conversation_id=(conversation_ids[0] if conversation_ids else getattr(exc, "conversation_id", "")),
+            )
+            if self.endpoint.startswith("/v1/images") and not hasattr(exc, "to_openai_error"):
+                from services.protocol.conversation import ImageGenerationError, public_image_error_message
+
+                raise ImageGenerationError(public_image_error_message(str(exc))) from exc
             raise
         finally:
             if not failed:
-                self.log("流式调用结束", urls=urls)
+                self.log("流式调用结束", urls=urls, account_email=account_emails[0] if account_emails else "",
+                         conversation_id=conversation_ids[0] if conversation_ids else "")
 
     def log(self, suffix: str, result: object = None, status: str = "success", error: str = "",
-            urls: list[str] | None = None) -> None:
+            urls: list[str] | None = None, account_email: str = "", conversation_id: str = "") -> None:
         detail = {
             "key_id": self.identity.get("id"),
             "key_name": self.identity.get("name"),
@@ -249,9 +315,23 @@ class LoggedCall:
         request_excerpt = _request_excerpt(self.request_text)
         if request_excerpt:
             detail["request_text"] = request_excerpt
+        if self.request_shape:
+            detail["request_shape"] = self.request_shape
         if error:
             detail["error"] = error
+        email = str(account_email or "").strip()
+        if not email:
+            emails = _collect_account_emails(result)
+            email = emails[0] if emails else ""
+        if email:
+            detail["account_email"] = email
+        conv_id = str(conversation_id or "").strip()
+        if not conv_id:
+            conv_ids = _collect_conversation_ids(result)
+            conv_id = conv_ids[0] if conv_ids else ""
+        if conv_id:
+            detail["conversation_id"] = conv_id
         collected_urls = [*(urls or []), *_collect_urls(result)]
-        if collected_urls:
+        if collected_urls and not self.endpoint.startswith("/v1/search"):
             detail["urls"] = list(dict.fromkeys(collected_urls))
         log_service.add(LOG_TYPE_CALL, f"{self.summary}{suffix}", detail)

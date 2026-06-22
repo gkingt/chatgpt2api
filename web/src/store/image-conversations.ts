@@ -16,10 +16,16 @@ export type StoredImage = {
   id: string;
   taskId?: string;
   status?: "loading" | "success" | "error";
+  taskStatus?: "queued" | "running";
+  progress?: string;
   b64_json?: string;
   url?: string;
   revised_prompt?: string;
   error?: string;
+  startTime?: number;
+  elapsedSecs?: number;
+  elapsedUpdatedAt?: number;
+  durationMs?: number;
 };
 
 export type ImageTurnStatus = "queued" | "generating" | "success" | "error";
@@ -32,6 +38,9 @@ export type ImageTurn = {
   referenceImages: StoredReferenceImage[];
   count: number;
   size: string;
+  ratio: string;
+  tier: string;
+  quality: string;
   images: StoredImage[];
   createdAt: string;
   status: ImageTurnStatus;
@@ -65,8 +74,13 @@ function normalizeStoredImage(image: StoredImage): StoredImage {
   const normalized = {
     ...image,
     taskId: typeof image.taskId === "string" && image.taskId ? image.taskId : undefined,
+    taskStatus: image.taskStatus === "queued" || image.taskStatus === "running" ? image.taskStatus : undefined,
     url: typeof image.url === "string" && image.url ? image.url : undefined,
     revised_prompt: typeof image.revised_prompt === "string" ? image.revised_prompt : undefined,
+    startTime: typeof image.startTime === "number" ? image.startTime : undefined,
+    elapsedSecs: typeof image.elapsedSecs === "number" ? image.elapsedSecs : undefined,
+    elapsedUpdatedAt: typeof image.elapsedUpdatedAt === "number" ? image.elapsedUpdatedAt : undefined,
+    durationMs: typeof image.durationMs === "number" ? image.durationMs : undefined,
   };
   if (image.status === "loading" || image.status === "error" || image.status === "success") {
     return normalized;
@@ -136,6 +150,9 @@ function normalizeTurn(turn: ImageTurn & Record<string, unknown>): ImageTurn {
     referenceImages: getLegacyReferenceImages(turn),
     count: Math.max(1, Number(turn.count || normalizedImages.length || 1)),
     size: typeof turn.size === "string" ? turn.size : "",
+    ratio: typeof turn.ratio === "string" && turn.ratio ? turn.ratio : "1:1",
+    tier: typeof turn.tier === "string" && turn.tier ? turn.tier : "1k",
+    quality: typeof turn.quality === "string" && turn.quality ? turn.quality : "auto",
     images: normalizedImages,
     createdAt: String(turn.createdAt || new Date().toISOString()),
     status:
@@ -163,6 +180,9 @@ function normalizeConversation(conversation: ImageConversation & Record<string, 
           referenceImages: getLegacyReferenceImages(conversation),
           count: Number(conversation.count || 1),
           size: typeof conversation.size === "string" ? conversation.size : "",
+          ratio: typeof conversation.ratio === "string" && conversation.ratio ? conversation.ratio : "1:1",
+          tier: typeof conversation.tier === "string" && conversation.tier ? conversation.tier : "1k",
+          quality: typeof conversation.quality === "string" && conversation.quality ? conversation.quality : "auto",
           images: Array.isArray(conversation.images) ? (conversation.images as StoredImage[]) : [],
           createdAt: String(conversation.createdAt || new Date().toISOString()),
           status:

@@ -4,12 +4,14 @@ import { useRouter } from "next/navigation";
 import { useRef, useState, type ChangeEvent } from "react";
 import {
   ArrowLeft,
+  Copy,
   ExternalLink,
   FileJson,
   FileText,
   Files,
   KeyRound,
   LoaderCircle,
+  LogIn,
   ServerCog,
   Upload,
 } from "lucide-react";
@@ -26,10 +28,17 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
-import { createAccounts, type Account } from "@/lib/api";
+import {
+  createAccounts,
+  finishOAuthLogin,
+  startOAuthLogin,
+  type Account,
+  type AccountImportPayload,
+  type OAuthLoginStartResponse,
+} from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-type ImportMethod = "menu" | "token" | "session" | "cpa";
+type ImportMethod = "menu" | "token" | "session" | "codex-auth" | "cpa" | "oauth";
 
 type AccountImportDialogProps = {
   disabled?: boolean;
@@ -38,6 +47,7 @@ type AccountImportDialogProps = {
 
 type PendingCpaImport = {
   tokens: string[];
+  accounts: AccountImportPayload[];
   parsedFileCount: number;
   errorCount: number;
 };
@@ -56,9 +66,52 @@ function getSessionAccessToken(value: unknown) {
   return typeof token === "string" ? token.trim() : "";
 }
 
-function getCpaAccessToken(value: unknown) {
-  const token = (value as { access_token?: unknown })?.access_token;
-  return typeof token === "string" ? token.trim() : "";
+function getCpaAccount(value: unknown): AccountImportPayload | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const raw = value as Record<string, unknown>;
+  const tokenValue = raw.access_token ?? raw.accessToken;
+  const token = typeof tokenValue === "string" ? tokenValue.trim() : "";
+  if (!token) {
+    return null;
+  }
+
+  const payload: AccountImportPayload = {
+    ...raw,
+    access_token: token,
+    source_type: "codex",
+  };
+  delete payload.accessToken;
+  if (payload.type === "codex") {
+    payload.export_type = "codex";
+    delete payload.type;
+  }
+  return payload;
+}
+
+function getCodexAuthAccount(value: unknown): AccountImportPayload | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const raw = value as Record<string, unknown>;
+  const tokenValue = raw.access_token ?? raw.accessToken;
+  const token = typeof tokenValue === "string" ? tokenValue.trim() : "";
+  if (!token) {
+    return null;
+  }
+
+  const payload: AccountImportPayload = {
+    ...raw,
+    access_token: token,
+    export_type: "codex",
+    source_type: "codex",
+  };
+  delete payload.accessToken;
+  if (payload.type === "codex") {
+    delete payload.type;
+  }
+  return payload;
 }
 
 function readFileAsText(file: File) {
@@ -108,9 +161,14 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
   const [method, setMethod] = useState<ImportMethod>("menu");
   const [tokenInput, setTokenInput] = useState("");
   const [sessionInput, setSessionInput] = useState("");
+  const [codexAuthInput, setCodexAuthInput] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [pendingCpaImport, setPendingCpaImport] = useState<PendingCpaImport | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const [oauthEmailHint, setOauthEmailHint] = useState("");
+  const [oauthSession, setOauthSession] = useState<OAuthLoginStartResponse | null>(null);
+  const [oauthCallbackInput, setOauthCallbackInput] = useState("");
+  const [oauthStarting, setOauthStarting] = useState(false);
 
   const txtInputRef = useRef<HTMLInputElement | null>(null);
   const cpaInputRef = useRef<HTMLInputElement | null>(null);
@@ -119,8 +177,13 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
     setMethod("menu");
     setTokenInput("");
     setSessionInput("");
+    setCodexAuthInput("");
     setPendingCpaImport(null);
     setConfirmOpen(false);
+    setOauthEmailHint("");
+    setOauthSession(null);
+    setOauthCallbackInput("");
+    setOauthStarting(false);
   };
 
   const handleOpenChange = (nextOpen: boolean) => {
@@ -130,7 +193,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
     }
   };
 
-  const submitTokens = async (tokens: string[], successText?: string) => {
+  const submitTokens = async (tokens: string[], successText?: string, accountPayloads: AccountImportPayload[] = []) => {
     const normalizedTokens = tokens.map((item) => item.trim()).filter(Boolean);
 
     if (normalizedTokens.length === 0) {
@@ -140,7 +203,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
 
     setIsSubmitting(true);
     try {
-      const data = await createAccounts(normalizedTokens);
+      const data = await createAccounts(normalizedTokens, accountPayloads);
       onImported(data.items);
       setOpen(false);
       resetState();
@@ -165,6 +228,79 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
 
   const handleImportTokenText = async () => {
     await submitTokens(splitTokens(tokenInput), "Access Token 导入完成");
+  };
+
+  // 起授权：拿 authorize URL，立刻在新窗口打开，方便用户登录
+  const handleStartOAuth = async () => {
+    setOauthStarting(true);
+    try {
+      const data = await startOAuthLogin(oauthEmailHint.trim());
+      setOauthSession(data);
+      setOauthCallbackInput("");
+      if (typeof window !== "undefined") {
+        window.open(data.authorize_url, "_blank", "noopener,noreferrer");
+      }
+      toast.success("已打开 OpenAI 授权页面，请在登录后复制 callback URL 回来");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "OAuth 起始失败";
+      toast.error(message);
+    } finally {
+      setOauthStarting(false);
+    }
+  };
+
+  // 用粘贴回来的 callback URL 完成换 token + 落盘
+  const handleFinishOAuth = async () => {
+    if (!oauthSession) {
+      toast.error("请先点击\"打开授权页面\"获取 session");
+      return;
+    }
+    const trimmed = oauthCallbackInput.trim();
+    if (!trimmed) {
+      toast.error("请粘贴 callback URL 或 code");
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      const data = await finishOAuthLogin(oauthSession.session_id, trimmed);
+      onImported(data.items);
+      setOpen(false);
+      resetState();
+
+      if ((data.errors?.length ?? 0) > 0) {
+        const firstError = data.errors?.[0]?.error;
+        toast.error(
+          `OAuth 登录完成，新增 ${data.added ?? 0} 个，已刷新 ${data.refreshed ?? 0} 个，失败 ${data.errors?.length ?? 0} 个${firstError ? `，首个错误：${firstError}` : ""}`,
+        );
+      } else {
+        toast.success(
+          `OAuth 登录完成，新增 ${data.added ?? 0} 个，跳过 ${data.skipped ?? 0} 个重复项，已自动刷新账号信息`,
+        );
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "OAuth 换 token 失败";
+      toast.error(message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  // 复制 authorize URL 到剪贴板（适配浏览器和 fallback）
+  const handleCopyAuthorizeUrl = async () => {
+    if (!oauthSession) {
+      return;
+    }
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(oauthSession.authorize_url);
+        toast.success("授权 URL 已复制到剪贴板");
+      } else {
+        toast.error("当前环境不支持自动复制，请手动选择并复制");
+      }
+    } catch {
+      toast.error("复制失败，请手动选择并复制");
+    }
   };
 
   const handleTxtSelected = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -217,6 +353,28 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
     }
   };
 
+  const handleImportCodexAuthJson = async () => {
+    if (!codexAuthInput.trim()) {
+      toast.error("请先粘贴 Codex 认证 JSON");
+      return;
+    }
+
+    try {
+      const payload = JSON.parse(codexAuthInput) as unknown;
+      const account = getCodexAuthAccount(payload);
+
+      if (!account) {
+        toast.error("未从 Codex 认证 JSON 中提取到 access_token");
+        return;
+      }
+
+      await submitTokens([account.access_token], "Codex 认证 JSON 导入完成", [account]);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Codex 认证 JSON 解析失败";
+      toast.error(message);
+    }
+  };
+
   const handleCpaSelected = async (event: ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files ?? []);
     event.target.value = "";
@@ -230,15 +388,16 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
         files.map(async (file) => {
           const raw = await readFileAsText(file);
           const parsed = JSON.parse(raw) as unknown;
-          const token = getCpaAccessToken(parsed);
+          const account = getCpaAccount(parsed);
           return {
-            token,
+            account,
           };
         }),
       );
 
-      const tokens = results.map((item) => item.token).filter((item): item is string => Boolean(item));
-      const parsedFileCount = tokens.length;
+      const accounts = results.map((item) => item.account).filter((item): item is AccountImportPayload => Boolean(item));
+      const tokens = accounts.map((item) => item.access_token);
+      const parsedFileCount = accounts.length;
       const errorCount = results.length - parsedFileCount;
 
       if (parsedFileCount === 0) {
@@ -248,6 +407,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
 
       setPendingCpaImport({
         tokens,
+        accounts,
         parsedFileCount,
         errorCount,
       });
@@ -357,6 +517,105 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
       );
     }
 
+    if (method === "oauth") {
+      return (
+        <div className="space-y-4">
+          <button
+            type="button"
+            onClick={() => setMethod("menu")}
+            className="inline-flex items-center gap-1 text-sm text-stone-500 transition hover:text-stone-800"
+          >
+            <ArrowLeft className="size-4" />
+            返回导入方式
+          </button>
+          <div className="rounded-2xl border border-stone-200 bg-stone-50 p-4 text-sm leading-6 text-stone-600 space-y-2">
+            <div className="font-medium text-stone-800">操作步骤</div>
+            <ol className="list-decimal pl-5 space-y-1">
+              <li>（可选）填写你 ChatGPT 账号的邮箱，登录页会预填。</li>
+              <li>点击下方"打开授权页面"，在新标签里登录自己的 ChatGPT 账号。</li>
+              <li>登录完成后浏览器会跳到 <code className="rounded bg-stone-200 px-1">platform.openai.com/auth/callback?code=...</code>。立刻从地址栏复制整段 URL（或开 F12 在 Network 里抓到 callback 那一行，右键 Copy → Copy URL）。</li>
+              <li>把 callback URL 粘到下面输入框，点"完成导入"。</li>
+            </ol>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm font-medium text-stone-700">邮箱（可选预填）</label>
+            <input
+              type="email"
+              placeholder="you@example.com"
+              value={oauthEmailHint}
+              onChange={(event) => setOauthEmailHint(event.target.value)}
+              disabled={Boolean(oauthSession) || oauthStarting}
+              className="w-full rounded-xl border border-stone-200 bg-white px-3 py-2 text-sm outline-none focus:border-stone-400"
+            />
+          </div>
+          {!oauthSession ? (
+            <Button
+              type="button"
+              className="h-10 rounded-xl bg-stone-950 text-white hover:bg-stone-800"
+              onClick={() => void handleStartOAuth()}
+              disabled={oauthStarting}
+            >
+              {oauthStarting ? <LoaderCircle className="size-4 animate-spin" /> : <ExternalLink className="size-4" />}
+              打开授权页面
+            </Button>
+          ) : (
+            <div className="space-y-3">
+              <div className="rounded-2xl border border-stone-200 bg-white p-3 text-xs leading-6 text-stone-600 break-all font-mono">
+                {oauthSession.authorize_url}
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="rounded-xl border-stone-200 bg-white"
+                  onClick={() => void handleCopyAuthorizeUrl()}
+                >
+                  <Copy className="size-4" />
+                  复制授权 URL
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="rounded-xl border-stone-200 bg-white"
+                  onClick={() => window.open(oauthSession.authorize_url, "_blank", "noopener,noreferrer")}
+                >
+                  <ExternalLink className="size-4" />
+                  再次打开
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="rounded-xl border-stone-200 bg-white"
+                  onClick={() => {
+                    setOauthSession(null);
+                    setOauthCallbackInput("");
+                  }}
+                >
+                  重新生成
+                </Button>
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-stone-700">粘贴 callback URL（或仅 code）</label>
+                <Textarea
+                  placeholder={"https://platform.openai.com/auth/callback?code=...&state=..."}
+                  value={oauthCallbackInput}
+                  onChange={(event) => setOauthCallbackInput(event.target.value)}
+                  className="min-h-24 resize-none rounded-xl border-stone-200 font-mono text-xs"
+                />
+              </div>
+            </div>
+          )}
+          <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm leading-6 text-amber-900">
+            <div className="font-medium">注意</div>
+            <div>
+              授权码（code）只能使用一次。如果浏览器的 callback 页加载完成、显示了 OpenAI 的错误页，那 code 大概率已经被消耗，
+              请点击"重新生成"再走一次。整个流程在 10 分钟内完成即可。
+            </div>
+          </div>
+        </div>
+      );
+    }
+
     if (method === "cpa") {
       return (
         <div className="space-y-4">
@@ -403,8 +662,38 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
       );
     }
 
+    if (method === "codex-auth") {
+      return (
+        <div className="space-y-4">
+          <button
+            type="button"
+            onClick={() => setMethod("menu")}
+            className="inline-flex items-center gap-1 text-sm text-stone-500 transition hover:text-stone-800"
+          >
+            <ArrowLeft className="size-4" />
+            返回导入方式
+          </button>
+          <div className="space-y-2">
+            <label className="text-sm font-medium text-stone-700">Codex 认证 JSON</label>
+            <Textarea
+              placeholder='粘贴包含 "access_token"、"refresh_token"、"id_token" 的 Codex 认证 JSON...'
+              value={codexAuthInput}
+              onChange={(event) => setCodexAuthInput(event.target.value)}
+              className="min-h-64 resize-none rounded-xl border-stone-200 font-mono text-xs"
+            />
+          </div>
+        </div>
+      );
+    }
+
     return (
       <div className="space-y-3">
+        <MethodCard
+          title="OAuth 登录已有账号（带自动刷新）"
+          description="用浏览器登录自己的 ChatGPT 账号，回填 callback URL 即可拿到 refresh_token，后台会自动续期。"
+          icon={LogIn}
+          onClick={() => setMethod("oauth")}
+        />
         <MethodCard
           title="导入 Access Token"
           description="支持直接粘贴，一行一个；也支持从 TXT 文件读取，一行一个。"
@@ -416,6 +705,12 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
           description="从 chatgpt.com 的 session 接口复制完整 JSON，自动提取 accessToken。"
           icon={FileJson}
           onClick={() => setMethod("session")}
+        />
+        <MethodCard
+          title="导入 Codex 认证 JSON"
+          description="粘贴 Codex 认证 JSON，导入后账号来源标记为 codex。"
+          icon={FileJson}
+          onClick={() => setMethod("codex-auth")}
         />
         <MethodCard
           title="导入 CPA JSON 文件"
@@ -469,7 +764,11 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
                   ? "导入 Access Token"
                   : method === "session"
                     ? "导入 Session JSON"
-                    : "导入 CPA JSON"}
+                    : method === "codex-auth"
+                      ? "导入 Codex 认证 JSON"
+                    : method === "oauth"
+                      ? "OAuth 登录已有账号"
+                      : "导入 CPA JSON"}
             </DialogTitle>
             <DialogDescription className="text-sm leading-6">
               {method === "menu"
@@ -478,7 +777,11 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
                   ? "支持手动粘贴或从 TXT 文件导入，一行一个 Token。"
                   : method === "session"
                     ? "粘贴完整 Session JSON，系统会自动提取 accessToken。"
-                    : "支持一次读取多个本地 JSON 文件，并在提交前做数量确认。"}
+                    : method === "codex-auth"
+                      ? "粘贴 Codex 认证 JSON，系统会按 codex 来源导入。"
+                    : method === "oauth"
+                      ? "用浏览器跑一遍 OpenAI 标准 OAuth，拿回 refresh_token 后系统会自动续期。"
+                      : "支持一次读取多个本地 JSON 文件，并在提交前做数量确认。"}
             </DialogDescription>
           </DialogHeader>
 
@@ -511,6 +814,29 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
               >
                 {isSubmitting ? <LoaderCircle className="size-4 animate-spin" /> : null}
                 导入 JSON
+              </Button>
+            ) : null}
+            {method === "codex-auth" ? (
+              <Button
+                className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
+                onClick={() => void handleImportCodexAuthJson()}
+                disabled={footerDisabled}
+              >
+                {isSubmitting ? <LoaderCircle className="size-4 animate-spin" /> : null}
+                导入 JSON
+              </Button>
+            ) : null}
+            {method === "oauth" ? (
+              <Button
+                className={cn(
+                  "h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800",
+                  !oauthSession ? "hidden" : "",
+                )}
+                onClick={() => void handleFinishOAuth()}
+                disabled={footerDisabled || !oauthSession || !oauthCallbackInput.trim()}
+              >
+                {isSubmitting ? <LoaderCircle className="size-4 animate-spin" /> : null}
+                完成导入
               </Button>
             ) : null}
             {method === "cpa" ? (
@@ -553,7 +879,13 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
             </Button>
             <Button
               className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
-              onClick={() => void submitTokens(pendingCpaImport?.tokens ?? [], "CPA JSON 导入完成")}
+              onClick={() =>
+                void submitTokens(
+                  pendingCpaImport?.tokens ?? [],
+                  "CPA JSON 导入完成",
+                  pendingCpaImport?.accounts ?? [],
+                )
+              }
               disabled={isSubmitting || !pendingCpaImport}
             >
               {isSubmitting ? <LoaderCircle className="size-4 animate-spin" /> : null}

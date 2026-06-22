@@ -1,30 +1,177 @@
 import base64
 import hashlib
 import json
+import mimetypes
 import re
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import urlparse
 
 from curl_cffi import requests
 from fastapi import HTTPException
+from services.proxy_service import proxy_settings
 from utils.log import logger
 
-IMAGE_MODELS = {"gpt-image-2", "codex-gpt-image-2"}
+BASE_IMAGE_MODELS = {"gpt-image-2", "codex-gpt-image-2"}
+IMAGE_MODEL_PLAN_TYPES = ("plus", "team", "pro")
+CODEX_IMAGE_MODEL = "codex-gpt-image-2"
+PREFIXED_CODEX_IMAGE_MODELS = {
+    f"{plan_type}-{CODEX_IMAGE_MODEL}"
+    for plan_type in IMAGE_MODEL_PLAN_TYPES
+}
+IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
+PUBLIC_IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+
+SUPPORTED_JSON_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
+MAX_JSON_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_JSON_EDIT_IMAGES = 10
+DATA_URL_IMAGE_RE = re.compile(r"^data:(?P<mime>[-+./\w]+);base64,(?P<data>.*)$", re.DOTALL)
+REMOTE_IMAGE_TIMEOUT_SECONDS = 20
+
+
+def _image_extension(mime_type: str) -> str:
+    image_type = mime_type.split("/", 1)[1].split(";", 1)[0].lower() if "/" in mime_type else "png"
+    return "jpg" if image_type == "jpeg" else image_type or "png"
+
+
+def _decode_json_image_string(value: str, index: int, filename: str | None = None, mime_type: str | None = None) -> tuple[bytes, str, str]:
+    text = value.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail={"error": "image file is empty"})
+    match = DATA_URL_IMAGE_RE.match(text)
+    if match:
+        resolved_mime = (match.group("mime") or "image/png").lower()
+        encoded = match.group("data")
+    else:
+        if text.startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail={"error": "remote image URLs are not supported"})
+        resolved_mime = (mime_type or "image/png").lower()
+        encoded = text
+    if resolved_mime == "image/jpg":
+        resolved_mime = "image/jpeg"
+    if resolved_mime not in SUPPORTED_JSON_IMAGE_MIME_TYPES:
+        raise HTTPException(status_code=400, detail={"error": "unsupported image mime type"})
+    try:
+        image_data = base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail={"error": "invalid base64 image data"}) from exc
+    if not image_data:
+        raise HTTPException(status_code=400, detail={"error": "image file is empty"})
+    if len(image_data) > MAX_JSON_IMAGE_BYTES:
+        raise HTTPException(status_code=400, detail={"error": "image file is too large"})
+    return image_data, filename or f"image_{index}.{_image_extension(resolved_mime)}", resolved_mime
+
+
+def _extract_json_image_value(item: object) -> tuple[str, str | None, str | None]:
+    if isinstance(item, str):
+        return item, None, None
+    if not isinstance(item, dict):
+        raise HTTPException(status_code=400, detail={"error": "image entry must be a base64 string or object"})
+    filename = str(item.get("filename") or item.get("file_name") or "").strip() or None
+    mime_type = str(item.get("mime_type") or item.get("mimeType") or "").strip() or None
+    value = item.get("b64_json") or item.get("base64")
+    if not value:
+        image_url = item.get("image_url") or item.get("url")
+        if isinstance(image_url, dict):
+            filename = filename or str(image_url.get("filename") or image_url.get("file_name") or "").strip() or None
+            mime_type = mime_type or str(image_url.get("mime_type") or image_url.get("mimeType") or "").strip() or None
+            value = image_url.get("url") or image_url.get("image_url")
+        else:
+            value = image_url
+    if not isinstance(value, str) or not value.strip():
+        raise HTTPException(status_code=400, detail={"error": "image entry must include image data"})
+    return value, filename, mime_type
+
+
+def normalize_json_edit_images(image: object = None, images: object = None) -> list[tuple[bytes, str, str]]:
+    raw_images = images if images is not None else image
+    if raw_images is None:
+        raise HTTPException(status_code=400, detail={"error": "image file is required"})
+    entries = raw_images if isinstance(raw_images, list) else [raw_images]
+    if not entries:
+        raise HTTPException(status_code=400, detail={"error": "image file is required"})
+    if len(entries) > MAX_JSON_EDIT_IMAGES:
+        raise HTTPException(status_code=400, detail={"error": f"images supports up to {MAX_JSON_EDIT_IMAGES} items"})
+    normalized = []
+    for index, item in enumerate(entries, start=1):
+        value, filename, mime_type = _extract_json_image_value(item)
+        normalized.append(_decode_json_image_string(value, index, filename, mime_type))
+    return normalized
 
 
 def new_uuid() -> str:
     return str(uuid.uuid4())
 
 
+def split_image_model(model: object) -> tuple[str | None, str | None]:
+    normalized = str(model or "").strip().lower()
+    if not normalized:
+        return None, None
+    if normalized in BASE_IMAGE_MODELS:
+        return None, normalized
+    for plan_type in IMAGE_MODEL_PLAN_TYPES:
+        prefix = f"{plan_type}-"
+        if normalized.startswith(prefix):
+            base_model = normalized[len(prefix):]
+            if base_model == CODEX_IMAGE_MODEL:
+                return plan_type, base_model
+    return None, None
+
+
+def is_supported_image_model(model: object) -> bool:
+    _, base_model = split_image_model(model)
+    return base_model is not None
+
+
+def is_codex_image_model(model: object) -> bool:
+    _, base_model = split_image_model(model)
+    return base_model == CODEX_IMAGE_MODEL
+
+
 def is_image_chat_request(body: dict[str, object]) -> bool:
     model = str(body.get("model") or "").strip()
     modalities = body.get("modalities")
-    if model in IMAGE_MODELS:
+    if is_supported_image_model(model):
         return True
     return isinstance(modalities, list) and "image" in {str(item or "").strip().lower() for item in modalities}
+
+
+_UPSTREAM_BODY_LOG_LIMIT = 500
+
+
+class UpstreamHTTPError(RuntimeError):
+    """Raised when an upstream HTTP call returns a non-2xx status.
+
+    Carries structured fields (status_code, body, retry_after) so callers can
+    branch on status code instead of string-matching on str(exc). The full
+    body is preserved on the instance; the formatted message truncates it
+    to keep log lines reasonable.
+    """
+
+    def __init__(
+        self,
+        context: str,
+        status_code: int,
+        body: Any,
+        retry_after: int | None = None,
+    ) -> None:
+        self.context = context
+        self.status_code = status_code
+        self.body = body
+        self.retry_after = retry_after
+        if isinstance(body, (dict, list)):
+            try:
+                body_str = json.dumps(body, ensure_ascii=False)
+            except (TypeError, ValueError):
+                body_str = repr(body)
+        else:
+            body_str = str(body)
+        if len(body_str) > _UPSTREAM_BODY_LOG_LIMIT:
+            body_str = body_str[:_UPSTREAM_BODY_LOG_LIMIT] + "…[truncated]"
+        super().__init__(f"{context} failed: status={status_code}, body={body_str}")
 
 
 def ensure_ok(response: requests.Response, context: str) -> None:
@@ -35,7 +182,13 @@ def ensure_ok(response: requests.Response, context: str) -> None:
         body = response.json()
     except Exception:
         pass
-    raise RuntimeError(f"{context} failed: status={response.status_code}, body={body}")
+    retry_after_header = response.headers.get("Retry-After") if hasattr(response, "headers") else None
+    retry_after: int | None = None
+    if retry_after_header is not None:
+        ra_str = str(retry_after_header).strip()
+        if ra_str.isdigit():
+            retry_after = int(ra_str)
+    raise UpstreamHTTPError(context, response.status_code, body, retry_after=retry_after)
 
 
 def sse_json_stream(items) -> Iterator[str]:
@@ -167,6 +320,80 @@ def extract_prompt_from_message_content(content: object) -> str:
     return "\n".join(parts).strip()
 
 
+def _message_image_url(value: object) -> str:
+    if isinstance(value, dict):
+        return str(value.get("url") or value.get("image_url") or "").strip()
+    return str(value or "").strip()
+
+
+def _decode_message_image_url(value: object) -> tuple[bytes, str] | None:
+    source = _message_image_url(value)
+    if source.startswith("data:"):
+        header, _, data = source.partition(",")
+        mime = header.split(";")[0].removeprefix("data:") or "image/png"
+        return base64.b64decode(data), mime
+    if not source.startswith(("http://", "https://")):
+        return None
+    parsed = urlparse(source)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+
+    try:
+        response = requests.get(
+            source,
+            headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api vision fetcher"},
+            timeout=REMOTE_IMAGE_TIMEOUT_SECONDS,
+            allow_redirects=True,
+            **proxy_settings.build_session_kwargs(),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc
+    if not 200 <= response.status_code < 300:
+        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: HTTP {response.status_code}"})
+    content_length = str(response.headers.get("content-length") or "").strip()
+    if content_length.isdigit() and int(content_length) > MAX_JSON_IMAGE_BYTES:
+        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
+    image_data = response.content
+    if not image_data:
+        raise HTTPException(status_code=400, detail={"error": "image_url returned empty content"})
+    if len(image_data) > MAX_JSON_IMAGE_BYTES:
+        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
+    mime = str(response.headers.get("content-type") or "image/png").split(";", 1)[0].lower()
+    guessed_mime = mimetypes.guess_type(parsed.path)[0] or ""
+    if mime and not mime.startswith("image/") and mime not in {"application/octet-stream", "binary/octet-stream"}:
+        raise HTTPException(status_code=400, detail={"error": "image_url must point to an image"})
+    if not mime.startswith("image/") and guessed_mime.startswith("image/"):
+        mime = guessed_mime
+    if not mime.startswith("image/"):
+        mime = "image/png"
+    return image_data, mime
+
+
+def _decode_message_image_object(item: dict[str, object]) -> tuple[bytes, str] | None:
+    data = item.get("data")
+    if isinstance(data, (bytes, bytearray)):
+        return bytes(data), str(item.get("mime") or item.get("mime_type") or "image/png")
+    for key in ("image_url", "url"):
+        image = _decode_message_image_url(item.get(key))
+        if image:
+            return image
+    value = item.get("b64_json") or item.get("base64")
+    if isinstance(value, str) and value.strip():
+        image_data, _, mime = _decode_json_image_string(
+            value,
+            1,
+            mime_type=str(item.get("mime") or item.get("mime_type") or item.get("mimeType") or "image/png"),
+        )
+        return image_data, mime
+    source = item.get("source")
+    if isinstance(source, dict) and str(source.get("type") or "") == "base64":
+        encoded = str(source.get("data") or "")
+        mime = str(source.get("media_type") or source.get("mime_type") or "image/png")
+        image_data, _, resolved_mime = _decode_json_image_string(encoded, 1, mime_type=mime)
+        return image_data, resolved_mime
+    return None
+
+
 def extract_image_from_message_content(content: object) -> list[tuple[bytes, str]]:
     if not isinstance(content, list):
         return []
@@ -176,18 +403,13 @@ def extract_image_from_message_content(content: object) -> list[tuple[bytes, str
             continue
         item_type = str(item.get("type") or "").strip()
         if item_type == "image_url":
-            url_obj = item.get("image_url") or item
-            url = str(url_obj.get("url") or "") if isinstance(url_obj, dict) else str(url_obj)
-            if url.startswith("data:"):
-                header, _, data = url.partition(",")
-                mime = header.split(";")[0].removeprefix("data:")
-                images.append((base64.b64decode(data), mime or "image/png"))
-        elif item_type == "input_image":
-            image_url = str(item.get("image_url") or "")
-            if image_url.startswith("data:"):
-                header, _, data = image_url.partition(",")
-                mime = header.split(";")[0].removeprefix("data:")
-                images.append((base64.b64decode(data), mime or "image/png"))
+            image = _decode_message_image_url(item.get("image_url") or item.get("url") or item)
+            if image:
+                images.append(image)
+        elif item_type in {"input_image", "image"}:
+            image = _decode_message_image_object(item)
+            if image:
+                images.append(image)
     return images
 
 

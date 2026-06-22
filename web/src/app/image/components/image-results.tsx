@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import { Clock3, Download, LoaderCircle, RotateCcw, Sparkles, Trash2 } from "lucide-react";
+import { memo, useEffect, useRef, useState } from "react";
+import { Clock3, Download, EyeOff, LoaderCircle, RotateCcw, Sparkles, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -23,27 +23,55 @@ type ImageResultsProps = {
   onReuseTurnConfig: (conversationId: string, turnId: string) => void | Promise<void>;
   onRegenerateTurn: (conversationId: string, turnId: string) => void | Promise<void>;
   onRetryImage: (conversationId: string, turnId: string, imageId: string) => void | Promise<void>;
+  onTimeoutRetryContinue: (taskId: string) => void | Promise<void>;
+  onDismissErrors: (conversationId: string, turnId: string) => void | Promise<void>;
   formatConversationTime: (value: string) => string;
 };
 
+// Blob URL 缓存：避免 base64 超长字符串在 DOM 中，改用短小的 blob: URL
+const b64BlobUrlCache = new Map<string, string>();
+
 function getStoredImageSrc(image: StoredImage) {
   if (image.b64_json) {
-    return `data:image/png;base64,${image.b64_json}`;
+    let url = b64BlobUrlCache.get(image.b64_json);
+    if (!url) {
+      const binary = atob(image.b64_json);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const blob = new Blob([bytes], { type: "image/png" });
+      url = URL.createObjectURL(blob);
+      b64BlobUrlCache.set(image.b64_json, url);
+    }
+    return url;
   }
   return image.url || "";
 }
 
 async function downloadStoredImage(image: StoredImage, index: number) {
-  let blob: Blob;
-  if (image.b64_json) {
-    const binary = atob(image.b64_json);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    blob = new Blob([bytes], { type: "image/png" });
-  } else if (image.url) {
-    const res = await fetch(image.url);
-    blob = await res.blob();
-  } else {
+  let blob: Blob | null = null;
+  try {
+    if (image.b64_json) {
+      const binary = atob(image.b64_json);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      blob = new Blob([bytes], { type: "image/png" });
+    } else if (image.url) {
+      // 确保 URL 是绝对路径
+      const url = image.url.startsWith("http") ? image.url : `${window.location.origin}${image.url}`;
+      const res = await fetch(url);
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+      }
+      blob = await res.blob();
+    } else {
+      return;
+    }
+  } catch (err) {
+    console.error("Failed to download image:", err);
+    // 如果 fetch 失败，尝试直接在新窗口打开
+    if (image.url) {
+      window.open(image.url, "_blank");
+    }
     return;
   }
   const url = URL.createObjectURL(blob);
@@ -65,18 +93,31 @@ export function ImageResults({
   onReuseTurnConfig,
   onRegenerateTurn,
   onRetryImage,
+  onTimeoutRetryContinue,
+  onDismissErrors,
   formatConversationTime,
 }: ImageResultsProps) {
-  const [imageDimensions, setImageDimensions] = useState<Record<string, string>>({});
+  const imageDimensionsRef = useRef<Record<string, string>>({});
+  const [currentTime, setCurrentTime] = useState(Date.now());
+  
+  // 仅在存在 loading 图片时启动定时器，避免空闲时无谓重渲染
+  const hasLoadingImages = selectedConversation?.turns.some(
+    (turn) => !turn.resultsDeleted && turn.images.some((image) => image.status === "loading"),
+  );
+  useEffect(() => {
+    if (!hasLoadingImages) return;
+    const timer = setInterval(() => {
+      setCurrentTime(Date.now());
+    }, 500);
+    return () => clearInterval(timer);
+  }, [hasLoadingImages]);
 
   const updateImageDimensions = (id: string, width: number, height: number) => {
     const dimensions = formatImageDimensions(width, height);
-    setImageDimensions((current) => {
-      if (current[id] === dimensions) {
-        return current;
-      }
-      return { ...current, [id]: dimensions };
-    });
+    // 使用 ref 存储，不触发 React 重渲染，消除级联重渲染
+    if (imageDimensionsRef.current[id] !== dimensions) {
+      imageDimensionsRef.current[id] = dimensions;
+    }
   };
 
   if (!selectedConversation) {
@@ -119,7 +160,7 @@ export function ImageResults({
                   id: image.id,
                   src,
                   sizeLabel: image.b64_json ? formatBase64ImageSize(image.b64_json) : undefined,
-                  dimensions: imageDimensions[image.id],
+                  dimensions: imageDimensionsRef.current[image.id],
                 },
               ]
             : [];
@@ -210,7 +251,7 @@ export function ImageResults({
                       if (image.status === "success" && imageSrc) {
                         const currentIndex = successfulTurnImages.findIndex((item) => item.id === image.id);
                         const sizeLabel = image.b64_json ? formatBase64ImageSize(image.b64_json) : "";
-                        const dimensions = imageDimensions[image.id];
+                        const dimensions = imageDimensionsRef.current[image.id];
                         const imageMeta = [sizeLabel, dimensions].filter(Boolean).join(" · ");
 
                         return (
@@ -218,28 +259,24 @@ export function ImageResults({
                             key={image.id}
                             className="break-inside-avoid"
                           >
-                            <button
-                              type="button"
-                              onClick={() => onOpenLightbox(successfulTurnImages, currentIndex)}
+                            <LazyImage
+                              src={imageSrc}
+                              alt={`Generated result ${index + 1}`}
                               className="group block aspect-square w-full cursor-zoom-in overflow-hidden rounded-xl sm:aspect-auto"
-                            >
-                              <img
-                                src={imageSrc}
-                                alt={`Generated result ${index + 1}`}
-                                className="block h-full w-full object-cover transition duration-200 group-hover:brightness-90 sm:h-auto sm:object-contain"
-                                onLoad={(event) => {
-                                  updateImageDimensions(
-                                    image.id,
-                                    event.currentTarget.naturalWidth,
-                                    event.currentTarget.naturalHeight,
-                                  );
-                                }}
-                              />
-                            </button>
+                              onLoad={(event) => {
+                                updateImageDimensions(
+                                  image.id,
+                                  event.currentTarget.naturalWidth,
+                                  event.currentTarget.naturalHeight,
+                                );
+                              }}
+                              onOpen={() => onOpenLightbox(successfulTurnImages, currentIndex)}
+                            />
                             <div className="flex flex-col gap-1 px-0.5 py-1 text-[10px] sm:flex-row sm:items-center sm:justify-between sm:gap-2 sm:px-3 sm:py-3 sm:text-xs">
                               <div className="min-w-0 text-stone-500">
                                 <span>结果 {index + 1}</span>
-                                {imageMeta ? <span className="block text-stone-400 sm:ml-2 sm:inline">{imageMeta}</span> : null}
+                                {image.durationMs != null ? <span className="text-stone-400 sm:ml-2">{formatDuration(image.durationMs)}</span> : null}
+                                {imageMeta ? <span className="block text-stone-400">{imageMeta}</span> : null}
                               </div>
                               <div className="flex items-center gap-1.5">
                                 <Button
@@ -269,65 +306,111 @@ export function ImageResults({
                       }
 
                       if (image.status === "error") {
+                        const isTimeoutError = image.error?.includes("超时") && image.taskId;
                         return (
-                          <div
-                            key={image.id}
-                            className={cn(
-                              "break-inside-avoid overflow-hidden rounded-xl border border-rose-200 bg-rose-50 sm:rounded-none",
-                              "aspect-square",
-                              turn.size === "1:1" && "sm:aspect-square",
-                              turn.size === "16:9" && "sm:aspect-video",
-                              turn.size === "9:16" && "sm:aspect-[9/16]",
-                              turn.size === "4:3" && "sm:aspect-[4/3]",
-                              turn.size === "3:4" && "sm:aspect-[3/4]",
-                              !["1:1", "16:9", "9:16", "4:3", "3:4"].includes(turn.size) && "sm:aspect-square",
-                            )}
-                          >
+                          <div key={image.id} className="break-inside-avoid">
+                            <div
+                              className={cn(
+                                "overflow-hidden rounded-xl border border-rose-200 bg-rose-50",
+                                "aspect-square",
+                                turn.ratio === "1:1" && "sm:aspect-square",
+                                turn.ratio === "16:9" && "sm:aspect-video",
+                                turn.ratio === "9:16" && "sm:aspect-[9/16]",
+                                turn.ratio === "4:3" && "sm:aspect-[4/3]",
+                                turn.ratio === "3:4" && "sm:aspect-[3/4]",
+                              )}
+                            >
                             <div className="flex h-full min-h-16 flex-col items-center justify-center gap-1.5 px-2 py-2 text-center text-[11px] leading-4 text-rose-600 sm:gap-3 sm:px-6 sm:py-8 sm:text-sm sm:leading-6">
+                              <p className="font-medium">图片 {index + 1}/{turn.images.length}</p>
                               <span className="line-clamp-2 sm:line-clamp-none">{image.error || "生成失败"}</span>
-                              <button
-                                type="button"
-                                onClick={() => void onRetryImage(selectedConversation.id, turn.id, image.id)}
-                                className="rounded-full bg-white px-2 py-1 text-[10px] font-medium text-rose-600 shadow-sm transition hover:bg-rose-100 sm:px-3 sm:text-xs"
-                              >
-                                重新生成这一张
-                              </button>
+                              <div className="flex items-center gap-2">
+                                {isTimeoutError && (
+                                  <button
+                                    type="button"
+                                    onClick={() => void onTimeoutRetryContinue(image.taskId!)}
+                                    className="rounded-full bg-emerald-100 px-2 py-1 text-[10px] font-medium text-emerald-600 shadow-sm transition hover:bg-emerald-200 sm:px-3 sm:text-xs"
+                                  >
+                                    继续等待
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => void onRetryImage(selectedConversation.id, turn.id, image.id)}
+                                  className="rounded-full bg-white px-2 py-1 text-[10px] font-medium text-rose-600 shadow-sm transition hover:bg-rose-100 sm:px-3 sm:text-xs"
+                                >
+                                  重新生成这一张
+                                </button>
+                              </div>
+                            </div>
+                            </div>
+                            <div className="flex flex-col gap-1 px-0.5 py-1 text-[10px] sm:flex-row sm:items-center sm:justify-between sm:gap-2 sm:px-3 sm:py-3 sm:text-xs">
+                              <div className="min-w-0 text-stone-500">
+                                <span>结果 {index + 1}</span>
+                                {image.durationMs != null ? <span className="text-stone-400 sm:ml-2">{formatDuration(image.durationMs)}</span> : null}
+                                <span className="block text-transparent">-</span>
+                              </div>
                             </div>
                           </div>
                         );
                       }
 
+                      const imageTaskStatus = image.taskStatus || (turn.status === "queued" ? "queued" : "running");
+                      const imageStatusLabel = imageTaskStatus === "queued" ? "排队中" : getProgressLabel(image.progress);
+                      const showElapsed = imageTaskStatus === "running" && image.elapsedSecs != null;
+                      const elapsedDisplay = showElapsed
+                        ? formatElapsed(
+                            image.elapsedUpdatedAt != null
+                              ? image.elapsedSecs! + (currentTime - image.elapsedUpdatedAt!) / 1000
+                              : image.elapsedSecs!,
+                          )
+                        : null;
                       return (
-                        <div
-                          key={image.id}
-                          className={cn(
-                            "break-inside-avoid overflow-hidden rounded-xl border border-stone-200/80 bg-stone-100/80 sm:rounded-none",
-                            turn.size === "1:1" && "aspect-square",
-                            turn.size === "16:9" && "aspect-video",
-                            turn.size === "9:16" && "aspect-[9/16]",
-                            turn.size === "4:3" && "aspect-[4/3]",
-                            turn.size === "3:4" && "aspect-[3/4]",
-                            !["1:1", "16:9", "9:16", "4:3", "3:4"].includes(turn.size) && "aspect-square",
-                          )}
-                        >
+                        <div key={image.id} className="break-inside-avoid">
+                          <div
+                            className={cn(
+                              "overflow-hidden rounded-xl border border-stone-200/80 bg-stone-100/80 relative",
+                              turn.ratio === "1:1" && "aspect-square",
+                              turn.ratio === "16:9" && "aspect-video",
+                              turn.ratio === "9:16" && "aspect-[9/16]",
+                              turn.ratio === "4:3" && "aspect-[4/3]",
+                              turn.ratio === "3:4" && "aspect-[3/4]",
+                            )}
+                          >
                           <div className="flex h-full flex-col items-center justify-center gap-1.5 px-2 py-3 text-center text-stone-500 sm:gap-3 sm:px-6 sm:py-8">
                             <div className="rounded-full bg-white p-2 shadow-sm sm:p-3">
-                              {turn.status === "queued" ? (
+                              {imageTaskStatus === "queued" ? (
                                 <Clock3 className="size-4 sm:size-5" />
                               ) : (
                                 <LoaderCircle className="size-4 animate-spin sm:size-5" />
                               )}
                             </div>
-                            <p className="text-[10px] leading-4 sm:text-sm">{turn.status === "queued" ? "排队中" : "处理中"}</p>
+                            <p className="text-[11px] font-medium leading-4 sm:text-sm">
+                              图片 {index + 1}/{turn.images.length}
+                            </p>
+                            <p className="text-[10px] leading-4 text-stone-400 sm:text-xs">
+                              {imageStatusLabel}
+                            </p>
                           </div>
+                          </div>
+                          {elapsedDisplay != null && (
+                            <div className="px-0.5 py-1 text-[10px] text-stone-400 sm:px-3 sm:py-3 sm:text-xs">{elapsedDisplay}</div>
+                          )}
                         </div>
                       );
                     })}
                   </div>
 
                   {turn.status === "error" && turn.error ? (
-                    <div className="mt-4 border-l-2 border-amber-300 bg-amber-50/70 px-4 py-3 text-sm leading-6 text-amber-700">
-                      {turn.error}
+                    <div className="mt-4 flex items-center justify-between border-l-2 border-amber-300 bg-amber-50/70 px-4 py-3 text-sm leading-6 text-amber-700">
+                      <span>{turn.error}</span>
+                      <button
+                        type="button"
+                        onClick={() => void onDismissErrors(selectedConversation.id, turn.id)}
+                        className="ml-3 inline-flex shrink-0 items-center gap-1 rounded-full bg-amber-100 px-2.5 py-1 text-[11px] font-medium text-amber-700 transition hover:bg-amber-200 hover:text-amber-900"
+                      >
+                        <EyeOff className="size-3" />
+                        忽略错误
+                      </button>
                     </div>
                   ) : null}
 
@@ -372,20 +455,100 @@ function getTurnStatusLabel(status: ImageTurnStatus) {
   return "失败";
 }
 
+const PROGRESS_LABELS: Record<string, string> = {
+  getting_account: "确认可用账号",
+  uploading: "上传图片",
+  bootstrapping: "预热首页",
+  getting_token: "获取 token",
+  preparing_conversation: "准备会话",
+  starting_generation: "启动生成",
+  generating: "生成中",
+  receiving_image: "接收图片中",
+};
+
+function getProgressLabel(progress?: string) {
+  if (!progress) {
+    return "生成中";
+  }
+  return PROGRESS_LABELS[progress] || "生成中";
+}
+
+function formatElapsed(seconds: number): string {
+  return `${seconds.toFixed(1)}s`;
+}
+
+function formatDuration(ms: number): string {
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+const base64SizeCache = new Map<string, string>();
 function formatBase64ImageSize(base64: string) {
+  let cached = base64SizeCache.get(base64);
+  if (cached !== undefined) return cached;
   const normalized = base64.replace(/\s/g, "");
   const padding = normalized.endsWith("==") ? 2 : normalized.endsWith("=") ? 1 : 0;
   const bytes = Math.max(0, Math.floor((normalized.length * 3) / 4) - padding);
 
   if (bytes >= 1024 * 1024) {
-    return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+    cached = `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+  } else if (bytes >= 1024) {
+    cached = `${(bytes / 1024).toFixed(1)} KB`;
+  } else {
+    cached = `${bytes} B`;
   }
-  if (bytes >= 1024) {
-    return `${(bytes / 1024).toFixed(1)} KB`;
-  }
-  return `${bytes} B`;
+  base64SizeCache.set(base64, cached);
+  return cached;
 }
 
 function formatImageDimensions(width: number, height: number) {
   return `${width} x ${height}`;
 }
+
+const LazyImage = memo(function LazyImage({ src, alt, className, onLoad, onOpen }: {
+  src: string;
+  alt: string;
+  className: string;
+  onLoad?: (event: React.SyntheticEvent<HTMLImageElement>) => void;
+  onOpen?: () => void;
+}) {
+  const [isVisible, setIsVisible] = useState(false);
+  const imgRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const element = imgRef.current;
+    if (!element) return;
+
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry.isIntersecting) {
+          setIsVisible(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: "400px" },
+    );
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  return (
+    <div ref={imgRef} className="relative">
+      {isVisible ? (
+        <button
+          type="button"
+          onClick={onOpen}
+          className={className}
+        >
+          <img
+            src={src}
+            alt={alt}
+            className="block h-full w-full object-cover transition duration-200 group-hover:brightness-90 sm:h-auto sm:object-contain"
+            onLoad={onLoad}
+          />
+        </button>
+      ) : (
+        <div className={`animate-pulse rounded-xl bg-stone-100 min-h-[200px] sm:min-h-[280px] ${className}`} />
+      )}
+    </div>
+  );
+});
