@@ -1,6 +1,9 @@
 services:
   app:
-    image: ghcr.io/basketikun/chatgpt2api:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: chatgpt2api:local
     container_name: chatgpt2api
     restart: unless-stopped
     ports:
