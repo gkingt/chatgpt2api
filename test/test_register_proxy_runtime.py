@@ -189,6 +189,25 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
         self.assertIn("status=403", message)
         self.assertIn("challenge body", message)
 
+    def test_login_token_exchange_retries_oauth_session_conflict_once(self):
+        registrar = openai_register.PlatformRegistrar(proxy="")
+        calls = []
+
+        def fake_once(email, password, mailbox, index):
+            calls.append((email, password, mailbox, index))
+            if len(calls) == 1:
+                raise RuntimeError("oauth_token_http_409, status=409, json={\"error\":\"invalid_state\"}")
+            return {"access_token": "access", "refresh_token": "refresh", "id_token": "id"}
+
+        try:
+            with patch.object(registrar, "_login_and_exchange_tokens_once", side_effect=fake_once):
+                result = registrar._login_and_exchange_tokens("user@example.com", "password", {"address": "user@example.com"}, 1)
+        finally:
+            registrar.close()
+
+        self.assertEqual(result["access_token"], "access")
+        self.assertEqual(len(calls), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
