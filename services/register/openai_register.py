@@ -21,6 +21,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from services.account_service import account_service
+from services.proxy_service import proxy_settings
 from services.register import mail_provider
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -191,6 +192,21 @@ def _response_error_detail(resp, limit: int = 1200) -> str:
     return ", ".join(parts)
 
 
+def _is_cloudflare_challenge(resp) -> bool:
+    if resp is None:
+        return False
+    status = int(getattr(resp, "status_code", 0) or 0)
+    if status not in (403, 429, 503):
+        return False
+    text = str(getattr(resp, "text", "") or "").lower()
+    headers = getattr(resp, "headers", {}) or {}
+    server = str(headers.get("server") or "").lower()
+    content_type = str(headers.get("content-type") or "").lower()
+    if "cloudflare" in server and "text/html" in content_type:
+        return any(marker in text for marker in ("just a moment", "cf-chl", "challenge-platform", "cf_clearance"))
+    return any(marker in text for marker in ("/cdn-cgi/challenge-platform/", "cf-chl", "cf_clearance"))
+
+
 def _decode_jwt_payload(token: str) -> dict:
     try:
         payload = token.split(".")[1]
@@ -314,16 +330,23 @@ def _is_socks_proxy(proxy: str) -> bool:
 
 
 def create_session(proxy: str = "") -> Any:
+    kwargs = proxy_settings.build_session_kwargs(proxy=proxy, impersonate="chrome", verify=False, upstream=True)
     if _is_socks_proxy(proxy):
-        return curl_requests.Session(impersonate="chrome", verify=False, proxy=proxy)
-    session = requests.Session()
+        return curl_requests.Session(**kwargs)
+    try:
+        session = requests.Session(**kwargs)
+    except TypeError:
+        session = requests.Session()
     retry = Retry(total=2, connect=2, read=2, backoff_factor=0.5, status_forcelist=(429, 500, 502, 503, 504))
     adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    session.verify = False
-    if proxy:
-        session.proxies.update({"http": proxy, "https": proxy})
+    if hasattr(session, "mount"):
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+    if hasattr(session, "verify"):
+        session.verify = bool(kwargs.get("verify", False))
+    if kwargs.get("proxy"):
+        if hasattr(session, "proxies"):
+            session.proxies.update({"http": str(kwargs["proxy"]), "https": str(kwargs["proxy"])})
     return session
 
 
@@ -488,7 +511,7 @@ class PlatformRegistrar:
         headers = dict(navigate_headers)
         if referer:
             headers["referer"] = referer
-        return headers
+        return proxy_settings.build_headers(headers, target_url=auth_base, proxy=self.proxy, upstream=True)
 
     def _json_headers(self, referer: str) -> dict[str, str]:
         headers = dict(common_headers)
@@ -521,6 +544,15 @@ class PlatformRegistrar:
             "auth0Client": platform_auth0_client,
         }
         resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=self._navigate_headers(f"{platform_base}/"), allow_redirects=True, verify=False)
+        if _is_cloudflare_challenge(resp):
+            bundle = proxy_settings.refresh_clearance(target_url=auth_base, proxy=self.proxy, force=True, upstream=True)
+            if bundle is not None:
+                headers = self._navigate_headers(f"{platform_base}/")
+                if bundle.user_agent:
+                    headers["user-agent"] = bundle.user_agent
+                resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=headers, allow_redirects=True, verify=False)
+            if _is_cloudflare_challenge(resp):
+                raise RuntimeError(f"Cloudflare challenge: {_response_error_detail(resp, 1200)}")
         if resp is None or resp.status_code != 200:
             err = _response_json(resp).get("error", {}) if resp is not None else {}
             detail = f": {err.get('code', '')} - {err.get('message', '')}".strip(" -") if err else ""

@@ -171,6 +171,7 @@ class OpenAIBackendAPI:
             account=self.account,
             impersonate=self.fp["impersonate"],
             verify=True,
+            upstream=True,
         ))
         self.session.headers.update({
             "User-Agent": self.user_agent,
@@ -237,7 +238,34 @@ class OpenAIBackendAPI:
         headers["X-OpenAI-Target-Route"] = path
         if extra:
             headers.update(extra)
-        return headers
+        return proxy_settings.build_headers(
+            headers,
+            target_url=self.base_url + path,
+            account=self.account,
+            upstream=True,
+        )
+
+    def _ensure_ok_with_clearance_retry(self, request_func: Callable[[], requests.Response], context: str) -> requests.Response:
+        response = request_func()
+        try:
+            ensure_ok(response, context)
+            return response
+        except UpstreamHTTPError as exc:
+            profile = proxy_settings.get_profile(account=self.account, upstream=True)
+            if exc.status_code not in profile.reset_session_status_codes:
+                raise
+            response.close()
+            bundle = proxy_settings.refresh_clearance(
+                target_url=self.base_url,
+                account=self.account,
+                force=True,
+                upstream=True,
+            )
+            if bundle is None:
+                raise
+            response = request_func()
+            ensure_ok(response, context)
+            return response
 
     @staticmethod
     def _extract_quota_and_restore_at(limits_progress: list[Any]) -> tuple[int, str | None, bool]:
@@ -344,7 +372,7 @@ class OpenAIBackendAPI:
 
     def _bootstrap_headers(self) -> Dict[str, str]:
         """构造首页预热请求头。"""
-        return {
+        headers = {
             "User-Agent": self.user_agent,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
@@ -357,6 +385,12 @@ class OpenAIBackendAPI:
             "Sec-Fetch-User": "?1",
             "Upgrade-Insecure-Requests": "1",
         }
+        return proxy_settings.build_headers(
+            headers,
+            target_url=self.base_url + "/",
+            account=self.account,
+            upstream=True,
+        )
 
     def _build_requirements(self, data: Dict[str, Any], source_p: str = "") -> ChatRequirements:
         """把 sentinel 响应整理成后续对话需要的 token 集合。"""
@@ -2537,12 +2571,14 @@ class OpenAIBackendAPI:
 
     def _bootstrap(self) -> None:
         """预热首页，并提取 PoW 相关脚本引用。"""
-        response = self.session.get(
-            self.base_url + "/",
-            headers=self._bootstrap_headers(),
-            timeout=30,
+        response = self._ensure_ok_with_clearance_retry(
+            lambda: self.session.get(
+                self.base_url + "/",
+                headers=self._bootstrap_headers(),
+                timeout=30,
+            ),
+            "bootstrap",
         )
-        ensure_ok(response, "bootstrap")
         self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
         if not self.pow_script_sources:
             self.pow_script_sources = [DEFAULT_POW_SCRIPT]
@@ -2553,13 +2589,15 @@ class OpenAIBackendAPI:
         p_token = build_legacy_requirements_token(self.user_agent, self.pow_script_sources, self.pow_data_build)
 
         prepare_path = base + "/prepare"
-        response = self.session.post(
-            self.base_url + prepare_path,
-            headers=self._headers(prepare_path, {"Content-Type": "application/json"}),
-            json={"p": p_token},
-            timeout=30,
+        response = self._ensure_ok_with_clearance_retry(
+            lambda: self.session.post(
+                self.base_url + prepare_path,
+                headers=self._headers(prepare_path, {"Content-Type": "application/json"}),
+                json={"p": p_token},
+                timeout=30,
+            ),
+            "chat_requirements_prepare",
         )
-        ensure_ok(response, "chat_requirements_prepare")
         prepare_data = response.json()
 
         if (prepare_data.get("arkose") or {}).get("required"):
@@ -2582,17 +2620,19 @@ class OpenAIBackendAPI:
             turnstile_token = solve_turnstile_token(turnstile_info["dx"], p_token) or ""
 
         finalize_path = base + "/finalize"
-        response = self.session.post(
-            self.base_url + finalize_path,
-            headers=self._headers(finalize_path, {"Content-Type": "application/json"}),
-            json={
-                "prepare_token": prepare_data.get("prepare_token", ""),
-                "proof_token": proof_token,
-                "turnstile_token": turnstile_token,
-            },
-            timeout=30,
+        response = self._ensure_ok_with_clearance_retry(
+            lambda: self.session.post(
+                self.base_url + finalize_path,
+                headers=self._headers(finalize_path, {"Content-Type": "application/json"}),
+                json={
+                    "prepare_token": prepare_data.get("prepare_token", ""),
+                    "proof_token": proof_token,
+                    "turnstile_token": turnstile_token,
+                },
+                timeout=30,
+            ),
+            "chat_requirements_finalize",
         )
-        ensure_ok(response, "chat_requirements_finalize")
         data = response.json()
 
         token = data.get("token", "")
