@@ -1349,11 +1349,12 @@ class AccountService:
         access_token: str,
         event: str = "fetch_remote_info",
         defer_invalid_removal: bool = True,
+        skip_token_refresh: bool = False,
     ) -> dict[str, Any] | None:
         if not access_token:
             raise ValueError("access_token is required")
 
-        active_token = self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
+        active_token = access_token if skip_token_refresh else self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
         try:
             from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
             result = OpenAIBackendAPI(active_token).get_user_info()
