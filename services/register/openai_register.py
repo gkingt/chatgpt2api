@@ -207,22 +207,6 @@ def _is_cloudflare_challenge(resp) -> bool:
     return any(marker in text for marker in ("/cdn-cgi/challenge-platform/", "cf-chl", "cf_clearance"))
 
 
-def _is_oauth_session_conflict(error: object) -> bool:
-    text = str(error or "").lower()
-    return any(
-        marker in text
-        for marker in (
-            "http_409",
-            "status=409",
-            "invalid_state",
-            "state mismatch",
-            "code already used",
-            "authorization code",
-            "oauth_callback_failed",
-        )
-    )
-
-
 def _decode_jwt_payload(token: str) -> dict:
     try:
         payload = token.split(".")[1]
@@ -626,22 +610,6 @@ class PlatformRegistrar:
 
 
     def _login_and_exchange_tokens(self, email: str, password: str, mailbox: dict, index: int) -> dict:
-        last_error: Exception | None = None
-        for attempt in range(2):
-            try:
-                if attempt:
-                    step(index, "登录换 token 遇到会话冲突，重新登录重试")
-                return self._login_and_exchange_tokens_once(email, password, mailbox, index)
-            except Exception as exc:
-                last_error = exc
-                if attempt == 0 and _is_oauth_session_conflict(exc):
-                    continue
-                raise
-        if last_error:
-            raise last_error
-        raise RuntimeError("token换取失败")
-
-    def _login_and_exchange_tokens_once(self, email: str, password: str, mailbox: dict, index: int) -> dict:
         step(index, "开始独立登录换 token")
         login_session = create_session(self.proxy)
         login_device_id = str(uuid.uuid4())
