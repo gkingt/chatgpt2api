@@ -32,6 +32,10 @@ class InvalidAccessTokenError(RuntimeError):
     pass
 
 
+class DisabledAccountError(RuntimeError):
+    pass
+
+
 class ImagePollTimeoutError(RuntimeError):
     pass
 
@@ -277,7 +281,43 @@ class OpenAIBackendAPI:
     def _raise_on_error(self, response: Any, path: str) -> None:
         if response.status_code == 401:
             raise InvalidAccessTokenError(f"token invalidated ({path})")
+        body = self._response_error_body(response)
+        body_text = self._body_preview(body).lower()
+        if any(marker in body_text for marker in (
+            "account_deactivated",
+            "account disabled",
+            "account is disabled",
+            "user_deactivated",
+            "deactivated account",
+        )):
+            raise DisabledAccountError(f"account disabled ({path}): {self._body_preview(body)}")
+        if response.status_code in (401, 403) and any(marker in body_text for marker in (
+            "token_invalidated",
+            "token_revoked",
+            "invalidated oauth token",
+            "invalid access token",
+            "unauthorized",
+        )):
+            raise InvalidAccessTokenError(f"token invalidated ({path}): {self._body_preview(body)}")
         raise RuntimeError(f"{path} failed: HTTP {response.status_code}")
+
+    @staticmethod
+    def _response_error_body(response: Any) -> Any:
+        try:
+            return response.json()
+        except Exception:
+            return getattr(response, "text", "")
+
+    @staticmethod
+    def _body_preview(body: Any, limit: int = 500) -> str:
+        if isinstance(body, (dict, list)):
+            try:
+                text = json.dumps(body, ensure_ascii=False)
+            except Exception:
+                text = repr(body)
+        else:
+            text = str(body or "")
+        return text if len(text) <= limit else text[:limit] + "...[truncated]"
 
     def _get_me(self) -> Dict[str, Any]:
         path = "/backend-api/me"
@@ -342,20 +382,25 @@ class OpenAIBackendAPI:
             executor.shutdown(wait=True, cancel_futures=True)
 
         plan_type = str(default_account.get("plan_type") or "free")
+        is_deactivated = bool(default_account.get("is_deactivated"))
 
         limits_progress = init_payload.get("limits_progress")
         limits_progress = limits_progress if isinstance(limits_progress, list) else []
         quota, restore_at, image_quota_unknown = self._extract_quota_and_restore_at(limits_progress)
+        status = "禁用" if is_deactivated else (
+            "正常" if image_quota_unknown and plan_type.lower() != "free" else ("限流" if quota == 0 else "正常")
+        )
         result = {
             "email": me_payload.get("email"),
             "user_id": me_payload.get("id"),
             "type": plan_type,
-            "quota": quota,
+            "quota": 0 if is_deactivated else quota,
             "image_quota_unknown": image_quota_unknown,
             "limits_progress": limits_progress,
             "default_model_slug": init_payload.get("default_model_slug"),
             "restore_at": restore_at,
-            "status": "正常" if image_quota_unknown and plan_type.lower() != "free" else ("限流" if quota == 0 else "正常"),
+            "status": status,
+            "is_deactivated": is_deactivated,
         }
         logger.debug({
             "event": "backend_user_info_result",

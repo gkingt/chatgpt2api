@@ -133,7 +133,7 @@ class AccountCapabilityTests(unittest.TestCase):
                     "services.openai_backend_api.OpenAIBackendAPI.get_user_info",
                     side_effect=InvalidAccessTokenError("token invalidated (/backend-api/me)"),
                 ):
-                    result = service.refresh_accounts(["invalid-token"])
+                    result = service.refresh_accounts(["invalid-token"], defer_invalid_removal=True)
 
                 account = service.get_account("invalid-token")
                 self.assertEqual(result["refreshed"], 0)
@@ -145,6 +145,65 @@ class AccountCapabilityTests(unittest.TestCase):
                 config.data.pop("auto_remove_invalid_accounts", None)
             else:
                 config.data["auto_remove_invalid_accounts"] = original_value
+
+    def test_refresh_accounts_removes_invalid_token_by_default(self) -> None:
+        original_value = config.data.get("auto_remove_invalid_accounts")
+        config.data["auto_remove_invalid_accounts"] = True
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+                service.add_account_items([{"access_token": "invalid-token", "status": "正常"}])
+
+                with patch(
+                    "services.openai_backend_api.OpenAIBackendAPI.get_user_info",
+                    side_effect=InvalidAccessTokenError("token invalidated (/backend-api/me)"),
+                ):
+                    result = service.refresh_accounts(["invalid-token"])
+
+                self.assertEqual(result["refreshed"], 0)
+                self.assertEqual(len(result["errors"]), 1)
+                self.assertIsNone(service.get_account("invalid-token"))
+        finally:
+            if original_value is None:
+                config.data.pop("auto_remove_invalid_accounts", None)
+            else:
+                config.data["auto_remove_invalid_accounts"] = original_value
+
+    def test_refresh_accounts_marks_deactivated_account_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items([{"access_token": "deactivated-token", "status": "正常", "quota": 5}])
+
+            with patch(
+                "services.openai_backend_api.OpenAIBackendAPI.get_user_info",
+                return_value={
+                    "email": "disabled@example.com",
+                    "type": "Plus",
+                    "quota": 0,
+                    "image_quota_unknown": False,
+                    "status": "禁用",
+                    "is_deactivated": True,
+                },
+            ):
+                result = service.refresh_accounts(["deactivated-token"])
+
+            account = service.get_account("deactivated-token")
+            self.assertEqual(result["refreshed"], 1)
+            self.assertIsNotNone(account)
+            self.assertEqual(account["status"], "禁用")
+            self.assertEqual(account["quota"], 0)
+
+    def test_text_token_skips_pending_invalid_accounts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {"access_token": "bad-token", "status": "正常", "invalid_count": 1},
+                    {"access_token": "good-token", "status": "正常"},
+                ]
+            )
+
+            self.assertEqual(service.get_text_access_token(), "good-token")
 
 
 class TokenLogTests(unittest.TestCase):

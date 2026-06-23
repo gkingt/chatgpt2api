@@ -21,6 +21,27 @@ from services.storage.base import StorageBackend
 from utils.helper import anonymize_token
 
 
+INVALID_TOKEN_ERROR_MARKERS = (
+    "token invalidated",
+    "token_invalidated",
+    "token_revoked",
+    "invalidated oauth token",
+    "invalid access token",
+    "invalid_grant",
+    "oauth_refresh_http_400",
+    "oauth_refresh_http_401",
+    "unauthorized",
+)
+
+DISABLED_ACCOUNT_ERROR_MARKERS = (
+    "account_deactivated",
+    "account disabled",
+    "account is disabled",
+    "user_deactivated",
+    "deactivated account",
+)
+
+
 class AccountService:
     """账号池服务，使用 token -> account 的 dict 保存账号。"""
 
@@ -134,9 +155,31 @@ class AccountService:
             return False
         if account.get("status") in {"禁用", "限流", "异常"}:
             return False
+        if int(account.get("invalid_count") or 0) > 0:
+            return False
         if bool(account.get("image_quota_unknown")):
             return True
         return int(account.get("quota") or 0) > 0
+
+    @staticmethod
+    def _is_invalid_token_error(error: object) -> bool:
+        text = str(error or "").lower()
+        return any(marker in text for marker in INVALID_TOKEN_ERROR_MARKERS)
+
+    @staticmethod
+    def _is_disabled_account_error(error: object) -> bool:
+        text = str(error or "").lower()
+        return any(marker in text for marker in DISABLED_ACCOUNT_ERROR_MARKERS)
+
+    @staticmethod
+    def _is_account_eligible_for_text(account: dict) -> bool:
+        if not isinstance(account, dict):
+            return False
+        if account.get("status") in {"禁用", "异常"}:
+            return False
+        if int(account.get("invalid_count") or 0) > 0:
+            return False
+        return bool(account.get("access_token"))
 
     @classmethod
     def _account_matches_plan_type(cls, account: dict, plan_type: str | None = None) -> bool:
@@ -457,6 +500,12 @@ class AccountService:
             except Exception as exc:
                 error_str = str(exc or "")
                 self._record_token_refresh_error(active_token, event, error_str)
+                if self._is_disabled_account_error(error_str):
+                    self.update_account(active_token, {"status": "禁用", "quota": 0, "last_refresh_error": error_str}, quiet=True)
+                    return ""
+                if self._is_invalid_token_error(error_str):
+                    self.remove_invalid_token(active_token, event, quiet=True)
+                    return ""
                 # 如果是 app_session_terminated 错误，尝试密码重新登录
                 if "app_session_terminated" in error_str.lower():
                     # 获取账号信息（email, password）
@@ -1032,8 +1081,8 @@ class AccountService:
             candidates = [
                 token
                 for account in self._accounts.values()
-                if account.get("status") not in {"禁用", "异常"}
-                   and (token := account.get("access_token") or "")
+                     if self._is_account_eligible_for_text(account)
+                         and (token := account.get("access_token") or "")
                    and token not in excluded
             ]
             if not candidates:
@@ -1356,8 +1405,11 @@ class AccountService:
 
         active_token = access_token if skip_token_refresh else self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
         try:
-            from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
+            from services.openai_backend_api import DisabledAccountError, InvalidAccessTokenError, OpenAIBackendAPI
             result = OpenAIBackendAPI(active_token).get_user_info()
+        except DisabledAccountError as exc:
+            self.update_account(active_token, {"status": "禁用", "quota": 0, "last_refresh_error": str(exc)}, quiet=True)
+            raise
         except InvalidAccessTokenError as exc:
             refreshed_token = self.refresh_access_token(active_token, force=True, event=f"{event}:invalid_access_token")
             if refreshed_token and refreshed_token != active_token:
@@ -1489,7 +1541,7 @@ class AccountService:
         self,
         access_tokens: list[str],
         progress_id: str | None = None,
-        defer_invalid_removal: bool = True,
+        defer_invalid_removal: bool = False,
     ) -> dict[str, Any]:
         access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
         if not access_tokens:
