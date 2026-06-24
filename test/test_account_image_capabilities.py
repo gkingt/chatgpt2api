@@ -99,6 +99,31 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertEqual(plus_token, "token-plus")
             self.assertEqual(pro_token, "token-pro")
 
+    def test_image_preflight_failure_marks_account_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items([
+                {"access_token": "stale-token", "status": "正常", "quota": 8, "image_quota_unknown": True}
+            ])
+
+            def fail_preflight(access_token: str, event: str = "fetch_remote_info") -> dict:
+                raise RuntimeError("upstream auth preflight failed")
+
+            service.fetch_remote_info = fail_preflight
+
+            with self.assertRaisesRegex(RuntimeError, "no available image quota"):
+                service.get_available_access_token()
+
+            account = service.get_account("stale-token")
+            stats = service.get_stats()
+            self.assertIsNotNone(account)
+            self.assertEqual(account["status"], "异常")
+            self.assertEqual(account["quota"], 0)
+            self.assertFalse(account["image_quota_unknown"])
+            self.assertEqual(stats["active"], 0)
+            self.assertEqual(stats["total_quota"], 0)
+            self.assertEqual(stats["unlimited_quota_count"], 0)
+
     def test_refresh_accounts_can_remove_invalid_token_without_confirmation_delay(self) -> None:
         original_value = config.data.get("auto_remove_invalid_accounts")
         config.data["auto_remove_invalid_accounts"] = True

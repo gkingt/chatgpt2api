@@ -28,6 +28,17 @@ _outlook_token_state_lock = Lock()
 OUTLOOK_IN_USE_STALE_SECONDS = 3600
 OUTLOOK_RECORDED_STATES = {"used", "in_use", "token_invalid", "failed"}
 OUTLOOK_UNAVAILABLE_STATES = {"used", "token_invalid", "failed"}
+cancel_checker: Callable[[], None] | None = None
+
+
+def set_cancel_checker(checker: Callable[[], None] | None) -> None:
+    global cancel_checker
+    cancel_checker = checker
+
+
+def _check_cancelled() -> None:
+    if cancel_checker is not None:
+        cancel_checker()
 
 
 def _load_ddg_aliases() -> set[str]:
@@ -218,7 +229,7 @@ def _config(mail_config: dict) -> dict:
         "wait_timeout": float(mail_config.get("wait_timeout") or 30),
         "wait_interval": float(mail_config.get("wait_interval") or 2),
         "user_agent": str(mail_config.get("user_agent") or "Mozilla/5.0"),
-        "proxy": str(mail_config.get("proxy") or "").strip(),
+        "proxy": "",
     }
 
 
@@ -375,12 +386,17 @@ class BaseMailProvider:
     def wait_for(self, mailbox: dict[str, Any], on_message: Callable[[dict[str, Any]], ResultT | None]) -> ResultT | None:
         deadline = time.monotonic() + self.conf["wait_timeout"]
         while time.monotonic() < deadline:
+            _check_cancelled()
             message = self.fetch_latest_message(mailbox)
             if message:
                 result = on_message(message)
                 if result is not None:
                     return result
-            time.sleep(max(0.2, self.conf["wait_interval"]))
+            sleep_for = max(0.2, self.conf["wait_interval"])
+            until = min(deadline, time.monotonic() + sleep_for)
+            while time.monotonic() < until:
+                _check_cancelled()
+                time.sleep(min(0.2, until - time.monotonic()))
         return None
 
     def wait_for_code(self, mailbox: dict[str, Any]) -> str | None:
@@ -1352,6 +1368,7 @@ class OutlookTokenProvider(BaseMailProvider):
 
         deadline = time.monotonic() + self.conf["wait_timeout"]
         while time.monotonic() < deadline:
+            _check_cancelled()
             for message in self.fetch_recent_messages(mailbox):
                 ref = _message_tracking_ref(message)
                 if ref in seen_refs:
@@ -1361,7 +1378,11 @@ class OutlookTokenProvider(BaseMailProvider):
                     seen_value.append(ref)
                     return code
                 seen_refs.add(ref)
-            time.sleep(max(0.2, self.conf["wait_interval"]))
+            sleep_for = max(0.2, self.conf["wait_interval"])
+            until = min(deadline, time.monotonic() + sleep_for)
+            while time.monotonic() < until:
+                _check_cancelled()
+                time.sleep(min(0.2, until - time.monotonic()))
         return None
 
 
@@ -1424,6 +1445,7 @@ def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = 
 
 
 def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
+    _check_cancelled()
     enabled = _enabled_entries(mail_config)
     tried: set[str] = set()
     last_error = ""
@@ -1431,6 +1453,7 @@ def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
         provider = _create_provider(mail_config)
         provider_key = f"{provider.name}#{provider.provider_ref}"
         try:
+            _check_cancelled()
             if provider_key in tried:
                 continue
             tried.add(provider_key)
@@ -1446,8 +1469,10 @@ def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
 
 
 def wait_for_code(mail_config: dict, mailbox: dict) -> str | None:
+    _check_cancelled()
     provider = _create_provider(mail_config, str(mailbox.get("provider") or ""), str(mailbox.get("provider_ref") or ""))
     try:
+        _check_cancelled()
         return provider.wait_for_code(mailbox)
     finally:
         provider.close()

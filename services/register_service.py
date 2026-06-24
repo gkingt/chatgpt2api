@@ -179,6 +179,8 @@ class RegisterService:
             self._config["enabled"] = True
             self._drop_mail_proxy()
             self._logs = []
+            openai_register.reset_cancel()
+            mail_provider.set_cancel_checker(openai_register.ensure_not_cancelled)
             metrics = self._pool_metrics()
             self._config["stats"] = {"job_id": uuid.uuid4().hex, "success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], **metrics, "started_at": _now(), "updated_at": _now()}
             openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
@@ -195,7 +197,8 @@ class RegisterService:
             self._config["enabled"] = False
             self._config["stats"]["updated_at"] = _now()
             self._save()
-            self._append_log("已请求停止注册任务，正在等待当前运行任务结束", "yellow")
+            openai_register.request_cancel()
+            self._append_log("已请求停止注册任务，正在取消当前远端请求", "yellow")
             return self.get()
 
     def auto_start_if_quota_low(self, min_quota: int) -> dict:
@@ -293,7 +296,8 @@ class RegisterService:
     def _run(self) -> None:
         threads = int(self.get()["threads"])
         submitted, done, success, fail = 0, 0, 0, 0
-        with ThreadPoolExecutor(max_workers=threads) as executor:
+        executor = ThreadPoolExecutor(max_workers=threads)
+        try:
             futures = set()
             while True:
                 cfg = self.get()
@@ -303,6 +307,9 @@ class RegisterService:
                     futures.add(executor.submit(openai_register.worker, submitted))
                     target_reached = self._target_reached(cfg, submitted)
                 self._bump(running=len(futures), done=done, success=success, fail=fail)
+                if not self.get()["enabled"]:
+                    for future in futures:
+                        future.cancel()
                 if not futures and (
                     not self.get()["enabled"]
                     or str(cfg.get("mode") or "total") == "total"
@@ -314,7 +321,9 @@ class RegisterService:
                 if not futures:
                     time.sleep(max(1, int(cfg.get("check_interval") or 5)))
                     continue
-                finished, futures = wait(futures, return_when=FIRST_COMPLETED)
+                finished, futures = wait(futures, timeout=0.5, return_when=FIRST_COMPLETED)
+                if not finished:
+                    continue
                 for future in finished:
                     done += 1
                     try:
@@ -323,6 +332,8 @@ class RegisterService:
                         fail += 0 if result.get("ok") else 1
                     except Exception:
                         fail += 1
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
         self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now())
         with self._lock:
             self._config["enabled"] = False

@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from services.proxy_service import ClearanceBundle
-from services.register import openai_register
+from services.register import mail_provider, openai_register
 
 
 class FakeResponse:
@@ -61,6 +61,20 @@ class FakeProxySettings:
 
 
 class RegisterProxyRuntimeTests(unittest.TestCase):
+    def test_mail_provider_session_ignores_mail_proxy(self):
+        created = []
+
+        def fake_session_factory(**kwargs):
+            session = FakeSession(**kwargs)
+            created.append(session)
+            return session
+
+        with patch.object(mail_provider.requests, "Session", side_effect=fake_session_factory):
+            session = mail_provider._create_session(mail_provider._config({"proxy": "http://mail-proxy.example:8080"}))
+
+        self.assertIs(session, created[0])
+        self.assertNotIn("proxy", session.kwargs)
+
     def test_create_session_uses_proxy_settings_without_breaking_existing_proxy_argument(self):
         fake_proxy = FakeProxySettings()
         created = []
@@ -83,6 +97,32 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
         self.assertEqual(fake_proxy.session_kwargs_calls[0]["impersonate"], "chrome")
         self.assertFalse(fake_proxy.session_kwargs_calls[0]["verify"])
         self.assertEqual(session.kwargs["proxy"], "http://runtime.example:8118")
+        session.close()
+
+    def test_request_cancel_closes_active_sessions_and_blocks_new_sessions(self):
+        fake_proxy = FakeProxySettings()
+        created = []
+
+        def fake_session_factory(**kwargs):
+            session = FakeSession(**kwargs)
+            created.append(session)
+            return session
+
+        openai_register.reset_cancel()
+        try:
+            with patch.object(openai_register, "proxy_settings", fake_proxy), patch.object(
+                openai_register.requests,
+                "Session",
+                side_effect=fake_session_factory,
+            ):
+                session = openai_register.create_session("http://legacy-register.example:8080")
+                openai_register.request_cancel()
+
+                self.assertTrue(session.closed)
+                with self.assertRaises(openai_register.RegistrationCancelled):
+                    openai_register.create_session("http://legacy-register.example:8080")
+        finally:
+            openai_register.reset_cancel()
 
     def test_cloudflare_without_clearance_keeps_clear_register_error(self):
         fake_proxy = FakeProxySettings(bundle=None)

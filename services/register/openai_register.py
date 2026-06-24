@@ -62,6 +62,13 @@ print_lock = threading.Lock()
 stats_lock = threading.Lock()
 stats = {"done": 0, "success": 0, "fail": 0, "start_time": 0.0}
 register_log_sink = None
+cancel_event = threading.Event()
+active_sessions_lock = threading.Lock()
+active_sessions: set[Any] = set()
+
+
+class RegistrationCancelled(RuntimeError):
+    pass
 
 common_headers = {
     "accept": "application/json",
@@ -118,6 +125,37 @@ def log(text: str, color: str = "") -> None:
 
 def step(index: int, text: str, color: str = "") -> None:
     log(f"[任务{index}] {text}", color)
+
+
+def reset_cancel() -> None:
+    cancel_event.clear()
+
+
+def request_cancel() -> None:
+    cancel_event.set()
+    with active_sessions_lock:
+        sessions = list(active_sessions)
+    for session in sessions:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+
+def ensure_not_cancelled() -> None:
+    if cancel_event.is_set():
+        raise RegistrationCancelled("注册任务已停止")
+
+
+def _track_session(session: Any) -> Any:
+    with active_sessions_lock:
+        active_sessions.add(session)
+    return session
+
+
+def _untrack_session(session: Any) -> None:
+    with active_sessions_lock:
+        active_sessions.discard(session)
 
 
 def _make_trace_headers() -> dict[str, str]:
@@ -346,9 +384,10 @@ def _is_socks_proxy(proxy: str) -> bool:
 
 
 def create_session(proxy: str = "") -> Any:
+    ensure_not_cancelled()
     kwargs = proxy_settings.build_session_kwargs(proxy=proxy, impersonate="chrome", verify=False, upstream=True)
     if _is_socks_proxy(proxy):
-        return curl_requests.Session(**kwargs)
+        return _track_session(curl_requests.Session(**kwargs))
     try:
         session = requests.Session(**kwargs)
     except TypeError:
@@ -363,7 +402,7 @@ def create_session(proxy: str = "") -> Any:
     if kwargs.get("proxy"):
         if hasattr(session, "proxies"):
             session.proxies.update({"http": str(kwargs["proxy"]), "https": str(kwargs["proxy"])})
-    return session
+    return _track_session(session)
 
 
 def request_with_local_retry(session: requests.Session, method: str, url: str, retry_attempts: int = 3, **kwargs):
@@ -371,11 +410,14 @@ def request_with_local_retry(session: requests.Session, method: str, url: str, r
     timeout_val = kwargs.pop("timeout", default_timeout)
     last_error = ""
     for _ in range(max(1, retry_attempts)):
+        ensure_not_cancelled()
         try:
             return session.request(method.upper(), url, timeout=timeout_val, **kwargs), ""
         except Exception as error:
+            ensure_not_cancelled()
             last_error = str(error)
-            time.sleep(1)
+            if cancel_event.wait(1):
+                raise RegistrationCancelled("注册任务已停止")
     return None, last_error
 
 
@@ -489,19 +531,27 @@ def exchange_platform_tokens(session: requests.Session, device_id: str, code_ver
     code = str(callback_params.get("code") or "").strip()
     if not code:
         raise RuntimeError("oauth_callback_missing_code")
-    resp = create_session(config["proxy"]).post(
-        f"{auth_base}/oauth/token",
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        data={
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": platform_oauth_redirect_uri,
-            "client_id": platform_oauth_client_id,
-            "code_verifier": code_verifier,
-        },
-        verify=False,
-        timeout=60,
-    )
+    token_session = create_session(config["proxy"])
+    try:
+        ensure_not_cancelled()
+        resp = token_session.post(
+            f"{auth_base}/oauth/token",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": platform_oauth_redirect_uri,
+                "client_id": platform_oauth_client_id,
+                "code_verifier": code_verifier,
+            },
+            verify=False,
+            timeout=60,
+        )
+    finally:
+        try:
+            token_session.close()
+        finally:
+            _untrack_session(token_session)
     data = _response_json(resp)
     if resp.status_code != 200 or not data.get("access_token") or not data.get("refresh_token") or not data.get("id_token"):
         raise RuntimeError(f"oauth_token_http_{resp.status_code}, {_response_error_detail(resp, 1200)}")
@@ -521,7 +571,10 @@ class PlatformRegistrar:
         self.device_id = str(uuid.uuid4())
 
     def close(self) -> None:
-        self.session.close()
+        try:
+            self.session.close()
+        finally:
+            _untrack_session(self.session)
 
     def _navigate_headers(self, referer: str = "") -> dict[str, str]:
         headers = dict(navigate_headers)
@@ -646,6 +699,7 @@ class PlatformRegistrar:
         login_session = create_session(self.proxy)
         login_device_id = str(uuid.uuid4())
         try:
+            ensure_not_cancelled()
             login_session.cookies.set("oai-did", login_device_id, domain=".auth.openai.com")
             login_session.cookies.set("oai-did", login_device_id, domain="auth.openai.com")
             code_verifier, code_challenge = _generate_pkce()
@@ -748,7 +802,10 @@ class PlatformRegistrar:
             step(index, "token 换取完成")
             return tokens
         finally:
-            login_session.close()
+            try:
+                login_session.close()
+            finally:
+                _untrack_session(login_session)
 
     def register(self, index: int) -> dict:
         step(index, "开始创建邮箱")
@@ -782,6 +839,7 @@ class PlatformRegistrar:
 
 def worker(index: int) -> dict:
     start = time.time()
+    ensure_not_cancelled()
     registrar = PlatformRegistrar(config["proxy"])
     try:
         step(index, "任务启动")

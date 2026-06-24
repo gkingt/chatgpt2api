@@ -981,6 +981,20 @@ class AccountService:
         with self._image_slot_condition:
             while True:
                 if not self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types):
+                    ready_count = len(self._list_ready_candidate_tokens(set(), plan_type, source_type, plan_types))
+                    available_count = len(self._list_available_candidate_tokens(set(), plan_type, source_type, plan_types))
+                    log_service.add(
+                        LOG_TYPE_ACCOUNT,
+                        "图片账号取号失败",
+                        {
+                            "plan_type": plan_type,
+                            "source_type": source_type,
+                            "plan_types": list(plan_types or []),
+                            "excluded": len(excluded_tokens or set()),
+                            "ready": ready_count,
+                            "available": available_count,
+                        },
+                    )
                     self._schedule_auto_start_register_if_needed("no_ready_image_quota")
                     raise RuntimeError(
                         f"no available {plan_type or source_type or ''} image quota".replace("  ", " ").strip()
@@ -1053,8 +1067,9 @@ class AccountService:
             attempted_tokens.add(access_token)
             try:
                 account = self.fetch_remote_info(access_token, "get_available_access_token")
-            except Exception:
+            except Exception as exc:
                 self.release_image_slot(access_token)
+                self._record_image_preflight_error(access_token, "get_available_access_token", str(exc))
                 continue
             # fetch_remote_info 内部可能因 token rotation 导致 access_token 变化，
             # 把新 token 也加入排除列表，防止重复尝试
@@ -1069,6 +1084,21 @@ class AccountService:
             ):
                 return str((account or {}).get("access_token") or access_token)
             self.release_image_slot(access_token)
+        with self._lock:
+            ready_count = len(self._list_ready_candidate_tokens(set(), plan_type, source_type, plan_types))
+            available_count = len(self._list_available_candidate_tokens(set(), plan_type, source_type, plan_types))
+        log_service.add(
+            LOG_TYPE_ACCOUNT,
+            "图片账号取号失败",
+            {
+                "plan_type": plan_type,
+                "source_type": source_type,
+                "plan_types": list(plan_types or []),
+                "attempted": len(attempted_tokens),
+                "ready": ready_count,
+                "available": available_count,
+            },
+        )
         self._schedule_auto_start_register_if_needed("no_available_image_quota")
         raise RuntimeError(
             f"no available {plan_type or source_type or ''} image quota (tried {len(attempted_tokens)} tokens)".replace("  ", " ").strip()
@@ -1381,6 +1411,33 @@ class AccountService:
                 )
                 return False
         return True
+
+    def _record_image_preflight_error(self, access_token: str, event: str, error: str) -> dict | None:
+        if not access_token:
+            return None
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(access_token)
+            if current is None:
+                return None
+            next_item = dict(current)
+            next_item["status"] = "异常"
+            next_item["quota"] = 0
+            next_item["image_quota_unknown"] = False
+            next_item["last_refresh_error"] = str(error or "image preflight failed")[:500]
+            next_item["last_refresh_error_at"] = now
+            account = self._normalize_account(next_item)
+            if account is None:
+                return None
+            self._accounts[access_token] = account
+            self._save_accounts()
+        log_service.add(
+            LOG_TYPE_ACCOUNT,
+            "图片账号预检失败-标记异常",
+            {"source": event, "token": anonymize_token(access_token), "error": str(error or "")[:500]},
+        )
+        return dict(account)
 
     def mark_image_result(self, access_token: str, success: bool) -> dict | None:
         if not access_token:
