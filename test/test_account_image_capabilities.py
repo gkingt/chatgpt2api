@@ -12,6 +12,8 @@ from services.account_service import AccountService
 from services.auth_service import AuthService
 from services.config import config
 from services.openai_backend_api import InvalidAccessTokenError
+from services.protocol.conversation import ConversationRequest, ImageOutput, _generate_single_image, is_image_quota_exhausted_error
+from services.register_service import register_service
 from services.storage.json_storage import JSONStorageBackend
 from utils.helper import anonymize_token, split_image_model
 
@@ -139,12 +141,101 @@ class AccountCapabilityTests(unittest.TestCase):
                 self.assertEqual(result["refreshed"], 0)
                 self.assertEqual(len(result["errors"]), 1)
                 self.assertIsNotNone(account)
+                self.assertEqual(account["status"], "异常")
+                self.assertEqual(account["quota"], 0)
+                self.assertFalse(account["image_quota_unknown"])
                 self.assertEqual(account["invalid_count"], 1)
+                stats = service.get_stats()
+                self.assertEqual(stats["active"], 0)
+                self.assertEqual(stats["total_quota"], 0)
+                self.assertEqual(stats["unlimited_quota_count"], 0)
+                self.assertEqual(service.list_normal_tokens(), [])
         finally:
             if original_value is None:
                 config.data.pop("auto_remove_invalid_accounts", None)
             else:
                 config.data["auto_remove_invalid_accounts"] = original_value
+
+    def test_stats_ignore_normal_accounts_with_pending_invalid_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "pending-invalid-token",
+                        "status": "正常",
+                        "quota": 9,
+                        "image_quota_unknown": True,
+                        "invalid_count": 1,
+                    },
+                    {"access_token": "good-token", "status": "正常", "quota": 2},
+                ]
+            )
+
+            stats = service.get_stats()
+
+            self.assertEqual(stats["active"], 1)
+            self.assertEqual(stats["total_quota"], 2)
+            self.assertEqual(stats["unlimited_quota_count"], 0)
+            self.assertEqual(service.list_normal_tokens(), ["good-token"])
+
+    def test_register_pool_metrics_ignore_unavailable_normal_accounts(self) -> None:
+        with patch("services.register_service.account_service") as mocked_account_service:
+            mocked_account_service.list_accounts.return_value = [
+                {"access_token": "pending-invalid-token", "status": "正常", "quota": 9, "invalid_count": 1},
+                {"access_token": "unknown-quota-token", "status": "正常", "quota": 0, "image_quota_unknown": True},
+                {"access_token": "good-token", "status": "正常", "quota": 2},
+                {"access_token": "limited-token", "status": "限流", "quota": 5},
+            ]
+            mocked_account_service._is_image_account_available.side_effect = AccountService._is_image_account_available
+
+            metrics = register_service._pool_metrics()
+
+            self.assertEqual(metrics["current_available"], 2)
+            self.assertEqual(metrics["current_quota"], 2)
+
+    def test_image_quota_error_detector_matches_common_messages(self) -> None:
+        self.assertTrue(is_image_quota_exhausted_error("reached your image generation limit"))
+        self.assertTrue(is_image_quota_exhausted_error("图片额度不足，请稍后再试"))
+        self.assertFalse(is_image_quota_exhausted_error("upstream connection timed out"))
+
+    def test_image_generation_marks_quota_exhausted_token_limited_and_retries(self) -> None:
+        class FakeAccountService:
+            def __init__(self) -> None:
+                self.tokens = ["bad-token", "good-token"]
+                self.limited: list[str] = []
+                self.marked: list[tuple[str, bool]] = []
+
+            def get_available_access_token(self, **_: object) -> str:
+                if not self.tokens:
+                    raise RuntimeError("no available image quota")
+                return self.tokens.pop(0)
+
+            def get_account(self, token: str) -> dict:
+                return {"email": f"{token}@example.com"}
+
+            def mark_image_quota_exhausted_token(self, token: str, event: str, error: str = "") -> dict:
+                self.limited.append(token)
+                return {"access_token": token, "status": "限流", "quota": 0}
+
+            def mark_image_result(self, token: str, success: bool) -> None:
+                self.marked.append((token, success))
+
+        fake_account_service = FakeAccountService()
+
+        def fake_stream(backend: object, request: ConversationRequest, index: int, total: int):
+            if getattr(backend, "access_token", "") == "bad-token":
+                raise RuntimeError("reached your image generation limit")
+            yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=[{"url": "ok"}])
+
+        with patch("services.protocol.conversation.account_service", fake_account_service), patch(
+            "services.protocol.conversation.stream_image_outputs", fake_stream
+        ):
+            outputs = _generate_single_image(ConversationRequest(model="gpt-image-2", prompt="test"), 1, 1)
+
+        self.assertEqual(fake_account_service.limited, ["bad-token"])
+        self.assertEqual(fake_account_service.marked, [("good-token", True)])
+        self.assertEqual(outputs[0].data, [{"url": "ok"}])
 
     def test_refresh_accounts_removes_invalid_token_by_default(self) -> None:
         original_value = config.data.get("auto_remove_invalid_accounts")

@@ -16,6 +16,7 @@ from services.image_storage_service import image_storage_service
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
 from utils.helper import (
     IMAGE_MODELS,
+    UpstreamHTTPError,
     extract_image_from_message_content,
     is_codex_image_model,
     is_supported_image_model,
@@ -74,6 +75,52 @@ def is_token_invalid_error(message: str) -> bool:
         or "authentication token has been invalidated" in text
         or "invalidated oauth token" in text
     )
+
+
+def _error_text(value: object) -> str:
+    parts = [str(value or "")]
+    if isinstance(value, UpstreamHTTPError):
+        try:
+            parts.append(json.dumps(value.body, ensure_ascii=False))
+        except Exception:
+            parts.append(str(value.body))
+    return "\n".join(part for part in parts if part)
+
+
+def is_image_quota_exhausted_error(error: object) -> bool:
+    text = _error_text(error).lower()
+    if not text:
+        return False
+    direct_markers = (
+        "image quota",
+        "insufficient quota",
+        "not enough quota",
+        "quota exceeded",
+        "exceeded your current quota",
+        "usage limit",
+        "usage_limits",
+        "limit reached",
+        "rate_limit_exceeded",
+        "too many requests for image",
+        "reached your image generation limit",
+        "reached the image generation limit",
+        "image generation limit",
+        "图片额度",
+        "额度不足",
+        "额度已用完",
+        "额度耗尽",
+        "达到图片生成上限",
+        "图片生成上限",
+    )
+    if any(marker in text for marker in direct_markers):
+        return True
+    has_image_context = any(marker in text for marker in ("image", "gpt-image", "image_generation", "图片", "生图"))
+    has_quota_context = any(marker in text for marker in ("quota", "limit", "rate limit", "usage", "额度", "上限", "限流"))
+    return has_image_context and has_quota_context
+
+
+def _outputs_contain_image_quota_error(outputs: list[ImageOutput]) -> bool:
+    return any(output.kind == "message" and is_image_quota_exhausted_error(output.text) for output in outputs)
 
 
 def is_tls_connection_error(message: str) -> bool:
@@ -1286,6 +1333,9 @@ def _generate_single_image(
                 returned_result = returned_result or output.kind == "result"
                 outputs.append(output)
             if returned_message:
+                if _outputs_contain_image_quota_error(outputs):
+                    account_service.mark_image_quota_exhausted_token(token, "image_stream_message", outputs[-1].text if outputs else "")
+                    continue
                 account_service.mark_image_result(token, False)
                 return outputs
             if not returned_result:
@@ -1347,6 +1397,16 @@ def _generate_single_image(
                 conversation_id=getattr(exc, "conversation_id", ""),
             ) from exc
         except ImageGenerationError as exc:
+            if is_image_quota_exhausted_error(exc):
+                account_service.mark_image_quota_exhausted_token(token, "image_stream_generation_error", str(exc))
+                logger.warning({
+                    "event": "image_quota_exhausted_token_limited",
+                    "request_token": token,
+                    "account_email": account_email,
+                    "error": str(exc)[:300],
+                    "index": index,
+                })
+                continue
             account_service.mark_image_result(token, False)
             if account_email and not getattr(exc, "account_email", ""):
                 exc.account_email = account_email
@@ -1389,6 +1449,16 @@ def _generate_single_image(
             })
             raise
         except Exception as exc:
+            if is_image_quota_exhausted_error(exc):
+                account_service.mark_image_quota_exhausted_token(token, "image_stream_error", str(exc))
+                logger.warning({
+                    "event": "image_quota_exhausted_token_limited",
+                    "request_token": token,
+                    "account_email": account_email,
+                    "error": str(exc)[:300],
+                    "index": index,
+                })
+                continue
             account_service.mark_image_result(token, False)
             last_error = str(exc)
             logger.warning({

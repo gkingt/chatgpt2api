@@ -1119,6 +1119,28 @@ class AccountService:
             self.update_account(access_token, {"status": "异常", "quota": 0}, quiet=quiet)
         return removed
 
+    def mark_image_quota_exhausted_token(self, access_token: str, event: str, error: str = "") -> dict | None:
+        if not access_token:
+            return None
+        self.release_image_slot(access_token)
+        account = self.update_account(
+            access_token,
+            {
+                "status": "限流",
+                "quota": 0,
+                "image_quota_unknown": False,
+                "last_refresh_error": str(error or "image quota exhausted")[:500],
+                "last_refresh_error_at": datetime.now(timezone.utc).isoformat(),
+            },
+            quiet=True,
+        )
+        log_service.add(
+            LOG_TYPE_ACCOUNT,
+            "图片额度不足-标记限流",
+            {"source": event, "token": anonymize_token(access_token), "error": str(error or "")[:500]},
+        )
+        return account
+
     def get_account(self, access_token: str) -> dict | None:
         if not access_token:
             return None
@@ -1157,6 +1179,7 @@ class AccountService:
                 token
                 for item in self._accounts.values()
                 if item.get("status") == "正常"
+                   and int(item.get("invalid_count") or 0) == 0
                    and (token := item.get("access_token") or "")
             ]
 
@@ -1343,6 +1366,9 @@ class AccountService:
             next_item["last_invalid_at"] = now.isoformat()
             next_item["last_refresh_error"] = str(error or "invalid access token")
             next_item["last_refresh_error_at"] = now.isoformat()
+            next_item["status"] = "异常"
+            next_item["quota"] = 0
+            next_item["image_quota_unknown"] = False
             account = self._normalize_account(next_item)
             if account is not None:
                 self._accounts[access_token] = account
@@ -1747,12 +1773,12 @@ class AccountService:
         with self._lock:
             items = list(self._accounts.values())
         total = len(items)
-        active = sum(1 for a in items if a.get("status") == "正常")
+        active = sum(1 for a in items if self._is_image_account_available(a))
         limited = sum(1 for a in items if a.get("status") == "限流")
         abnormal = sum(1 for a in items if a.get("status") == "异常")
         disabled = sum(1 for a in items if a.get("status") == "禁用")
-        total_quota = sum(max(0, int(a.get("quota") or 0)) for a in items if a.get("status") == "正常")
-        unlimited = sum(1 for a in items if a.get("status") == "正常" and bool(a.get("image_quota_unknown")))
+        total_quota = sum(max(0, int(a.get("quota") or 0)) for a in items if self._is_image_account_available(a))
+        unlimited = sum(1 for a in items if self._is_image_account_available(a) and bool(a.get("image_quota_unknown")))
         total_success = sum(int(a.get("success") or 0) for a in items)
         total_fail = sum(int(a.get("fail") or 0) for a in items)
         by_type = {}
