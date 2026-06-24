@@ -260,7 +260,7 @@ class RegisterService:
             "current_available": len(normal),
         }
 
-    def _target_reached(self, cfg: dict, submitted: int) -> bool:
+    def _target_reached(self, cfg: dict, success: int = 0) -> bool:
         mode = str(cfg.get("mode") or "total")
         metrics = self._pool_metrics()
         self._bump(**metrics)
@@ -272,7 +272,13 @@ class RegisterService:
             reached = metrics["current_available"] >= int(cfg.get("target_available") or 1)
             self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，目标账号={cfg.get('target_available')}，当前剩余额度={metrics['current_quota']}，{'跳过注册' if reached else '继续注册'}", "yellow")
             return reached
-        return submitted >= int(cfg.get("total") or 1)
+        return success >= int(cfg.get("total") or 1)
+
+    def _can_submit_more(self, cfg: dict, success: int, running: int) -> bool:
+        mode = str(cfg.get("mode") or "total")
+        if mode != "total":
+            return True
+        return success + running < int(cfg.get("total") or 1)
 
     def _bump(self, **updates) -> None:
         with self._lock:
@@ -301,21 +307,26 @@ class RegisterService:
             futures = set()
             while True:
                 cfg = self.get()
-                target_reached = self._target_reached(cfg, submitted)
-                while self.get()["enabled"] and not target_reached and len(futures) < threads:
+                target_reached = self._target_reached(cfg, success)
+                while (
+                    self.get()["enabled"]
+                    and not target_reached
+                    and len(futures) < threads
+                    and self._can_submit_more(cfg, success, len(futures))
+                ):
                     submitted += 1
                     futures.add(executor.submit(openai_register.worker, submitted))
-                    target_reached = self._target_reached(cfg, submitted)
+                    target_reached = self._target_reached(cfg, success)
                 self._bump(running=len(futures), done=done, success=success, fail=fail)
                 if not self.get()["enabled"]:
                     for future in futures:
                         future.cancel()
                 if not futures and (
                     not self.get()["enabled"]
-                    or str(cfg.get("mode") or "total") == "total"
+                    or target_reached
                     or (target_reached and self._auto_stop_when_target_reached)
                 ):
-                    if target_reached and str(cfg.get("mode") or "total") != "total":
+                    if target_reached:
                         self._append_log("注册目标已满足，停止注册任务", "yellow")
                     break
                 if not futures:

@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from services.proxy_service import ClearanceBundle
 from services.register import mail_provider, openai_register
+from services.register_service import register_service
 
 
 class FakeResponse:
@@ -123,6 +124,14 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
                     openai_register.create_session("http://legacy-register.example:8080")
         finally:
             openai_register.reset_cancel()
+
+    def test_total_mode_targets_successful_normal_accounts_not_attempts(self):
+        cfg = {"mode": "total", "total": 2}
+
+        self.assertFalse(register_service._target_reached(cfg, success=1))
+        self.assertTrue(register_service._target_reached(cfg, success=2))
+        self.assertFalse(register_service._can_submit_more(cfg, success=1, running=1))
+        self.assertTrue(register_service._can_submit_more(cfg, success=1, running=0))
 
     def test_cloudflare_without_clearance_keeps_clear_register_error(self):
         fake_proxy = FakeProxySettings(bundle=None)
