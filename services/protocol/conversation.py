@@ -97,11 +97,7 @@ def is_image_quota_exhausted_error(error: object) -> bool:
         "not enough quota",
         "quota exceeded",
         "exceeded your current quota",
-        "usage limit",
         "usage_limits",
-        "limit reached",
-        "rate_limit_exceeded",
-        "too many requests for image",
         "reached your image generation limit",
         "reached the image generation limit",
         "image generation limit",
@@ -115,7 +111,7 @@ def is_image_quota_exhausted_error(error: object) -> bool:
     if any(marker in text for marker in direct_markers):
         return True
     has_image_context = any(marker in text for marker in ("image", "gpt-image", "image_generation", "图片", "生图"))
-    has_quota_context = any(marker in text for marker in ("quota", "limit", "rate limit", "usage", "额度", "上限", "限流"))
+    has_quota_context = any(marker in text for marker in ("quota", "额度", "耗尽", "用完", "不足"))
     return has_image_context and has_quota_context
 
 

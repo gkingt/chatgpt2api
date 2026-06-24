@@ -99,7 +99,7 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertEqual(plus_token, "token-plus")
             self.assertEqual(pro_token, "token-pro")
 
-    def test_image_preflight_failure_marks_account_unavailable(self) -> None:
+    def test_image_preflight_failure_records_error_without_disabling_account(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
             service.add_account_items([
@@ -117,12 +117,13 @@ class AccountCapabilityTests(unittest.TestCase):
             account = service.get_account("stale-token")
             stats = service.get_stats()
             self.assertIsNotNone(account)
-            self.assertEqual(account["status"], "异常")
-            self.assertEqual(account["quota"], 0)
-            self.assertFalse(account["image_quota_unknown"])
-            self.assertEqual(stats["active"], 0)
-            self.assertEqual(stats["total_quota"], 0)
-            self.assertEqual(stats["unlimited_quota_count"], 0)
+            self.assertEqual(account["status"], "正常")
+            self.assertEqual(account["quota"], 8)
+            self.assertTrue(account["image_quota_unknown"])
+            self.assertIn("preflight failed", account["last_refresh_error"])
+            self.assertEqual(stats["active"], 1)
+            self.assertEqual(stats["total_quota"], 8)
+            self.assertEqual(stats["unlimited_quota_count"], 1)
 
     def test_refresh_accounts_can_remove_invalid_token_without_confirmation_delay(self) -> None:
         original_value = config.data.get("auto_remove_invalid_accounts")
@@ -223,6 +224,7 @@ class AccountCapabilityTests(unittest.TestCase):
         self.assertTrue(is_image_quota_exhausted_error("reached your image generation limit"))
         self.assertTrue(is_image_quota_exhausted_error("图片额度不足，请稍后再试"))
         self.assertFalse(is_image_quota_exhausted_error("upstream connection timed out"))
+        self.assertFalse(is_image_quota_exhausted_error("rate_limit_exceeded: too many requests for image generation"))
 
     def test_image_generation_marks_quota_exhausted_token_limited_and_retries(self) -> None:
         class FakeAccountService:

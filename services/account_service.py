@@ -1422,9 +1422,6 @@ class AccountService:
             if current is None:
                 return None
             next_item = dict(current)
-            next_item["status"] = "异常"
-            next_item["quota"] = 0
-            next_item["image_quota_unknown"] = False
             next_item["last_refresh_error"] = str(error or "image preflight failed")[:500]
             next_item["last_refresh_error_at"] = now
             account = self._normalize_account(next_item)
@@ -1434,7 +1431,7 @@ class AccountService:
             self._save_accounts()
         log_service.add(
             LOG_TYPE_ACCOUNT,
-            "图片账号预检失败-标记异常",
+            "图片账号预检失败",
             {"source": event, "token": anonymize_token(access_token), "error": str(error or "")[:500]},
         )
         return dict(account)
