@@ -62,7 +62,7 @@ class FakeProxySettings:
 
 
 class RegisterProxyRuntimeTests(unittest.TestCase):
-    def test_mail_provider_session_ignores_mail_proxy(self):
+    def test_mail_provider_session_uses_mail_proxy(self):
         created = []
 
         def fake_session_factory(**kwargs):
@@ -74,7 +74,7 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
             session = mail_provider._create_session(mail_provider._config({"proxy": "http://mail-proxy.example:8080"}))
 
         self.assertIs(session, created[0])
-        self.assertNotIn("proxy", session.kwargs)
+        self.assertEqual(session.kwargs["proxy"], "http://mail-proxy.example:8080")
 
     def test_create_session_uses_proxy_settings_without_breaking_existing_proxy_argument(self):
         fake_proxy = FakeProxySettings()
