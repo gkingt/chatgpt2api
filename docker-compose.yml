@@ -7,11 +7,12 @@ services:
     container_name: chatgpt2api
     restart: unless-stopped
     ports:
-      - "3000:80"
+      - "8007:80"
     volumes:
       - ./data:/app/data
       - ./config.json:/app/config.json
     environment:
+      TZ: ${TZ:-Asia/Shanghai}
       # 存储后端配置 (可选值: json, sqlite, postgres, git)
        - STORAGE_BACKEND=json
       
