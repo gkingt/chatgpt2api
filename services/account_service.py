@@ -54,6 +54,7 @@ class AccountService:
     _TOKEN_REFRESH_ERROR_BACKOFF_SECONDS = 5 * 60
     _OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
     _OAUTH_CLIENT_ID = "app_2SKx67EdpoN0G6j64rFvigXD"
+    _OAUTH_REDIRECT_URI = "com.openai.chat://auth0.openai.com/ios/com.openai.chat/callback"
     _OAUTH_USER_AGENT = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -408,13 +409,14 @@ class AccountService:
                 self._OAUTH_TOKEN_URL,
                 headers={
                     "Accept": "application/json",
-                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Content-Type": "application/json",
                     "User-Agent": self._OAUTH_USER_AGENT,
                 },
-                data={
-                    "grant_type": "refresh_token",
-                    "refresh_token": refresh_token,
+                json={
                     "client_id": self._OAUTH_CLIENT_ID,
+                    "grant_type": "refresh_token",
+                    "redirect_uri": self._OAUTH_REDIRECT_URI,
+                    "refresh_token": refresh_token,
                 },
                 timeout=60,
             )
