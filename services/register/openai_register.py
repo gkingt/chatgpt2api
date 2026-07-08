@@ -676,7 +676,9 @@ class PlatformRegistrar:
         resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/create_account", json={"name": name, "birthdate": birthdate}, headers=headers, verify=False)
         if resp is None or resp.status_code not in (200, 302):
             data = _response_json(resp) if resp is not None else {}
-            if data.get("message") == "Failed to create account. Please try again.":
+            if data.get("code") == "registration_disallowed":
+                step(index, f"注册被拒 registration_disallowed: sentinel(so_token={'有' if so_token else '无'}), 可能原因: 域名被封/代理IP信誉不足/sentinel校验失败", "red")
+            elif data.get("message") == "Failed to create account. Please try again.":
                 step(index, "创建账号失败提示: 邮箱域名很可能因滥用被封禁，请更换邮箱域名", "yellow")
             detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""
             raise RuntimeError(error or f"create_account_http_{getattr(resp, 'status_code', 'unknown')}{detail}")

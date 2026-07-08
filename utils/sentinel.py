@@ -124,7 +124,7 @@ def build_sentinel_token(
         data=json.dumps({"p": generator.generate_requirements_token(), "id": device_id, "flow": flow}),
         headers={
             "Content-Type": "text/plain;charset=UTF-8",
-            "Referer": "https://sentinel.openai.com/sentinel/20260124ceb8/frame.html",
+            "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
             "Origin": "https://sentinel.openai.com",
             "User-Agent": ua,
             "sec-ch-ua": ch_ua,
