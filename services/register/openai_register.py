@@ -684,37 +684,6 @@ class PlatformRegistrar:
         step(index, "platform authorize 完成")
         return code_verifier
 
-    def _submit_email(self, email: str, index: int) -> None:
-        """注册流程补齐 authorize/continue 这一步（对齐浏览器真实注册流程）。
-
-        在 platform_authorize 之后、user/register 之前，浏览器会先 POST authorize/continue
-        提交邮箱，这一步缺失会导致后续 create_account 阶段报 registration_disallowed。
-        """
-        step(index, "开始提交注册邮箱(authorize/continue)")
-
-        def _do_authorize_continue():
-            h = self._json_headers(f"{auth_base}/create-account?usernameKind=email")
-            h["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "authorize_continue")
-            return request_with_local_retry(
-                self.session, "post",
-                f"{auth_base}/api/accounts/authorize/continue",
-                json={"username": {"kind": "email", "value": email}},
-                headers=h, allow_redirects=False, verify=False,
-            )
-
-        resp, error = _do_authorize_continue()
-
-        # 处理可能的 invalid_state (409) 冲突
-        if resp is not None and resp.status_code == 409:
-            step(index, "注册邮箱提交 invalid_state，重试", "yellow")
-            resp, error = _do_authorize_continue()
-
-        if resp is None or resp.status_code != 200:
-            data = _response_json(resp) if resp is not None else {}
-            detail = json.dumps(data, ensure_ascii=False) if data else ""
-            raise RuntimeError(error or f"register_email_submit_http_{getattr(resp, 'status_code', 'unknown')}{f': {detail}' if detail else ''}")
-        step(index, "注册邮箱提交完成")
-
     def _register_user(self, email: str, password: str, index: int) -> None:
         step(index, "开始提交注册密码")
         headers = self._json_headers(f"{auth_base}/create-account/password")
@@ -917,7 +886,6 @@ class PlatformRegistrar:
         first_name, last_name = _random_name()
         try:
             self._platform_authorize(email, index)
-            self._submit_email(email, index)
             self._register_user(email, password, index)
             self._send_otp(index)
             step(index, "开始等待注册验证码")
