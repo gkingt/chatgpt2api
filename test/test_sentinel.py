@@ -70,6 +70,21 @@ class FakeProc:
         self.terminated = True
 
 
+class BrokenPipeStdin:
+    def write(self, text):
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def flush(self):
+        pass
+
+
+class BrokenPipeProc(FakeProc):
+    def __init__(self):
+        super().__init__()
+        self.stdin = BrokenPipeStdin()
+        self.stderr = io.StringIO("runner exploded")
+
+
 class SentinelOfficialSdkTests(unittest.TestCase):
     def test_official_sdk_replies_to_multiple_sentinel_reqs(self):
         post_calls = []
@@ -101,6 +116,26 @@ class SentinelOfficialSdkTests(unittest.TestCase):
         self.assertEqual(bundle.so_token, "so-token")
         self.assertEqual(bundle.requirements_token_length, 2)
         self.assertTrue(bundle.sentinel_req_so_required)
+
+    def test_official_sdk_wraps_broken_pipe_with_runner_detail(self):
+        with patch.object(sentinel.shutil, "which", return_value="node"), patch.object(
+            sentinel,
+            "_load_current_sdk",
+            return_value=("sdk-source", "https://sentinel.openai.com/sentinel/test/sdk.js", "test"),
+        ), patch.object(sentinel.subprocess, "Popen", return_value=BrokenPipeProc()):
+            with self.assertRaisesRegex(RuntimeError, "sentinel_sdk_pipe_write_failed") as ctx:
+                sentinel._run_official_sdk(
+                    object(),
+                    "device-id",
+                    "oauth_create_account",
+                    user_agent="ua",
+                    sec_ch_ua='"Chromium";v="145"',
+                    include_so=True,
+                    observer_wait_ms=0,
+                )
+
+        self.assertIn("context=start", str(ctx.exception))
+        self.assertIn("runner exploded", str(ctx.exception))
 
 
 if __name__ == "__main__":

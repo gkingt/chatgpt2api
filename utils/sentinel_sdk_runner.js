@@ -17,6 +17,9 @@ function fail(error) {
   process.exit(1);
 }
 
+process.on("uncaughtException", fail);
+process.on("unhandledRejection", fail);
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -198,8 +201,12 @@ rl.on("line", (line) => {
       }
     })();
     setImmediate(() => {
-      for (const listener of messageListeners) {
-        listener({ source: pending.iframe.contentWindow, data: payload, origin: eventOrigin });
+      try {
+        for (const listener of messageListeners) {
+          listener({ source: pending.iframe.contentWindow, data: payload, origin: eventOrigin });
+        }
+      } catch (error) {
+        fail(error);
       }
     });
   }

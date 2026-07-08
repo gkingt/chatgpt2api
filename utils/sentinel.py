@@ -252,6 +252,31 @@ def _run_official_sdk(
     assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
     stdout_lines: queue.Queue[str | None] = queue.Queue()
 
+    def _stderr_preview() -> str:
+        try:
+            return str(proc.stderr.read() or "")[:500]
+        except Exception:
+            return ""
+
+    def _write_json(payload: dict, context: str) -> None:
+        line = _json_compact(payload) + "\n"
+        exit_code = proc.poll()
+        if exit_code is not None:
+            detail = f"context={context}, exit_code={exit_code}"
+            stderr_text = _stderr_preview()
+            if stderr_text:
+                detail += f", stderr={stderr_text}"
+            raise RuntimeError(f"sentinel_sdk_pipe_closed({detail})")
+        try:
+            proc.stdin.write(line)
+            proc.stdin.flush()
+        except OSError as exc:
+            detail = f"context={context}, error={exc}, exit_code={proc.poll()}"
+            stderr_text = _stderr_preview()
+            if stderr_text:
+                detail += f", stderr={stderr_text}"
+            raise RuntimeError(f"sentinel_sdk_pipe_write_failed({detail})") from exc
+
     def _read_stdout() -> None:
         try:
             for output_line in proc.stdout:
@@ -262,24 +287,21 @@ def _run_official_sdk(
     stdout_thread = threading.Thread(target=_read_stdout, daemon=True)
     stdout_thread.start()
 
-    proc.stdin.write(
-        _json_compact(
-            {
-                "type": "start",
-                "flow": flow,
-                "deviceId": device_id,
-                "userAgent": user_agent,
-                "sdkSource": sdk_source,
-                "sdkUrl": sdk_url,
-                "sdkVersion": sdk_version,
-                "includeSo": include_so,
-                "observerWaitMs": max(0, int(observer_wait_ms or 0)),
-                "pageUrl": "https://auth.openai.com/about-you",
-            }
-        )
-        + "\n"
+    _write_json(
+        {
+            "type": "start",
+            "flow": flow,
+            "deviceId": device_id,
+            "userAgent": user_agent,
+            "sdkSource": sdk_source,
+            "sdkUrl": sdk_url,
+            "sdkVersion": sdk_version,
+            "includeSo": include_so,
+            "observerWaitMs": max(0, int(observer_wait_ms or 0)),
+            "pageUrl": "https://auth.openai.com/about-you",
+        },
+        "start",
     )
-    proc.stdin.flush()
 
     first_p_len = 0
     req_count = 0
@@ -331,8 +353,7 @@ def _run_official_sdk(
                         "requestId": message.get("requestId"),
                         "error": str(error),
                     }
-                proc.stdin.write(_json_compact(response) + "\n")
-                proc.stdin.flush()
+                _write_json(response, f"sentinel_req_result:{message.get('requestId')}")
                 continue
             if msg_type == "result":
                 last_event = "result"
@@ -352,12 +373,7 @@ def _run_official_sdk(
                 last_event = "error"
                 raise RuntimeError(str(message.get("message") or "sentinel_sdk_error"))
         exit_code = proc.poll()
-        stderr_text = ""
-        if exit_code is not None:
-            try:
-                stderr_text = str(proc.stderr.read() or "")[:500]
-            except Exception:
-                stderr_text = ""
+        stderr_text = _stderr_preview() if exit_code is not None else ""
         detail = f"last_event={last_event}, req_count={req_count}, p_len={first_p_len}, exit_code={exit_code}"
         if stderr_text:
             detail += f", stderr={stderr_text}"
@@ -434,15 +450,29 @@ def build_sentinel_tokens(
     ua = user_agent or DEFAULT_SENTINEL_USER_AGENT
     ch_ua = sec_ch_ua or DEFAULT_SENTINEL_SEC_CH_UA
     try:
-        bundle = _run_official_sdk(
-            session,
-            device_id,
-            flow,
-            user_agent=ua,
-            sec_ch_ua=ch_ua,
-            include_so=include_so,
-            observer_wait_ms=observer_wait_ms,
-        )
+        last_error: Exception | None = None
+        for _attempt in range(2 if include_so else 1):
+            try:
+                bundle = _run_official_sdk(
+                    session,
+                    device_id,
+                    flow,
+                    user_agent=ua,
+                    sec_ch_ua=ch_ua,
+                    include_so=include_so,
+                    observer_wait_ms=observer_wait_ms,
+                )
+                break
+            except Exception as exc:
+                last_error = exc
+                if not include_so or not any(marker in str(exc) for marker in (
+                    "sentinel_sdk_pipe_closed",
+                    "sentinel_sdk_pipe_write_failed",
+                    "sentinel_sdk_timeout",
+                )):
+                    raise
+        else:
+            raise last_error or RuntimeError("sentinel_sdk_failed")
         if include_so and not bundle.so_token:
             raise RuntimeError("sentinel_sdk_so_token_missing")
         return bundle
