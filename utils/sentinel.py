@@ -282,6 +282,8 @@ def _run_official_sdk(
     proc.stdin.flush()
 
     first_p_len = 0
+    req_count = 0
+    last_event = "started"
     so_required = False
     deadline = time.time() + max(45, observer_wait_ms / 1000 + 45)
     try:
@@ -302,8 +304,8 @@ def _run_official_sdk(
                 continue
             msg_type = str(message.get("type") or "")
             if msg_type == "sentinel_req":
-                if first_p_len:
-                    continue
+                last_event = "sentinel_req"
+                req_count += 1
                 p_value = str(message.get("p") or "")
                 first_p_len = first_p_len or len(p_value)
                 try:
@@ -333,6 +335,7 @@ def _run_official_sdk(
                 proc.stdin.flush()
                 continue
             if msg_type == "result":
+                last_event = "result"
                 sentinel_token = str(message.get("token") or "")
                 if not sentinel_token:
                     raise RuntimeError("sentinel_sdk_empty_token")
@@ -346,8 +349,19 @@ def _run_official_sdk(
                     sentinel_req_so_required=so_required,
                 )
             if msg_type == "error":
+                last_event = "error"
                 raise RuntimeError(str(message.get("message") or "sentinel_sdk_error"))
-        raise RuntimeError("sentinel_sdk_timeout")
+        exit_code = proc.poll()
+        stderr_text = ""
+        if exit_code is not None:
+            try:
+                stderr_text = str(proc.stderr.read() or "")[:500]
+            except Exception:
+                stderr_text = ""
+        detail = f"last_event={last_event}, req_count={req_count}, p_len={first_p_len}, exit_code={exit_code}"
+        if stderr_text:
+            detail += f", stderr={stderr_text}"
+        raise RuntimeError(f"sentinel_sdk_timeout({detail})")
     finally:
         if proc.poll() is None:
             try:
