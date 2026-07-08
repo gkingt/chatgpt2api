@@ -85,6 +85,36 @@ class BrokenPipeProc(FakeProc):
         self.stderr = io.StringIO("runner exploded")
 
 
+class CleanClosedOnSecondResponseStdin:
+    def __init__(self, proc):
+        self.proc = proc
+        self.response_count = 0
+
+    def write(self, text):
+        message = json.loads(text)
+        if message["type"] == "start":
+            self.proc.stdout.put({"type": "sentinel_req", "requestId": "req-1", "flow": message["flow"], "p": "p1"})
+            return
+        if message["type"] == "sentinel_req_result":
+            self.response_count += 1
+            if self.response_count == 1:
+                self.proc.stdout.put({"type": "sentinel_req", "requestId": "req-2", "flow": "oauth_create_account", "p": "p2"})
+                self.proc.stdout.put({"type": "result", "token": '{"c":"cookie-token"}', "soToken": "so-token"})
+                self.proc.stdout.close()
+                self.proc.terminated = True
+                return
+            raise BrokenPipeError(32, "Broken pipe")
+
+    def flush(self):
+        pass
+
+
+class CleanClosedOnSecondResponseProc(FakeProc):
+    def __init__(self):
+        super().__init__()
+        self.stdin = CleanClosedOnSecondResponseStdin(self)
+
+
 class SentinelOfficialSdkTests(unittest.TestCase):
     def test_official_sdk_replies_to_multiple_sentinel_reqs(self):
         post_calls = []
@@ -136,6 +166,35 @@ class SentinelOfficialSdkTests(unittest.TestCase):
 
         self.assertIn("context=start", str(ctx.exception))
         self.assertIn("runner exploded", str(ctx.exception))
+
+    def test_official_sdk_ignores_late_second_req_after_clean_exit(self):
+        post_calls = []
+
+        def fake_post_req(session, **kwargs):
+            post_calls.append(kwargs["p_value"])
+            return {"token": f"token-{len(post_calls)}", "so": {"required": True}}
+
+        with patch.object(sentinel.shutil, "which", return_value="node"), patch.object(
+            sentinel,
+            "_load_current_sdk",
+            return_value=("sdk-source", "https://sentinel.openai.com/sentinel/test/sdk.js", "test"),
+        ), patch.object(sentinel.subprocess, "Popen", return_value=CleanClosedOnSecondResponseProc()), patch.object(
+            sentinel,
+            "_post_sentinel_req",
+            side_effect=fake_post_req,
+        ):
+            bundle = sentinel._run_official_sdk(
+                object(),
+                "device-id",
+                "oauth_create_account",
+                user_agent="ua",
+                sec_ch_ua='"Chromium";v="145"',
+                include_so=True,
+                observer_wait_ms=0,
+            )
+
+        self.assertEqual(post_calls, ["p1", "p2"])
+        self.assertEqual(bundle.so_token, "so-token")
 
 
 if __name__ == "__main__":

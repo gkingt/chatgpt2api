@@ -258,10 +258,12 @@ def _run_official_sdk(
         except Exception:
             return ""
 
-    def _write_json(payload: dict, context: str) -> None:
+    def _write_json(payload: dict, context: str, ignore_clean_close: bool = False) -> bool:
         line = _json_compact(payload) + "\n"
         exit_code = proc.poll()
         if exit_code is not None:
+            if ignore_clean_close and exit_code == 0:
+                return False
             detail = f"context={context}, exit_code={exit_code}"
             stderr_text = _stderr_preview()
             if stderr_text:
@@ -271,11 +273,14 @@ def _run_official_sdk(
             proc.stdin.write(line)
             proc.stdin.flush()
         except OSError as exc:
+            if ignore_clean_close and proc.poll() == 0:
+                return False
             detail = f"context={context}, error={exc}, exit_code={proc.poll()}"
             stderr_text = _stderr_preview()
             if stderr_text:
                 detail += f", stderr={stderr_text}"
             raise RuntimeError(f"sentinel_sdk_pipe_write_failed({detail})") from exc
+        return True
 
     def _read_stdout() -> None:
         try:
@@ -353,7 +358,7 @@ def _run_official_sdk(
                         "requestId": message.get("requestId"),
                         "error": str(error),
                     }
-                _write_json(response, f"sentinel_req_result:{message.get('requestId')}")
+                _write_json(response, f"sentinel_req_result:{message.get('requestId')}", ignore_clean_close=req_count > 1)
                 continue
             if msg_type == "result":
                 last_event = "result"
