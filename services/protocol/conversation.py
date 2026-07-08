@@ -4,7 +4,7 @@ import base64
 import json
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator
 
@@ -1534,60 +1534,47 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
         "n": request.n,
         "model": request.model,
     })
-    # 每张图片一个线程，同时启动
-    futures = {}
-    results: dict[int, list[ImageOutput]] = {}
-    errors: dict[int, Exception] = {}
-    with ThreadPoolExecutor(max_workers=request.n) as executor:
-        for index in range(1, request.n + 1):
-            future = executor.submit(_generate_single_image, request, index, request.n)
-            futures[future] = index
-
-        # 按完成顺序收集结果
-        for future in as_completed(futures):
-            index = futures[future]
-            try:
-                results[index] = future.result()
-            except Exception as exc:
-                errors[index] = exc
-                logger.warning({
-                    "event": "image_parallel_generation_error",
-                    "index": index,
-                    "error": str(exc)[:300],
-                })
-
-    # yield 结果：跳过索引顺序限制，不再让低索引失败阻塞高索引成功结果
-    emitted = False
+    executor = ThreadPoolExecutor(max_workers=request.n)
+    futures = {
+        executor.submit(_generate_single_image, request, index, request.n): index
+        for index in range(1, request.n + 1)
+    }
+    pending = set(futures)
+    emitted = 0
     last_error = ""
-    # 先 yield 所有成功的结果
-    for index in range(1, request.n + 1):
-        if index in results:
-            for output in results[index]:
-                emitted = True
-                yield output
-        elif index in errors:
-            last_error = str(errors[index])
-            if not emitted:
-                logger.warning({
-                    "event": "image_parallel_failure_before_success",
-                    "failed_index": index,
-                    "error": last_error[:200],
-                })
-
-    # 如果有失败但也有成功，记录警告
-    if emitted:
-        for index in range(1, request.n + 1):
-            if index in errors:
-                logger.warning({
-                    "event": "image_parallel_partial_failure",
-                    "failed_index": index,
-                    "error": str(errors[index])[:200],
-                })
-
-    if not emitted:
+    try:
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                index = futures[future]
+                try:
+                    outputs = future.result()
+                except Exception as exc:
+                    last_error = str(exc)
+                    logger.warning({
+                        "event": "image_parallel_generation_error",
+                        "index": index,
+                        "error": last_error[:300],
+                    })
+                    if emitted == 0:
+                        logger.warning({
+                            "event": "image_parallel_failure_before_success",
+                            "failed_index": index,
+                            "error": last_error[:200],
+                        })
+                    continue
+                result_outputs = [output for output in outputs if output.kind == "result"]
+                if result_outputs:
+                    emitted += sum(max(1, len(output.data)) for output in result_outputs)
+                for output in outputs:
+                    yield output
+        if emitted:
+            return
         if not last_error:
             last_error = "no account in the pool could generate images — check account quota and rate-limit status"
         raise ImageGenerationError(image_stream_error_message(last_error), conversation_id="")
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def stream_image_chunks(outputs: Iterable[ImageOutput]) -> Iterator[dict[str, Any]]:
