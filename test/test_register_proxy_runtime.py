@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from services.proxy_service import ClearanceBundle
@@ -256,6 +257,140 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
 
         self.assertEqual(result["access_token"], "access")
         self.assertEqual(len(calls), 2)
+
+    def test_create_account_sends_sentinel_and_so_headers_without_logging_token_values(self):
+        registrar = openai_register.PlatformRegistrar(proxy="")
+        request_calls = []
+        log_lines = []
+
+        def fake_request(session, method, url, retry_attempts=3, **kwargs):
+            request_calls.append({"method": method, "url": url, "headers": dict(kwargs.get("headers") or {})})
+            return FakeResponse(status_code=200, text='{}', headers={"content-type": "application/json", "Location": "/continue"}), ""
+
+        try:
+            with patch.object(
+                openai_register,
+                "build_sentinel_tokens",
+                return_value=openai_register.SentinelTokens("sentinel-secret", "so-secret", "20260124ceb8"),
+            ), patch.object(openai_register, "request_with_local_retry", side_effect=fake_request), patch.object(openai_register, "step", side_effect=lambda index, text, color="": log_lines.append(text)):
+                continue_url = registrar._create_account("Test User", "2000-01-01", 1)
+        finally:
+            registrar.close()
+
+        self.assertEqual(continue_url, "/continue")
+        headers = request_calls[0]["headers"]
+        normalized = {key.lower(): value for key, value in headers.items()}
+        self.assertEqual(normalized["openai-sentinel-token"], "sentinel-secret")
+        self.assertEqual(normalized["openai-sentinel-so-token"], "so-secret")
+        self.assertTrue(any("token_len=15" in line and "so_token=yes" in line and "sdk=20260124ceb8" in line for line in log_lines))
+        self.assertFalse(any("sentinel-secret" in line or "so-secret" in line for line in log_lines))
+
+    def test_register_preserves_otp_step_before_create_account(self):
+        registrar = openai_register.PlatformRegistrar(proxy="")
+        calls = []
+
+        try:
+            with patch.object(openai_register, "create_mailbox", return_value={"address": "user@example.com"}), patch.object(
+                openai_register,
+                "wait_for_code",
+                return_value="123456",
+            ), patch.object(registrar, "_platform_authorize", side_effect=lambda email, index: calls.append("authorize") or "verifier"), patch.object(
+                registrar,
+                "_submit_email_continue",
+                side_effect=lambda email, index, referer="": calls.append("email_continue"),
+            ), patch.object(registrar, "_register_user", side_effect=lambda email, password, index: calls.append("password_register")), patch.object(
+                registrar,
+                "_send_otp",
+                side_effect=lambda index: calls.append("send_otp"),
+            ), patch.object(registrar, "_validate_otp", side_effect=lambda code, index: calls.append("validate_otp") or "/about-you"), patch.object(
+                registrar,
+                "_create_account",
+                side_effect=lambda name, birthdate, index, referer="": calls.append("create_account") or "/continue",
+            ), patch.object(
+                registrar,
+                "_login_and_exchange_tokens",
+                return_value={"access_token": "access", "refresh_token": "refresh", "id_token": "id"},
+            ):
+                result = registrar.register(1)
+        finally:
+            registrar.close()
+
+        self.assertEqual(result["email"], "user@example.com")
+        self.assertEqual(calls[:5], ["authorize", "password_register", "send_otp", "validate_otp", "create_account"])
+        self.assertNotIn("email_continue", calls)
+
+    def test_domain_stats_disable_low_success_domain_and_mail_provider_skips_it(self):
+        original_file = openai_register.domain_stats_file
+        temp_file = Path(__file__).resolve().parent / ".tmp_domain_stats.json"
+        try:
+            if temp_file.exists():
+                temp_file.unlink()
+            openai_register.domain_stats_file = temp_file
+            mail_provider.set_disabled_domains([])
+            for _ in range(openai_register.min_domain_attempts_before_disable):
+                openai_register._record_register_domain_result(
+                    {"address": "user@bad.example", "provider": "temp", "provider_ref": "temp#1"},
+                    False,
+                )
+            data = openai_register._load_domain_stats()
+            self.assertIn("bad.example", data.get("disabled_domains") or [])
+            self.assertEqual(mail_provider._next_domain(["bad.example", "good.example"]), "good.example")
+        finally:
+            openai_register.domain_stats_file = original_file
+            mail_provider.set_disabled_domains([])
+            if temp_file.exists():
+                temp_file.unlink()
+
+    def test_worker_uses_refresh_accounts_after_saving_registered_account(self):
+        refreshed_tokens = []
+        added_items = []
+        fake_result = {
+            "email": "user@example.com",
+            "password": "secret",
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+            "id_token": "id-token",
+        }
+
+        class FakeRegistrar:
+            def __init__(self, proxy=""):
+                self.proxy = proxy
+                self.closed = False
+
+            def register(self, index):
+                return dict(fake_result)
+
+            def close(self):
+                self.closed = True
+
+        def fake_add(items):
+            added_items.extend(items)
+            return {"items": items}
+
+        def fake_refresh(tokens):
+            refreshed_tokens.extend(tokens)
+            return {"refreshed": 1, "errors": [], "items": []}
+
+        original_stats = dict(openai_register.stats)
+        try:
+            openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": 1})
+            with patch.object(openai_register, "PlatformRegistrar", FakeRegistrar), patch.object(
+                openai_register.account_service,
+                "add_account_items",
+                side_effect=fake_add,
+            ), patch.object(
+                openai_register.account_service,
+                "refresh_accounts",
+                side_effect=fake_refresh,
+            ), patch.object(openai_register, "log"):
+                result = openai_register.worker(2)
+        finally:
+            openai_register.stats.update(original_stats)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(refreshed_tokens, ["access-token"])
+        self.assertEqual(added_items[0]["source_type"], "web")
+        self.assertIn("proxy", added_items[0])
 
 
 if __name__ == "__main__":

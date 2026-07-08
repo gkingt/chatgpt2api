@@ -61,6 +61,33 @@ class OpenAIBackendProxyRuntimeTests(unittest.TestCase):
         self.assertEqual(fake_proxy.build_headers_calls[0]["target_url"], "https://chatgpt.com/backend-api/f/conversation")
         self.assertTrue(fake_proxy.build_headers_calls[0]["upstream"])
 
+    def test_get_user_info_degrades_when_quota_endpoint_times_out(self):
+        fake_proxy = FakeProxySettings()
+        with patch.object(openai_backend_api, "proxy_settings", fake_proxy), patch.object(
+            openai_backend_api.requests,
+            "Session",
+            side_effect=lambda **kwargs: FakeSession(**kwargs),
+        ):
+            api = openai_backend_api.OpenAIBackendAPI("access-token")
+
+        with patch.object(
+            api,
+            "_get_me",
+            return_value={"email": "user@example.com", "id": "user-id"},
+        ), patch.object(
+            api,
+            "_get_conversation_init",
+            side_effect=TimeoutError("Connection timed out after 20011 milliseconds"),
+        ), patch.object(api, "_get_default_account", return_value={"plan_type": "free"}):
+            result = api.get_user_info()
+
+        self.assertEqual(result["email"], "user@example.com")
+        self.assertEqual(result["user_id"], "user-id")
+        self.assertEqual(result["type"], "free")
+        self.assertEqual(result["quota"], 0)
+        self.assertTrue(result["image_quota_unknown"])
+        self.assertEqual(result["status"], "限流")
+
 
 if __name__ == "__main__":
     unittest.main()

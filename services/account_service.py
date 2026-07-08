@@ -747,7 +747,7 @@ class AccountService:
             # 添加 sentinel token
             try:
                 from utils.sentinel import build_sentinel_token
-                sentinel_val, oai_sc_val, _so_token = build_sentinel_token(session, device_id, "password_verify")
+                sentinel_val, oai_sc_val = build_sentinel_token(session, device_id, "password_verify")
                 login_headers["openai-sentinel-token"] = sentinel_val
                 if oai_sc_val:
                     session.cookies.set("oai-sc", oai_sc_val, domain=".openai.com")

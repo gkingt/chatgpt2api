@@ -83,6 +83,9 @@ DEFAULT_THIRD_PARTY_APPS = {
     },
 }
 
+DEFAULT_IMAGE_BACKEND_MODEL = "gpt-5-5-thinking"
+IMAGE_BACKEND_MODEL_OPTIONS = ("gpt-5-5-thinking", "gpt-5-5", "gpt-5-3", "auto")
+
 
 def _normalize_bool(value: object, default: bool = False) -> bool:
     if isinstance(value, str):
@@ -197,6 +200,11 @@ def _normalize_chat_completion_cache_settings(value: object) -> dict[str, object
             bool(DEFAULT_CHAT_COMPLETION_CACHE["drop_assistant_history"]),
         ),
     }
+
+
+def _normalize_image_backend_model(value: object) -> str:
+    normalized = str(value or DEFAULT_IMAGE_BACKEND_MODEL).strip()
+    return normalized if normalized in IMAGE_BACKEND_MODEL_OPTIONS else DEFAULT_IMAGE_BACKEND_MODEL
 
 
 def _normalize_status_codes(value: object) -> list[int]:
@@ -393,6 +401,24 @@ class ConfigStore:
             return 30
 
     @property
+    def image_backend_model(self) -> str:
+        return _normalize_image_backend_model(self.data.get("image_backend_model"))
+
+    @property
+    def image_backend_model_fallback_enabled(self) -> bool:
+        value = self.data.get("image_backend_model_fallback_enabled", True)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    @property
+    def image_backend_model_attempts(self) -> list[str]:
+        primary = self.image_backend_model
+        if not self.image_backend_model_fallback_enabled:
+            return [primary]
+        return [primary, *(item for item in IMAGE_BACKEND_MODEL_OPTIONS if item != primary)]
+
+    @property
     def image_poll_timeout_secs(self) -> int:
         try:
             return max(1, int(self.data.get("image_poll_timeout_secs", 120)))
@@ -557,6 +583,8 @@ class ConfigStore:
         data = dict(self.data)
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
         data["image_retention_days"] = self.image_retention_days
+        data["image_backend_model"] = self.image_backend_model
+        data["image_backend_model_fallback_enabled"] = self.image_backend_model_fallback_enabled
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
@@ -603,6 +631,11 @@ class ConfigStore:
     def update(self, data: dict[str, object]) -> dict[str, object]:
         next_data = dict(self.data)
         next_data.update(dict(data or {}))
+        next_data["image_backend_model"] = _normalize_image_backend_model(next_data.get("image_backend_model"))
+        next_data["image_backend_model_fallback_enabled"] = _normalize_bool(
+            next_data.get("image_backend_model_fallback_enabled"),
+            True,
+        )
         if "backup" in next_data:
             next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
         if "image_storage" in next_data:

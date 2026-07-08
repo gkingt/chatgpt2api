@@ -9,6 +9,7 @@ import string
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -23,7 +24,11 @@ from urllib3.util.retry import Retry
 from services.account_service import account_service
 from services.proxy_service import proxy_settings
 from services.register import mail_provider
-from services.register import domain_stats
+from utils.sentinel import (
+    SENTINEL_OBSERVER_WAIT_MS,
+    build_sentinel_token as _build_sentinel_token_tuple,
+    build_sentinel_tokens as _build_sentinel_tokens,
+)
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 base_dir = Path(__file__).resolve().parent
@@ -39,6 +44,7 @@ config = {
     "threads": 3,
 }
 register_config_file = base_dir.parents[1] / "data" / "register.json"
+domain_stats_file = base_dir.parents[1] / "data" / "domain_stats.json"
 try:
     saved_config = json.loads(register_config_file.read_text(encoding="utf-8"))
     config.update({key: saved_config[key] for key in ("mail", "proxy", "total", "threads") if key in saved_config})
@@ -66,6 +72,24 @@ register_log_sink = None
 cancel_event = threading.Event()
 active_sessions_lock = threading.Lock()
 active_sessions: set[Any] = set()
+sentinel_sdk_url = "https://sentinel.openai.com/sentinel/20260124ceb8/sdk.js"
+sentinel_so_observer_timeout_ms = 5000
+sentinel_sdk_lock = threading.Lock()
+sentinel_sdk_metadata: dict[str, str] | None = None
+domain_stats_lock = threading.Lock()
+min_domain_attempts_before_disable = 5
+min_domain_success_rate = 0.2
+
+
+@dataclass(frozen=True)
+class SentinelTokens:
+    token: str
+    so_token: str = ""
+    sdk_version: str = "unknown"
+    req_host: str = ""
+    req_keys: str = ""
+    so_shape: str = "missing"
+    oai_sc: str = ""
 
 
 class RegistrationCancelled(RuntimeError):
@@ -281,14 +305,68 @@ def wait_for_code(mailbox: dict) -> str | None:
     return mail_provider.wait_for_code({**config["mail"], "proxy": config.get("proxy") or ""}, mailbox)
 
 
-# ── Sentinel SDK 常量（必须在 SentinelTokenGenerator 之前定义）──────────
-SENTINEL_SDK_VERSION = "20260124ceb8"
-# sentinel.openai.com 是 sentinel iframe 实际加载的域名
-# (parent 页面 auth.openai.com 通过 iframe 加载 sentinel.openai.com/sentinel/.../frame.html)
-# SDK 中 Zt = frame origin + "/backend-api/sentinel/" = sentinel.openai.com/backend-api/sentinel/
-SENTINEL_BASE_URL = "https://sentinel.openai.com/backend-api/sentinel"
-SENTINEL_FRAME_URL = f"https://sentinel.openai.com/sentinel/{SENTINEL_SDK_VERSION}/frame.html"
-SENTINEL_SDK_URL = f"https://sentinel.openai.com/sentinel/{SENTINEL_SDK_VERSION}/sdk.js"
+def _email_domain(email: str) -> str:
+    _, sep, domain = str(email or "").strip().lower().rpartition("@")
+    return domain if sep else ""
+
+
+def _load_domain_stats() -> dict:
+    try:
+        data = json.loads(domain_stats_file.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_domain_stats(data: dict) -> None:
+    domain_stats_file.parent.mkdir(parents=True, exist_ok=True)
+    domain_stats_file.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _record_register_domain_result(mailbox: dict, success: bool) -> None:
+    email = str(mailbox.get("address") or "").strip()
+    domain = str(mailbox.get("base_domain") or _email_domain(email)).strip().lower()
+    provider = str(mailbox.get("provider") or "unknown").strip() or "unknown"
+    provider_ref = str(mailbox.get("provider_ref") or "").strip()
+    now = datetime.now(timezone.utc).isoformat()
+    if not domain and not provider:
+        return
+    with domain_stats_lock:
+        data = _load_domain_stats()
+        domains = data.setdefault("domains", {})
+        providers = data.setdefault("providers", {})
+        if domain:
+            item = domains.setdefault(domain, {"success": 0, "fail": 0})
+            item["success" if success else "fail"] = int(item.get("success" if success else "fail") or 0) + 1
+            total = int(item.get("success") or 0) + int(item.get("fail") or 0)
+            item["success_rate"] = round(int(item.get("success") or 0) * 100 / max(1, total), 1)
+            item["last_updated"] = now
+        provider_key = f"{provider}:{provider_ref}" if provider_ref else provider
+        item = providers.setdefault(provider_key, {"success": 0, "fail": 0, "provider": provider, "provider_ref": provider_ref})
+        item["success" if success else "fail"] = int(item.get("success" if success else "fail") or 0) + 1
+        total = int(item.get("success") or 0) + int(item.get("fail") or 0)
+        item["success_rate"] = round(int(item.get("success") or 0) * 100 / max(1, total), 1)
+        item["last_updated"] = now
+        disabled = []
+        for domain_name, domain_item in domains.items():
+            total = int(domain_item.get("success") or 0) + int(domain_item.get("fail") or 0)
+            rate = int(domain_item.get("success") or 0) / max(1, total)
+            if total >= min_domain_attempts_before_disable and rate < min_domain_success_rate:
+                disabled.append(str(domain_name).lower())
+        data["disabled_domains"] = sorted(set(disabled))
+        data["updated_at"] = now
+        _save_domain_stats(data)
+        mail_provider.set_disabled_domains(data.get("disabled_domains") or [])
+
+
+def _sync_disabled_domains_from_stats() -> None:
+    data = _load_domain_stats()
+    domains = data.get("disabled_domains") if isinstance(data, dict) else []
+    if isinstance(domains, list):
+        mail_provider.set_disabled_domains(domains)
+
+
+_sync_disabled_domains_from_stats()
 
 
 class SentinelTokenGenerator:
@@ -315,27 +393,25 @@ class SentinelTokenGenerator:
 
     def _get_config(self) -> list:
         perf_now = random.uniform(1000, 50000)
-        time_origin = time.time() * 1000 - perf_now
-        search_params = f"device_id={self.device_id},flow=,screen_hint=login_or_signup"
         return [
             "1920x1080",
             time.strftime("%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)", time.gmtime()),
             4294705152,
             random.random(),
             self.user_agent,
-            f"{SENTINEL_SDK_URL}",
-            "",
+            sentinel_sdk_url,
+            None,
+            None,
             "en-US",
-            "en-US,en,es-US,es",
             random.random(),
             random.choice(["vendorSub-undefined", "plugins-undefined", "mimeTypes-undefined", "hardwareConcurrency-undefined"]),
             random.choice(["location", "implementation", "URL", "documentURI", "compatMode"]),
             random.choice(["Object", "Function", "Array", "Number", "parseFloat", "undefined"]),
             perf_now,
             self.sid,
-            search_params,
+            "",
             random.choice([4, 8, 12, 16]),
-            time_origin,
+            time.time() * 1000 - perf_now,
         ]
 
     @staticmethod
@@ -361,270 +437,98 @@ class SentinelTokenGenerator:
         return "gAAAAAB" + self.ERROR_PREFIX + self._b64(str(None))
 
 
-SO_TOKEN_OBSERVER_WAIT_SECS = 5.0
-
-
-# ── Sentinel Observer VM（对齐 Go 后端 generateSOTokenFromCollectorDX）──
-
-
-def _xor_decrypt(data: str, key: str) -> str:
-    if not key:
-        return data
-    kl = len(key)
-    return "".join(chr(ord(data[i]) ^ ord(key[i % kl])) for i in range(len(data)))
-
-
-class _SentinelObsVM:
-    """微型 VM，模拟 sentinel SDK 的 observer 字节码执行器，用于计算 so_token。"""
-
-    def __init__(self) -> None:
-        self.regs: dict[str, Any] = {}
-        self.queue: list[Any] = []
-        self.counter = 0
-        self.finished = False
-        self.result = ""
-        self._install_ops()
-
-    def _install_ops(self) -> None:
-        vm = self
-        r = vm.regs
-
-        def _get(key: Any) -> Any:
-            k = str(key)
-            if isinstance(key, float):
-                k = str(int(key))
-            return r.get(k)
-
-        def _set(args: list[Any], val: Any) -> None:
-            if args:
-                r[str(args[0])] = val
-
-        def _to_str(v: Any) -> str:
-            if isinstance(v, float) and v == int(v):
-                return str(int(v))
-            return str(v) if v is not None else ""
-
-        r["1"] = lambda a: _set(a, _xor_decrypt(_to_str(_get(a[0])), _to_str(_get(a[1]))))
-        r["2"] = lambda a: _set(a, _get(a[1]))
-        r["5"] = lambda a: _set(a, (list(_get(a[0])) + [_get(a[1])]) if isinstance(_get(a[0]), list) else _to_str(_get(a[0])) + _to_str(_get(a[1])))
-        r["6"] = lambda a: _set(a, self._op6(a, _get, _set))
-        r["7"] = lambda a: self._op7(a, _get)
-        r["8"] = lambda a: _set(a, _get(a[1]))
-        r["12"] = lambda a: _set(a, r)
-        r["13"] = lambda a: self._op13(a, _get)
-        r["14"] = lambda a: _set(a, json.loads(_to_str(_get(a[1]))) if _to_str(_get(a[1])) else None)
-        r["15"] = lambda a: _set(a, json.dumps(_get(a[1]), separators=(",", ":"), ensure_ascii=False))
-        r["17"] = lambda a: self._op17(a, _get)
-        r["18"] = lambda a: _set(a, base64.b64decode(_to_str(_get(a[0]))).decode("utf-8", errors="replace"))
-        r["19"] = lambda a: _set(a, base64.b64encode(_to_str(_get(a[0])).encode("utf-8")).decode("ascii"))
-        r["20"] = lambda a: self._op20(a, _get)
-        r["22"] = self._op22
-        r["23"] = lambda a: self._op23(a, _get)
-        r["24"] = self._op24
-        for op in ("25", "26", "27", "28"):
-            r[op] = lambda a: None
-        r["29"] = lambda a: _set(a, self._to_float(_get(a[1])) < self._to_float(_get(a[2])))
-        r["33"] = lambda a: _set(a, self._to_float(_get(a[1])) * self._to_float(_get(a[2])))
-        r["34"] = lambda a: _set(a, _get(a[1]))
-
-        # op 3 / 4: 收集结果
-        def _collect(a: list[Any]) -> None:
-            if not vm.finished:
-                vm.finished = True
-                vm.result = base64.b64encode(_to_str(_get(a[0])).encode("utf-8")).decode("ascii")
-
-        r["3"] = _collect
-        r["4"] = _collect
-
-        # op 30: 定义函数
-        r["30"] = lambda a: self._op30(a)
-
-        self._get = _get
-        self._set = _set
-        self._to_str = _to_str
-
-    @staticmethod
-    def _to_float(v: Any) -> float:
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return 0.0
-
-    def _op6(self, a: list, _get, _set) -> None:
-        b = _get(a[1])
-        idx = _get(a[2])
-        try:
-            n = int(float(idx)) if idx is not None else -1
-        except (TypeError, ValueError):
-            n = -1
-        if isinstance(b, str) and 0 <= n < len(b):
-            _set(a, b[n])
-        elif isinstance(b, list) and 0 <= n < len(b):
-            _set(a, b[n])
-
-    def _op7(self, a: list, _get) -> None:
-        fn = _get(a[0])
-        fa = [_get(a[i]) for i in range(1, len(a))]
-        if callable(fn):
-            fn(fa)
-
-    def _op13(self, a: list, _get) -> None:
-        try:
-            fn = _get(a[1])
-            fa = [_get(a[i]) for i in range(2, len(a))]
-            if callable(fn):
-                fn(fa)
-        except Exception as e:
-            self._set(a, str(e))
-
-    def _op17(self, a: list, _get) -> None:
-        fn = _get(a[1])
-        fa = [_get(a[i]) for i in range(2, len(a))]
-        if callable(fn):
-            fn(fa)
-
-    def _op20(self, a: list, _get) -> None:
-        if self._to_str(_get(a[0])) == self._to_str(_get(a[1])):
-            fn = _get(a[2])
-            fa = [_get(a[i]) for i in range(3, len(a))]
-            if callable(fn):
-                fn(fa)
-
-    def _op22(self, a: list) -> None:
-        sl = self._get(a[1])
-        if isinstance(sl, list):
-            saved = self.queue
-            self.queue = list(sl)
-            self.run()
-            self._set(a, str(self.counter))
-            self.queue = saved
-
-    def _op23(self, a: list, _get) -> None:
-        if _get(a[0]) is not None:
-            fn = _get(a[1])
-            fa = [_get(a[i]) for i in range(2, len(a))]
-            if callable(fn):
-                fn(fa)
-
-    def _op24(self, a: list) -> None:
-        obj = self._get(a[1])
-        method = self._get(a[2])
-        vm = self
-
-        def _impl(fa: list) -> None:
-            if isinstance(obj, str) and self._to_str(method) == "indexOf":
-                vm._set(a, self._to_str(obj).find(self._to_str(fa[0]) if fa else ""))
-
-        self._set(a, _impl)
-
-    def _op30(self, a: list) -> None:
-        vm = self
-        fn_name = self._to_str(a[0])
-        pn = a[1:]
-        ac = len(pn) - 1
-        body = a[-1] if a else None
-
-        def _impl(ca: list) -> None:
-            saved = dict(vm.regs)
-            for i in range(min(ac, len(ca))):
-                vm.regs[self._to_str(pn[i])] = ca[i]
-            if isinstance(body, list):
-                saved_q = vm.queue
-                vm.queue = list(body)
-                vm.run()
-                vm.queue = saved_q
-            for k in list(vm.regs.keys()):
-                if k not in saved:
-                    del vm.regs[k]
-            vm.regs.update(saved)
-
-        vm.regs[fn_name] = _impl
-
-    def run(self) -> None:
-        while self.queue:
-            inst = self.queue.pop(0)
-            if isinstance(inst, list) and inst:
-                fn = self.regs.get(self._to_str(inst[0]))
-                if callable(fn):
-                    fn(inst)
-            self.counter += 1
-
-
-def generate_so_token_from_collector_dx(collector_dx: str, proof_token: str) -> str:
-    """通过 Sentinel Observer VM 从 collector_dx 计算 so_token（对齐 Go 后端）。"""
+def _sentinel_sdk_version() -> str:
+    marker = "/sentinel/"
     try:
-        raw = base64.b64decode(collector_dx)
+        path = urlparse(sentinel_sdk_url).path
+        if marker in path:
+            return path.split(marker, 1)[1].split("/", 1)[0] or "unknown"
     except Exception:
-        return ""
-    decrypted = _xor_decrypt(raw.decode("utf-8", errors="replace"), proof_token)
+        pass
+    return "unknown"
+
+
+def _load_sentinel_sdk_metadata(session: requests.Session) -> dict[str, str]:
+    global sentinel_sdk_metadata
+    with sentinel_sdk_lock:
+        if sentinel_sdk_metadata is not None:
+            return dict(sentinel_sdk_metadata)
+    version = _sentinel_sdk_version()
+    metadata = {"version": version, "observer_timeout_ms": str(sentinel_so_observer_timeout_ms)}
     try:
-        program = json.loads(decrypted)
-    except (json.JSONDecodeError, TypeError):
-        return ""
-    if not isinstance(program, list):
-        return ""
-    vm = _SentinelObsVM()
-    vm.regs["rt"] = proof_token
-    vm.queue = list(program)
-    vm.run()
-    if vm.result:
-        return vm.result
-    # fallback: 返回 counter
-    return base64.b64encode(str(vm.counter).encode("utf-8")).decode("ascii")
+        resp = session.get(
+            sentinel_sdk_url,
+            headers={"User-Agent": user_agent, "Accept": "application/javascript,*/*;q=0.8"},
+            timeout=20,
+            verify=False,
+        )
+        body = str(getattr(resp, "text", "") or "")
+        if getattr(resp, "status_code", 0) == 200 and body:
+            if "5e3" in body or "5000" in body:
+                metadata["observer_timeout_ms"] = "5000"
+    except Exception:
+        pass
+    with sentinel_sdk_lock:
+        sentinel_sdk_metadata = dict(metadata)
+    return metadata
 
 
-def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -> tuple[str, str]:
-    """返回 (sentinel_token_json, so_token) 的元组。
-
-    so_token 仅在 oauth_create_account flow 时生成。
-    so_token 通过 Sentinel Observer VM 从 collector_dx 计算。
-    """
-    generator = SentinelTokenGenerator(device_id, user_agent)
-    reqs_token = generator.generate_requirements_token()
-    resp = session.post(
-        f"{SENTINEL_BASE_URL}/req",
-        data=json.dumps({"p": reqs_token, "id": device_id, "flow": flow}),
-        headers={
-            "Content-Type": "text/plain;charset=UTF-8",
-            "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
-            "Origin": "https://sentinel.openai.com",
-            "User-Agent": user_agent,
-            "sec-ch-ua": sec_ch_ua,
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-        },
-        timeout=20,
-        verify=False,
+def _sentinel_req_endpoints(flow: str) -> list[tuple[str, str, str]]:
+    auth_endpoint = (
+        "https://auth.openai.com/backend-api/sentinel/req",
+        "https://auth.openai.com/sentinel/20260124ceb8/frame.html",
+        "https://auth.openai.com",
     )
-    data = _response_json(resp)
-    token = str(data.get("token") or "").strip()
-    if resp.status_code != 200 or not token:
-        raise RuntimeError(f"sentinel_req_failed_{resp.status_code}")
-    pow_data = data.get("proofofwork") or {}
-    p_value = (
-        generator.generate_token(str(pow_data.get("seed") or ""), str(pow_data.get("difficulty") or "0"))
-        if pow_data.get("required") and pow_data.get("seed")
-        else generator.generate_requirements_token()
+    sentinel_endpoint = (
+        "https://sentinel.openai.com/backend-api/sentinel/req",
+        "https://sentinel.openai.com/backend-api/sentinel/frame.html",
+        "https://sentinel.openai.com",
     )
-    sentinel_token = json.dumps(
-        {"p": p_value, "t": "", "c": token, "id": device_id, "flow": flow},
-        separators=(",", ":"),
-    )
-
-    # SO token（Sentinel Observer），仅在 oauth_create_account 阶段需要
-    so_token = ""
     if flow == "oauth_create_account":
-        so_data = data.get("so") or {}
-        if isinstance(so_data, dict):
-            collector_dx = str(so_data.get("collector_dx") or "").strip()
-            if so_data.get("required") and collector_dx:
-                time.sleep(SO_TOKEN_OBSERVER_WAIT_SECS)
-                so_token = generate_so_token_from_collector_dx(collector_dx, reqs_token)
-                log(f"Sentinel SO token 已生成: so_len={len(so_token)}, has_snapshot={bool(so_data.get('snapshot_dx'))}")
-            else:
-                log(f"Sentinel so 字段无有效的 collector_dx（required={so_data.get('required')}, has_collector={bool(collector_dx)}）")
+        return [auth_endpoint, sentinel_endpoint]
+    return [sentinel_endpoint, auth_endpoint]
 
-    return sentinel_token, so_token
+
+def _so_shape(value: object) -> str:
+    if isinstance(value, dict):
+        return "dict:" + ",".join(sorted(str(key) for key in value.keys()))
+    if isinstance(value, str):
+        return "str" if value else "empty_str"
+    if value is None:
+        return "missing"
+    return type(value).__name__
+
+
+def build_sentinel_tokens(session: requests.Session, device_id: str, flow: str) -> SentinelTokens:
+    bundle = _build_sentinel_tokens(
+        session,
+        device_id,
+        flow,
+        user_agent=user_agent,
+        sec_ch_ua=sec_ch_ua,
+        include_so=flow == "oauth_create_account",
+        observer_wait_ms=SENTINEL_OBSERVER_WAIT_MS,
+    )
+    return SentinelTokens(
+        token=bundle.sentinel_token,
+        so_token=bundle.so_token,
+        sdk_version=bundle.sdk_version or "legacy",
+        req_host=urlparse(bundle.sdk_url).netloc,
+        req_keys=f"p_len={bundle.requirements_token_length}",
+        so_shape="required" if bundle.sentinel_req_so_required else "unknown",
+        oai_sc=bundle.oai_sc,
+    )
+
+
+def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -> str:
+    sentinel_value, _oai_sc = _build_sentinel_token_tuple(session, device_id, flow, user_agent=user_agent, sec_ch_ua=sec_ch_ua)
+    return sentinel_value
+
+
+def _apply_sentinel_headers(headers: dict[str, str], tokens: SentinelTokens, *, require_so_header: bool = False) -> None:
+    headers["OpenAI-Sentinel-Token"] = tokens.token
+    if tokens.so_token or require_so_header:
+        headers["OpenAI-Sentinel-SO-Token"] = tokens.so_token
 
 
 def _is_socks_proxy(proxy: str) -> bool:
@@ -678,7 +582,7 @@ def validate_otp(session: requests.Session, device_id: str, code: str):
     resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/email-otp/validate", json={"code": code}, headers=headers, verify=False)
     if resp is not None and resp.status_code == 200:
         return resp, ""
-    headers["openai-sentinel-token"] = build_sentinel_token(session, device_id, "authorize_continue")[0]
+    _apply_sentinel_headers(headers, build_sentinel_tokens(session, device_id, "authorize_continue"))
     resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/email-otp/validate", json={"code": code}, headers=headers, verify=False)
     return resp, error
 
@@ -849,7 +753,7 @@ class PlatformRegistrar:
             "audience": platform_oauth_audience,
             "redirect_uri": platform_oauth_redirect_uri,
             "device_id": self.device_id,
-            "screen_hint": "login_or_signup",
+            "screen_hint": "signup",
             "max_age": "0",
             "login_hint": email,
             "scope": "openid profile email offline_access",
@@ -881,8 +785,7 @@ class PlatformRegistrar:
     def _register_user(self, email: str, password: str, index: int) -> None:
         step(index, "开始提交注册密码")
         headers = self._json_headers(f"{auth_base}/create-account/password")
-        sentinel_val, _ = build_sentinel_token(self.session, self.device_id, "username_password_create")
-        headers["openai-sentinel-token"] = sentinel_val
+        _apply_sentinel_headers(headers, build_sentinel_tokens(self.session, self.device_id, "username_password_create"))
         resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/user/register", json={"username": email, "password": password}, headers=headers, verify=False)
         if resp is None or resp.status_code != 200:
             data = _response_json(resp) if resp is not None else {}
@@ -892,6 +795,24 @@ class PlatformRegistrar:
             raise RuntimeError(error or f"user_register_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
         step(index, "提交注册密码完成")
 
+    def _submit_email_continue(self, email: str, index: int, referer: str = "") -> None:
+        step(index, "开始提交注册邮箱")
+        headers = self._json_headers(referer or f"{auth_base}/create-account")
+        _apply_sentinel_headers(headers, build_sentinel_tokens(self.session, self.device_id, "authorize_continue"))
+        resp, error = request_with_local_retry(
+            self.session,
+            "post",
+            f"{auth_base}/api/accounts/authorize/continue",
+            json={"username": {"kind": "email", "value": email}},
+            headers=headers,
+            allow_redirects=False,
+            verify=False,
+        )
+        if resp is None or resp.status_code != 200:
+            detail = _response_error_detail(resp)
+            raise RuntimeError(error or f"register_email_continue_http_{getattr(resp, 'status_code', 'unknown')}{', ' + detail if detail else ''}")
+        step(index, "注册邮箱提交完成")
+
     def _send_otp(self, index: int) -> None:
         step(index, "开始发送验证码")
         resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/email-otp/send", headers=self._navigate_headers(f"{auth_base}/create-account/password"), allow_redirects=True, verify=False)
@@ -899,27 +820,31 @@ class PlatformRegistrar:
             raise RuntimeError(error or f"send_otp_http_{getattr(resp, 'status_code', 'unknown')}")
         step(index, "发送验证码完成")
 
-    def _validate_otp(self, code: str, index: int) -> None:
+    def _validate_otp(self, code: str, index: int) -> str:
         step(index, f"开始校验验证码 {code}")
         resp, error = validate_otp(self.session, self.device_id, code)
         if resp is None or resp.status_code != 200:
             raise RuntimeError(error or f"validate_otp_http_{getattr(resp, 'status_code', 'unknown')}")
+        payload = _response_json(resp)
+        continue_url = str(payload.get("continue_url") or resp.headers.get("Location") or "").strip()
         step(index, "验证码校验完成")
+        return continue_url
 
-    def _create_account(self, name: str, birthdate: str, index: int) -> str:
+    def _create_account(self, name: str, birthdate: str, index: int, referer: str = "") -> str:
         step(index, "开始创建账号资料")
-        headers = self._json_headers(f"{auth_base}/about-you")
-        sentinel_val, so_token = build_sentinel_token(self.session, self.device_id, "oauth_create_account")
-        headers["openai-sentinel-token"] = sentinel_val
-        if so_token:
-            headers["openai-sentinel-so-token"] = so_token
-            step(index, f"create_account 携带 SO token: sentinel_len={len(sentinel_val)}, so_len={len(so_token)}")
+        headers = self._json_headers(referer or f"{auth_base}/about-you")
+        sentinel_tokens = build_sentinel_tokens(self.session, self.device_id, "oauth_create_account")
+        if not sentinel_tokens.so_token:
+            raise RuntimeError("OpenAI-Sentinel-SO-Token 生成失败")
+        _apply_sentinel_headers(headers, sentinel_tokens, require_so_header=True)
+        if sentinel_tokens.oai_sc:
+            self.session.cookies.set("oai-sc", sentinel_tokens.oai_sc, domain=".openai.com")
+            self.session.cookies.set("oai-sc", sentinel_tokens.oai_sc, domain=".auth.openai.com")
+        step(index, f"Sentinel create_account: token_len={len(sentinel_tokens.token)}, so_token={'yes' if sentinel_tokens.so_token else 'no'}, sdk={sentinel_tokens.sdk_version}, req_host={sentinel_tokens.req_host}, req_keys={sentinel_tokens.req_keys}, so={sentinel_tokens.so_shape}")
         resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/create_account", json={"name": name, "birthdate": birthdate}, headers=headers, verify=False)
         if resp is None or resp.status_code not in (200, 302):
             data = _response_json(resp) if resp is not None else {}
-            if data.get("code") == "registration_disallowed":
-                step(index, f"注册被拒 registration_disallowed: sentinel(so_token={'有' if so_token else '无'}), 可能原因: 域名被封/代理IP信誉不足/sentinel校验失败", "red")
-            elif data.get("message") == "Failed to create account. Please try again.":
+            if data.get("message") == "Failed to create account. Please try again.":
                 step(index, "创建账号失败提示: 邮箱域名很可能因滥用被封禁，请更换邮箱域名", "yellow")
             detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""
             raise RuntimeError(error or f"create_account_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
@@ -989,7 +914,7 @@ class PlatformRegistrar:
                 h["referer"] = f"{auth_base}/log-in?usernameKind=email"
                 h["oai-device-id"] = login_device_id
                 h.update(_make_trace_headers())
-                h["openai-sentinel-token"] = build_sentinel_token(login_session, login_device_id, "authorize_continue")[0]
+                _apply_sentinel_headers(h, build_sentinel_tokens(login_session, login_device_id, "authorize_continue"))
                 return request_with_local_retry(
                     login_session, "post",
                     f"{auth_base}/api/accounts/authorize/continue",
@@ -1023,7 +948,7 @@ class PlatformRegistrar:
             headers["referer"] = f"{auth_base}/log-in/password"
             headers["oai-device-id"] = login_device_id
             headers.update(_make_trace_headers())
-            headers["openai-sentinel-token"] = build_sentinel_token(login_session, login_device_id, "password_verify")[0]
+            _apply_sentinel_headers(headers, build_sentinel_tokens(login_session, login_device_id, "password_verify"))
             resp, error = request_with_local_retry(login_session, "post", f"{auth_base}/api/accounts/password/verify", json={"password": password}, headers=headers, allow_redirects=False, verify=False)
             if resp is None or resp.status_code != 200:
                 detail = _response_error_detail(resp)
@@ -1070,9 +995,9 @@ class PlatformRegistrar:
         if not email:
             raise RuntimeError("邮箱服务未返回 address")
         step(index, f"邮箱创建完成: {email}")
-        password = _random_password()
-        first_name, last_name = _random_name()
         try:
+            password = _random_password()
+            first_name, last_name = _random_name()
             self._platform_authorize(email, index)
             self._register_user(email, password, index)
             self._send_otp(index)
@@ -1081,23 +1006,27 @@ class PlatformRegistrar:
             if not code:
                 raise RuntimeError("等待注册验证码超时")
             step(index, f"收到注册验证码: {code}")
-            self._validate_otp(code, index)
-            self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
+            continue_url = self._validate_otp(code, index)
+            self._create_account(f"{first_name} {last_name}", _random_birthdate(), index, continue_url or f"{auth_base}/about-you")
             tokens = self._login_and_exchange_tokens(email, password, mailbox, index)
+            try:
+                _record_register_domain_result(mailbox, True)
+            except Exception as exc:
+                step(index, f"注册域名统计写入失败: {exc}", "yellow")
+            return {
+                "email": email,
+                "password": password,
+                "access_token": str(tokens.get("access_token") or "").strip(),
+                "refresh_token": str(tokens.get("refresh_token") or "").strip(),
+                "id_token": str(tokens.get("id_token") or "").strip(),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
         except Exception:
-            # 记录失败统计
-            domain_stats.record(email, str(mailbox.get("provider") or ""), success=False)
+            try:
+                _record_register_domain_result(mailbox, False)
+            except Exception as exc:
+                step(index, f"注册域名统计写入失败: {exc}", "yellow")
             raise
-        # 记录成功统计
-        domain_stats.record(email, str(mailbox.get("provider") or ""), success=True)
-        return {
-            "email": email,
-            "password": password,
-            "access_token": str(tokens.get("access_token") or "").strip(),
-            "refresh_token": str(tokens.get("refresh_token") or "").strip(),
-            "id_token": str(tokens.get("id_token") or "").strip(),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
 
 
 def worker(index: int) -> dict:
@@ -1110,10 +1039,9 @@ def worker(index: int) -> dict:
         cost = time.time() - start
         access_token = str(result["access_token"])
         account_service.add_account_items([{**result, "source_type": "web", "proxy": config["proxy"]}])
-        try:
-            account_service.fetch_remote_info(access_token, "register", skip_token_refresh=True)
-        except Exception as refresh_exc:
-            step(index, f"账号已保存，刷新额度暂未成功，稍后可重试: {refresh_exc}", "yellow")
+        refresh_result = account_service.refresh_accounts([access_token])
+        if refresh_result.get("errors"):
+            step(index, f"账号已保存，刷新额度暂未成功，稍后可重试: {refresh_result['errors']}", "yellow")
         with stats_lock:
             stats["done"] += 1
             stats["success"] += 1

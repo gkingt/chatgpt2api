@@ -8,7 +8,7 @@ import time
 
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -362,6 +362,18 @@ class OpenAIBackendAPI:
         })
         return default_account
 
+    @staticmethod
+    def _future_result_or_default(future: Future, default: Any, event: str) -> Any:
+        try:
+            return future.result()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except InvalidAccessTokenError:
+            raise
+        except Exception as exc:
+            logger.debug({"event": event, "error": str(exc)})
+            return default
+
     def get_user_info(self) -> Dict[str, Any]:
         """获取当前 token 的账号信息。"""
         if not self.access_token:
@@ -371,7 +383,17 @@ class OpenAIBackendAPI:
             me_future = executor.submit(self._get_me)
             init_future = executor.submit(self._get_conversation_init)
             account_future = executor.submit(self._get_default_account)
-            me_payload, init_payload, default_account = me_future.result(), init_future.result(), account_future.result()
+            me_payload = me_future.result()
+            init_payload = self._future_result_or_default(
+                init_future,
+                {},
+                "backend_user_info_conversation_init_failed",
+            )
+            default_account = self._future_result_or_default(
+                account_future,
+                {},
+                "backend_user_info_account_check_failed",
+            )
         except (KeyboardInterrupt, SystemExit):
             executor.shutdown(wait=False, cancel_futures=True)
             raise
@@ -592,7 +614,7 @@ class OpenAIBackendAPI:
         if not base_model:
             return "auto"
         if base_model == "gpt-image-2":
-            return "gpt-5-3"
+            return str(getattr(self, "image_backend_model_override", "") or config.image_backend_model)
         if base_model == CODEX_IMAGE_MODEL:
             return base_model
         return "auto"

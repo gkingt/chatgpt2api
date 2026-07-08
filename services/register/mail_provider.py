@@ -221,6 +221,14 @@ domain_index = 0
 provider_index = 0
 cloudmail_token_lock = Lock()
 cloudmail_token_cache: dict[str, tuple[str, float]] = {}
+disabled_domain_lock = Lock()
+disabled_domains: set[str] = set()
+
+
+def set_disabled_domains(domains: list[str] | set[str] | tuple[str, ...]) -> None:
+    with disabled_domain_lock:
+        disabled_domains.clear()
+        disabled_domains.update(str(item).strip().lower() for item in domains if str(item).strip())
 
 
 def _config(mail_config: dict) -> dict:
@@ -244,6 +252,11 @@ def _random_subdomain_label() -> str:
 def _next_domain(domains: list[str]) -> str:
     global domain_index
     domains = [str(item).strip() for item in domains if str(item).strip()]
+    with disabled_domain_lock:
+        disabled = set(disabled_domains)
+    allowed_domains = [item for item in domains if item.lower().lstrip("*.") not in disabled]
+    if allowed_domains:
+        domains = allowed_domains
     if not domains:
         raise RuntimeError("mail.domain 不能为空")
     if len(domains) == 1:
@@ -252,6 +265,14 @@ def _next_domain(domains: list[str]) -> str:
         value = domains[domain_index % len(domains)]
         domain_index = (domain_index + 1) % len(domains)
         return value
+
+
+def _random_domain(domains: list[str]) -> str:
+    domains = [str(item).strip() for item in domains if str(item).strip()]
+    with disabled_domain_lock:
+        disabled = set(disabled_domains)
+    allowed_domains = [item for item in domains if item.lower().lstrip("*.") not in disabled]
+    return random.choice(allowed_domains or domains)
 
 
 def _normalize_string_list(value: Any) -> list[str]:
@@ -744,7 +765,7 @@ class TempMailLolProvider(BaseMailProvider):
     def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {}
         if self.domain:
-            domain, force_random_prefix = self._resolve_domain(random.choice(self.domain))
+            domain, force_random_prefix = self._resolve_domain(_random_domain(self.domain))
             payload["domain"] = domain
             if force_random_prefix:
                 payload["prefix"] = _random_mailbox_name()
