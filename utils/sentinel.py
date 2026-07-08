@@ -40,6 +40,8 @@ class SentinelTokenGenerator:
 
     def _get_config(self) -> list:
         perf_now = random.uniform(1000, 50000)
+        time_origin = time.time() * 1000 - perf_now
+        search_params = f"device_id={self.device_id},flow=,screen_hint=login_or_signup"
         return [
             "1920x1080",
             time.strftime("%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)", time.gmtime()),
@@ -47,18 +49,18 @@ class SentinelTokenGenerator:
             random.random(),
             self.user_agent,
             "https://sentinel.openai.com/sentinel/20260124ceb8/sdk.js",
-            None,
-            None,
+            "",
             "en-US",
+            "en-US,en,es-US,es",
             random.random(),
             random.choice(["vendorSub-undefined", "plugins-undefined", "mimeTypes-undefined", "hardwareConcurrency-undefined"]),
             random.choice(["location", "implementation", "URL", "documentURI", "compatMode"]),
             random.choice(["Object", "Function", "Array", "Number", "parseFloat", "undefined"]),
             perf_now,
             self.sid,
-            "",
+            search_params,
             random.choice([4, 8, 12, 16]),
-            time.time() * 1000 - perf_now,
+            time_origin,
         ]
 
     @staticmethod
