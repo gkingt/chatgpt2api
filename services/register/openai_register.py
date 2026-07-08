@@ -359,113 +359,17 @@ class SentinelTokenGenerator:
         return "gAAAAAB" + self.ERROR_PREFIX + self._b64(str(None))
 
 
-SENTINEL_POST_TOKEN_OBSERVER_MS = 5000
+from utils.sentinel import build_sentinel_token as _build_sentinel_token_impl  # noqa: F401
+
+SO_TOKEN_OBSERVER_WAIT_SECS = 5.0
 
 
-def request_sentinel(session: requests.Session, device_id: str, flow: str) -> dict:
-    """请求 sentinel/req 并返回包含 sentinel_token / token 的完整字典。
-
-    对齐官方 Sentinel SDK (20260124ceb8) 的协议:
-    - sentinel/req endpoint 为 sentinel.openai.com (SDK iframe 实际运行域名)
-    - POST body 为 {p, id, flow} JSON（SDK 的 rn() 函数会自动加 id/flow）
-    - 从返回体生成 PoW enforcement token (用于 header 的 p 字段)
-    - t 字段: 当无 turnstile 时为 null (对齐 SDK 中 t = tn?.turnstile?.dx ? Ot(dx) : null)
-    - create_account 完成后 SDK 会异步发 flow+"__auto" 的 observer 请求，
-      post_sentinel_observer 函数对齐该行为。
-
-    返回:
-        {
-            "sentinel_token": str,    # 用于 OpenAI-Sentinel-Token header (JSON字符串)
-            "token": str,             # 服务器签发的 challenge token
-            "raw": dict,              # 原始响应
-        }
-    """
-    generator = SentinelTokenGenerator(device_id, user_agent)
-    p_token = generator.generate_requirements_token()
-    resp = session.post(
-        f"{SENTINEL_BASE_URL}/req",
-        data=json.dumps({"p": p_token, "id": device_id, "flow": flow}),
-        headers={
-            "Content-Type": "text/plain;charset=UTF-8",
-            "Referer": SENTINEL_FRAME_URL,
-            "Origin": "https://sentinel.openai.com",
-            "User-Agent": user_agent,
-            "sec-ch-ua": sec_ch_ua,
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-        },
-        timeout=20,
-        verify=False,
+def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -> tuple[str, str]:
+    """请求 sentinel token，返回 (sentinel_header_value, so_token_value)。"""
+    sentinel_val, _oai_sc_val, so_token = _build_sentinel_token_impl(
+        session, device_id, flow, user_agent=user_agent, sec_ch_ua=sec_ch_ua
     )
-    data = _response_json(resp)
-    token = str(data.get("token") or "").strip()
-    if resp.status_code != 200 or not token:
-        raise RuntimeError(f"sentinel_req_failed_{resp.status_code}")
-
-    # 生成 PoW enforcement token (SDK getEnforcementToken)
-    pow_data = data.get("proofofwork") or {}
-    if pow_data.get("required") and pow_data.get("seed"):
-        p_value = generator.generate_token(str(pow_data.get("seed") or ""), str(pow_data.get("difficulty") or "0"))
-    else:
-        p_value = p_token
-
-    # t 字段: SDK 里 t = turnstile.dx ? Ot(dx) : null
-    # 当前注册场景无 turnstile 要求, t 设为 null (JSON null)
-    t_value = None
-
-    sentinel_value = json.dumps(
-        {"p": p_value, "t": t_value, "c": token, "id": device_id, "flow": flow},
-        separators=(",", ":"),
-    )
-
-    # 日志: 只记录长度，不记录明文
-    log(
-        f"[sentinel] flow={flow}, sdk={SENTINEL_SDK_VERSION}, "
-        f"token_len={len(sentinel_value)}, pow={'yes' if pow_data.get('required') else 'no'}, "
-        f"endpoint={SENTINEL_BASE_URL}/req"
-    )
-
-    return {
-        "sentinel_token": sentinel_value,
-        "token": token,
-        "raw": data,
-    }
-
-
-def post_sentinel_observer(session: requests.Session, device_id: str, flow: str) -> None:
-    """create_account 后异步发送 observer 请求（对齐 SDK 行为）。
-
-    SDK 在 token() 成功后会 setTimeout(5s) 发一个 flow+"__auto" 的 sentinel/req，
-    用于向服务器上报行为数据。这里同步发送以保持一致性。
-    """
-    try:
-        generator = SentinelTokenGenerator(device_id, user_agent)
-        p_token = generator.generate_requirements_token()
-        observer_flow = f"{flow}__auto"
-        session.post(
-            f"{SENTINEL_BASE_URL}/req",
-            data=json.dumps({"p": p_token, "id": device_id, "flow": observer_flow}),
-            headers={
-                "Content-Type": "text/plain;charset=UTF-8",
-                "Referer": SENTINEL_FRAME_URL,
-                "Origin": "https://sentinel.openai.com",
-                "User-Agent": user_agent,
-                "sec-ch-ua": sec_ch_ua,
-                "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": '"Windows"',
-            },
-            timeout=10,
-            verify=False,
-        )
-        log(f"[sentinel] observer flow={observer_flow} sent")
-    except Exception as exc:
-        log(f"[sentinel] observer send failed: {exc}", "yellow")
-
-
-def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -> str:
-    """请求 sentinel token，返回 sentinel header 字符串（兼容旧接口）。"""
-    result = request_sentinel(session, device_id, flow)
-    return result["sentinel_token"]
+    return sentinel_val, so_token
 
 
 def _is_socks_proxy(proxy: str) -> bool:
@@ -519,7 +423,9 @@ def validate_otp(session: requests.Session, device_id: str, code: str):
     resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/email-otp/validate", json={"code": code}, headers=headers, verify=False)
     if resp is not None and resp.status_code == 200:
         return resp, ""
-    headers["openai-sentinel-token"] = build_sentinel_token(session, device_id, "authorize_continue")
+    headers["openai-sentinel-token"], so_token = build_sentinel_token(session, device_id, "authorize_continue")
+    if so_token:
+        headers["openai-sentinel-so-token"] = so_token
     resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/email-otp/validate", json={"code": code}, headers=headers, verify=False)
     return resp, error
 
@@ -722,7 +628,10 @@ class PlatformRegistrar:
     def _register_user(self, email: str, password: str, index: int) -> None:
         step(index, "开始提交注册密码")
         headers = self._json_headers(f"{auth_base}/create-account/password")
-        headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "username_password_create")
+        sentinel_val, so_token = build_sentinel_token(self.session, self.device_id, "username_password_create")
+        headers["openai-sentinel-token"] = sentinel_val
+        if so_token:
+            headers["openai-sentinel-so-token"] = so_token
         resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/user/register", json={"username": email, "password": password}, headers=headers, verify=False)
         if resp is None or resp.status_code != 200:
             data = _response_json(resp) if resp is not None else {}
@@ -750,15 +659,20 @@ class PlatformRegistrar:
         step(index, "开始创建账号资料")
         headers = self._json_headers(f"{auth_base}/about-you")
         # ── 对齐官方 Sentinel SDK 协议 ──────────────────────────
-        # create_account 前先请求 sentinel req (flow=oauth_create_account)
-        # endpoint 为 auth.openai.com/backend-api/sentinel/req（与 SDK 加载位置一致）
-        # 从返回体生成 PoW token，组装 {p, t, c, id, flow} JSON 作为 header 值
+        # 1. 请求 sentinel/req (flow=oauth_create_account) 获取 sentinel_value + so_token
+        # 2. 等待 SO_TOKEN_OBSERVER_WAIT_SECS 秒（让 iframe observer 收集行为数据）
+        # 3. 同时携带 openai-sentinel-token 和 openai-sentinel-so-token header
         try:
-            sentinel_result = request_sentinel(self.session, self.device_id, "oauth_create_account")
-            headers["openai-sentinel-token"] = sentinel_result["sentinel_token"]
+            sentinel_val, so_token = build_sentinel_token(self.session, self.device_id, "oauth_create_account")
+            step(index, f"等待 Sentinel observer 收集期 ({SO_TOKEN_OBSERVER_WAIT_SECS}s)", "yellow")
+            time.sleep(SO_TOKEN_OBSERVER_WAIT_SECS)
+            headers["openai-sentinel-token"] = sentinel_val
+            if so_token:
+                headers["openai-sentinel-so-token"] = so_token
+            step(index, f"sentinel token 已设置, so_token={'yes' if so_token else 'no'}")
         except Exception as exc:
             step(index, f"sentinel 请求失败，降级使用旧方式: {exc}", "yellow")
-            headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "oauth_create_account")
+            headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "oauth_create_account")[0]
         resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/create_account", json={"name": name, "birthdate": birthdate}, headers=headers, verify=False)
         if resp is None or resp.status_code not in (200, 302):
             data = _response_json(resp) if resp is not None else {}
@@ -769,8 +683,6 @@ class PlatformRegistrar:
         payload = _response_json(resp)
         continue_url = str(payload.get("continue_url") or resp.headers.get("Location") or "").strip()
         step(index, "创建账号资料完成")
-        # create_account 成功后发送 sentinel observer (对齐 SDK 行为: flow+"__auto")
-        post_sentinel_observer(self.session, self.device_id, "oauth_create_account")
         return continue_url
     def _finish_registration_and_exchange_tokens(self, code_verifier: str, continue_url: str, index: int) -> dict:
         step(index, "开始注册会话换 token")
@@ -834,7 +746,9 @@ class PlatformRegistrar:
                 h["referer"] = f"{auth_base}/log-in?usernameKind=email"
                 h["oai-device-id"] = login_device_id
                 h.update(_make_trace_headers())
-                h["openai-sentinel-token"] = build_sentinel_token(login_session, login_device_id, "authorize_continue")
+                h["openai-sentinel-token"], _so = build_sentinel_token(login_session, login_device_id, "authorize_continue")
+                if _so:
+                    h["openai-sentinel-so-token"] = _so
                 return request_with_local_retry(
                     login_session, "post",
                     f"{auth_base}/api/accounts/authorize/continue",
@@ -868,7 +782,9 @@ class PlatformRegistrar:
             headers["referer"] = f"{auth_base}/log-in/password"
             headers["oai-device-id"] = login_device_id
             headers.update(_make_trace_headers())
-            headers["openai-sentinel-token"] = build_sentinel_token(login_session, login_device_id, "password_verify")
+            headers["openai-sentinel-token"], _so = build_sentinel_token(login_session, login_device_id, "password_verify")
+            if _so:
+                headers["openai-sentinel-so-token"] = _so
             resp, error = request_with_local_retry(login_session, "post", f"{auth_base}/api/accounts/password/verify", json={"password": password}, headers=headers, allow_redirects=False, verify=False)
             if resp is None or resp.status_code != 200:
                 detail = _response_error_detail(resp)
