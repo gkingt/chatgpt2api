@@ -283,11 +283,12 @@ def wait_for_code(mailbox: dict) -> str | None:
 
 # ── Sentinel SDK 常量（必须在 SentinelTokenGenerator 之前定义）──────────
 SENTINEL_SDK_VERSION = "20260124ceb8"
-# Sentinel endpoint 根据 SDK 加载位置确定:
-#   注册流程 SDK 从 auth.openai.com/sentinel/ 加载，所以 endpoint 用 auth.openai.com
-SENTINEL_BASE_URL = f"{auth_base}/backend-api/sentinel"
-SENTINEL_FRAME_URL = f"{auth_base}/sentinel/{SENTINEL_SDK_VERSION}/frame.html"
-SENTINEL_SDK_URL = f"{auth_base}/sentinel/{SENTINEL_SDK_VERSION}/sdk.js"
+# sentinel.openai.com 是 sentinel iframe 实际加载的域名
+# (parent 页面 auth.openai.com 通过 iframe 加载 sentinel.openai.com/sentinel/.../frame.html)
+# SDK 中 Zt = frame origin + "/backend-api/sentinel/" = sentinel.openai.com/backend-api/sentinel/
+SENTINEL_BASE_URL = "https://sentinel.openai.com/backend-api/sentinel"
+SENTINEL_FRAME_URL = f"https://sentinel.openai.com/sentinel/{SENTINEL_SDK_VERSION}/frame.html"
+SENTINEL_SDK_URL = f"https://sentinel.openai.com/sentinel/{SENTINEL_SDK_VERSION}/sdk.js"
 
 
 class SentinelTokenGenerator:
@@ -320,8 +321,7 @@ class SentinelTokenGenerator:
             4294705152,
             random.random(),
             self.user_agent,
-            f"{auth_base}/sentinel/{SENTINEL_SDK_VERSION}/sdk.js",
-
+            f"{SENTINEL_SDK_URL}",
             None,
             None,
             "en-US",
@@ -366,12 +366,12 @@ def request_sentinel(session: requests.Session, device_id: str, flow: str) -> di
     """请求 sentinel/req 并返回包含 sentinel_token / token 的完整字典。
 
     对齐官方 Sentinel SDK (20260124ceb8) 的协议:
-    - sentinel/req endpoint 根据 SDK 加载位置确定，注册场景为 auth.openai.com
+    - sentinel/req endpoint 为 sentinel.openai.com (SDK iframe 实际运行域名)
     - POST body 为 {p, id, flow} JSON（SDK 的 rn() 函数会自动加 id/flow）
     - 从返回体生成 PoW enforcement token (用于 header 的 p 字段)
-    - t 字段处理 turnstile.dx（如有）；当前注册场景无 turnstile，t=null
+    - t 字段: 当无 turnstile 时为 null (对齐 SDK 中 t = tn?.turnstile?.dx ? Ot(dx) : null)
     - create_account 完成后 SDK 会异步发 flow+"__auto" 的 observer 请求，
-      这里在主流程完成前预先发送以对齐行为。
+      post_sentinel_observer 函数对齐该行为。
 
     返回:
         {
@@ -388,7 +388,7 @@ def request_sentinel(session: requests.Session, device_id: str, flow: str) -> di
         headers={
             "Content-Type": "text/plain;charset=UTF-8",
             "Referer": SENTINEL_FRAME_URL,
-            "Origin": auth_base,
+            "Origin": "https://sentinel.openai.com",
             "User-Agent": user_agent,
             "sec-ch-ua": sec_ch_ua,
             "sec-ch-ua-mobile": "?0",
@@ -448,7 +448,7 @@ def post_sentinel_observer(session: requests.Session, device_id: str, flow: str)
             headers={
                 "Content-Type": "text/plain;charset=UTF-8",
                 "Referer": SENTINEL_FRAME_URL,
-                "Origin": auth_base,
+                "Origin": "https://sentinel.openai.com",
                 "User-Agent": user_agent,
                 "sec-ch-ua": sec_ch_ua,
                 "sec-ch-ua-mobile": "?0",
