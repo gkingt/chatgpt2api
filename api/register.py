@@ -8,6 +8,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from api.support import require_admin
+from services.register import domain_stats
 from services.register_service import register_service
 
 
@@ -58,6 +59,16 @@ def create_router() -> APIRouter:
     async def reset_outlook_pool(body: OutlookPoolResetRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return {"register": register_service.reset_outlook_pool(body.scope or "all")}
+
+    @router.get("/api/register/domain-stats")
+    async def get_domain_stats(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return {"stats": domain_stats.get_stats()}
+
+    @router.post("/api/register/domain-stats/reset")
+    async def reset_domain_stats(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return {"stats": domain_stats.reset_stats()}
 
     @router.get("/api/register/events")
     async def register_events(token: str = ""):

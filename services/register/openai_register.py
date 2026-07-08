@@ -23,6 +23,7 @@ from urllib3.util.retry import Retry
 from services.account_service import account_service
 from services.proxy_service import proxy_settings
 from services.register import mail_provider
+from services.register import domain_stats
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 base_dir = Path(__file__).resolve().parent
@@ -348,7 +349,26 @@ class SentinelTokenGenerator:
         return "gAAAAAB" + self.ERROR_PREFIX + self._b64(str(None))
 
 
-def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -> str:
+SENTINEL_SDK_VERSION = "20260124ceb8"
+SENTINEL_SO_OBSERVER_MS = 5000
+
+
+def request_sentinel(session: requests.Session, device_id: str, flow: str) -> dict:
+    """请求 sentinel/req 并返回包含 sentinel_token / so_token / token 的完整字典。
+
+    这是底层函数，对齐浏览器真实注册流程中 create_account 前的 sentinel 请求协议：
+    - 带上 flow=oauth_create_account 等
+    - 从返回体的 requirements 里生成 PoW token
+    - 从返回体的 so 字段生成 so_token (5s observer 等待)
+
+    返回:
+        {
+            "sentinel_token": str,   # 用于 OpenAI-Sentinel-Token header
+            "so_token": str,         # 用于 OpenAI-Sentinel-SO-Token header
+            "token": str,            # 服务器签发的 challenge token (c 字段)
+            "raw": dict,             # 原始响应
+        }
+    """
     generator = SentinelTokenGenerator(device_id, user_agent)
     resp = session.post(
         "https://sentinel.openai.com/backend-api/sentinel/req",
@@ -375,7 +395,42 @@ def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -
         if pow_data.get("required") and pow_data.get("seed")
         else generator.generate_requirements_token()
     )
-    return json.dumps({"p": p_value, "t": "", "c": token, "id": device_id, "flow": flow}, separators=(",", ":"))
+    sentinel_value = json.dumps({"p": p_value, "t": "", "c": token, "id": device_id, "flow": flow}, separators=(",", ":"))
+
+    # ── so_token: 从 sentinel 返回的 so 字段生成 ──────────────
+    # so_token 的生成依赖 SDK 内部 observer 逻辑 (类似于 PoW)，
+    # 官方前端会在 sentinel frame 里等待 ~5000ms 让 observer 收集数据后提交。
+    # 我们使用 SDK 同款 generator 生成 so proof token。
+    so_token = ""
+    so_data = data.get("so") or {}
+    if isinstance(so_data, dict):
+        so_required = bool(so_data.get("required"))
+        so_seed = str(so_data.get("seed") or "").strip()
+        so_difficulty = str(so_data.get("difficulty") or "").strip()
+        if so_required and so_seed:
+            # 模拟 SDK observer 等待 (5000ms)，让 token 时间戳更真实
+            time.sleep(SENTINEL_SO_OBSERVER_MS / 1000.0)
+            so_token = generator.generate_token(so_seed, so_difficulty or "0")
+
+    # 日志: 只记录长度和是否存在，不记录明文
+    log(
+        f"[sentinel] flow={flow}, sdk={SENTINEL_SDK_VERSION}, "
+        f"token_len={len(sentinel_value)}, so_token={'yes' if so_token else 'no'}"
+        f"{f', so_len={len(so_token)}' if so_token else ''}",
+    )
+
+    return {
+        "sentinel_token": sentinel_value,
+        "so_token": so_token,
+        "token": token,
+        "raw": data,
+    }
+
+
+def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -> str:
+    """请求 sentinel token，返回 sentinel header 字符串（兼容旧接口）。"""
+    result = request_sentinel(session, device_id, flow)
+    return result["sentinel_token"]
 
 
 def _is_socks_proxy(proxy: str) -> bool:
@@ -629,6 +684,37 @@ class PlatformRegistrar:
         step(index, "platform authorize 完成")
         return code_verifier
 
+    def _submit_email(self, email: str, index: int) -> None:
+        """注册流程补齐 authorize/continue 这一步（对齐浏览器真实注册流程）。
+
+        在 platform_authorize 之后、user/register 之前，浏览器会先 POST authorize/continue
+        提交邮箱，这一步缺失会导致后续 create_account 阶段报 registration_disallowed。
+        """
+        step(index, "开始提交注册邮箱(authorize/continue)")
+
+        def _do_authorize_continue():
+            h = self._json_headers(f"{auth_base}/create-account?usernameKind=email")
+            h["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "authorize_continue")
+            return request_with_local_retry(
+                self.session, "post",
+                f"{auth_base}/api/accounts/authorize/continue",
+                json={"username": {"kind": "email", "value": email}},
+                headers=h, allow_redirects=False, verify=False,
+            )
+
+        resp, error = _do_authorize_continue()
+
+        # 处理可能的 invalid_state (409) 冲突
+        if resp is not None and resp.status_code == 409:
+            step(index, "注册邮箱提交 invalid_state，重试", "yellow")
+            resp, error = _do_authorize_continue()
+
+        if resp is None or resp.status_code != 200:
+            data = _response_json(resp) if resp is not None else {}
+            detail = json.dumps(data, ensure_ascii=False) if data else ""
+            raise RuntimeError(error or f"register_email_submit_http_{getattr(resp, 'status_code', 'unknown')}{f': {detail}' if detail else ''}")
+        step(index, "注册邮箱提交完成")
+
     def _register_user(self, email: str, password: str, index: int) -> None:
         step(index, "开始提交注册密码")
         headers = self._json_headers(f"{auth_base}/create-account/password")
@@ -659,7 +745,20 @@ class PlatformRegistrar:
     def _create_account(self, name: str, birthdate: str, index: int) -> str:
         step(index, "开始创建账号资料")
         headers = self._json_headers(f"{auth_base}/about-you")
-        headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "oauth_create_account")
+        # ── 对齐浏览器真实注册流程 ──────────────────────────────
+        # create_account 前先请求 sentinel req (flow=oauth_create_account)
+        # 从返回的 requirements 里生成 Sentinel token 和 so-token
+        # create_account 请求必须同时带两个 Sentinel header:
+        #   OpenAI-Sentinel-Token
+        #   OpenAI-Sentinel-SO-Token
+        try:
+            sentinel_result = request_sentinel(self.session, self.device_id, "oauth_create_account")
+            headers["openai-sentinel-token"] = sentinel_result["sentinel_token"]
+            if sentinel_result.get("so_token"):
+                headers["OpenAI-Sentinel-SO-Token"] = sentinel_result["so_token"]
+        except Exception as exc:
+            step(index, f"sentinel 请求失败，降级使用旧方式: {exc}", "yellow")
+            headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "oauth_create_account")
         resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/create_account", json={"name": name, "birthdate": birthdate}, headers=headers, verify=False)
         if resp is None or resp.status_code not in (200, 302):
             data = _response_json(resp) if resp is not None else {}
@@ -816,17 +915,25 @@ class PlatformRegistrar:
         step(index, f"邮箱创建完成: {email}")
         password = _random_password()
         first_name, last_name = _random_name()
-        self._platform_authorize(email, index)
-        self._register_user(email, password, index)
-        self._send_otp(index)
-        step(index, "开始等待注册验证码")
-        code = wait_for_code(mailbox)
-        if not code:
-            raise RuntimeError("等待注册验证码超时")
-        step(index, f"收到注册验证码: {code}")
-        self._validate_otp(code, index)
-        self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
-        tokens = self._login_and_exchange_tokens(email, password, mailbox, index)
+        try:
+            self._platform_authorize(email, index)
+            self._submit_email(email, index)
+            self._register_user(email, password, index)
+            self._send_otp(index)
+            step(index, "开始等待注册验证码")
+            code = wait_for_code(mailbox)
+            if not code:
+                raise RuntimeError("等待注册验证码超时")
+            step(index, f"收到注册验证码: {code}")
+            self._validate_otp(code, index)
+            self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
+            tokens = self._login_and_exchange_tokens(email, password, mailbox, index)
+        except Exception:
+            # 记录失败统计
+            domain_stats.record(email, str(mailbox.get("provider") or ""), success=False)
+            raise
+        # 记录成功统计
+        domain_stats.record(email, str(mailbox.get("provider") or ""), success=True)
         return {
             "email": email,
             "password": password,
