@@ -364,16 +364,226 @@ class SentinelTokenGenerator:
 SO_TOKEN_OBSERVER_WAIT_SECS = 5.0
 
 
+# ── Sentinel Observer VM（对齐 Go 后端 generateSOTokenFromCollectorDX）──
+
+
+def _xor_decrypt(data: str, key: str) -> str:
+    if not key:
+        return data
+    kl = len(key)
+    return "".join(chr(ord(data[i]) ^ ord(key[i % kl])) for i in range(len(data)))
+
+
+class _SentinelObsVM:
+    """微型 VM，模拟 sentinel SDK 的 observer 字节码执行器，用于计算 so_token。"""
+
+    def __init__(self) -> None:
+        self.regs: dict[str, Any] = {}
+        self.queue: list[Any] = []
+        self.counter = 0
+        self.finished = False
+        self.result = ""
+        self._install_ops()
+
+    def _install_ops(self) -> None:
+        vm = self
+        r = vm.regs
+
+        def _get(key: Any) -> Any:
+            k = str(key)
+            if isinstance(key, float):
+                k = str(int(key))
+            return r.get(k)
+
+        def _set(args: list[Any], val: Any) -> None:
+            if args:
+                r[str(args[0])] = val
+
+        def _to_str(v: Any) -> str:
+            if isinstance(v, float) and v == int(v):
+                return str(int(v))
+            return str(v) if v is not None else ""
+
+        r["1"] = lambda a: _set(a, _xor_decrypt(_to_str(_get(a[0])), _to_str(_get(a[1]))))
+        r["2"] = lambda a: _set(a, _get(a[1]))
+        r["5"] = lambda a: _set(a, (list(_get(a[0])) + [_get(a[1])]) if isinstance(_get(a[0]), list) else _to_str(_get(a[0])) + _to_str(_get(a[1])))
+        r["6"] = lambda a: _set(a, self._op6(a, _get, _set))
+        r["7"] = lambda a: self._op7(a, _get)
+        r["8"] = lambda a: _set(a, _get(a[1]))
+        r["12"] = lambda a: _set(a, r)
+        r["13"] = lambda a: self._op13(a, _get)
+        r["14"] = lambda a: _set(a, json.loads(_to_str(_get(a[1]))) if _to_str(_get(a[1])) else None)
+        r["15"] = lambda a: _set(a, json.dumps(_get(a[1]), separators=(",", ":"), ensure_ascii=False))
+        r["17"] = lambda a: self._op17(a, _get)
+        r["18"] = lambda a: _set(a, base64.b64decode(_to_str(_get(a[0]))).decode("utf-8", errors="replace"))
+        r["19"] = lambda a: _set(a, base64.b64encode(_to_str(_get(a[0])).encode("utf-8")).decode("ascii"))
+        r["20"] = lambda a: self._op20(a, _get)
+        r["22"] = self._op22
+        r["23"] = lambda a: self._op23(a, _get)
+        r["24"] = self._op24
+        for op in ("25", "26", "27", "28"):
+            r[op] = lambda a: None
+        r["29"] = lambda a: _set(a, self._to_float(_get(a[1])) < self._to_float(_get(a[2])))
+        r["33"] = lambda a: _set(a, self._to_float(_get(a[1])) * self._to_float(_get(a[2])))
+        r["34"] = lambda a: _set(a, _get(a[1]))
+
+        # op 3 / 4: 收集结果
+        def _collect(a: list[Any]) -> None:
+            if not vm.finished:
+                vm.finished = True
+                vm.result = base64.b64encode(_to_str(_get(a[0])).encode("utf-8")).decode("ascii")
+
+        r["3"] = _collect
+        r["4"] = _collect
+
+        # op 30: 定义函数
+        r["30"] = lambda a: self._op30(a)
+
+        self._get = _get
+        self._set = _set
+        self._to_str = _to_str
+
+    @staticmethod
+    def _to_float(v: Any) -> float:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _op6(self, a: list, _get, _set) -> None:
+        b = _get(a[1])
+        idx = _get(a[2])
+        try:
+            n = int(float(idx)) if idx is not None else -1
+        except (TypeError, ValueError):
+            n = -1
+        if isinstance(b, str) and 0 <= n < len(b):
+            _set(a, b[n])
+        elif isinstance(b, list) and 0 <= n < len(b):
+            _set(a, b[n])
+
+    def _op7(self, a: list, _get) -> None:
+        fn = _get(a[0])
+        fa = [_get(a[i]) for i in range(1, len(a))]
+        if callable(fn):
+            fn(fa)
+
+    def _op13(self, a: list, _get) -> None:
+        try:
+            fn = _get(a[1])
+            fa = [_get(a[i]) for i in range(2, len(a))]
+            if callable(fn):
+                fn(fa)
+        except Exception as e:
+            self._set(a, str(e))
+
+    def _op17(self, a: list, _get) -> None:
+        fn = _get(a[1])
+        fa = [_get(a[i]) for i in range(2, len(a))]
+        if callable(fn):
+            fn(fa)
+
+    def _op20(self, a: list, _get) -> None:
+        if self._to_str(_get(a[0])) == self._to_str(_get(a[1])):
+            fn = _get(a[2])
+            fa = [_get(a[i]) for i in range(3, len(a))]
+            if callable(fn):
+                fn(fa)
+
+    def _op22(self, a: list) -> None:
+        sl = self._get(a[1])
+        if isinstance(sl, list):
+            saved = self.queue
+            self.queue = list(sl)
+            self.run()
+            self._set(a, str(self.counter))
+            self.queue = saved
+
+    def _op23(self, a: list, _get) -> None:
+        if _get(a[0]) is not None:
+            fn = _get(a[1])
+            fa = [_get(a[i]) for i in range(2, len(a))]
+            if callable(fn):
+                fn(fa)
+
+    def _op24(self, a: list) -> None:
+        obj = self._get(a[1])
+        method = self._get(a[2])
+        vm = self
+
+        def _impl(fa: list) -> None:
+            if isinstance(obj, str) and self._to_str(method) == "indexOf":
+                vm._set(a, self._to_str(obj).find(self._to_str(fa[0]) if fa else ""))
+
+        self._set(a, _impl)
+
+    def _op30(self, a: list) -> None:
+        vm = self
+        fn_name = self._to_str(a[0])
+        pn = a[1:]
+        ac = len(pn) - 1
+        body = a[-1] if a else None
+
+        def _impl(ca: list) -> None:
+            saved = dict(vm.regs)
+            for i in range(min(ac, len(ca))):
+                vm.regs[self._to_str(pn[i])] = ca[i]
+            if isinstance(body, list):
+                saved_q = vm.queue
+                vm.queue = list(body)
+                vm.run()
+                vm.queue = saved_q
+            for k in list(vm.regs.keys()):
+                if k not in saved:
+                    del vm.regs[k]
+            vm.regs.update(saved)
+
+        vm.regs[fn_name] = _impl
+
+    def run(self) -> None:
+        while self.queue:
+            inst = self.queue.pop(0)
+            if isinstance(inst, list) and inst:
+                fn = self.regs.get(self._to_str(inst[0]))
+                if callable(fn):
+                    fn(inst)
+            self.counter += 1
+
+
+def generate_so_token_from_collector_dx(collector_dx: str, proof_token: str) -> str:
+    """通过 Sentinel Observer VM 从 collector_dx 计算 so_token（对齐 Go 后端）。"""
+    try:
+        raw = base64.b64decode(collector_dx)
+    except Exception:
+        return ""
+    decrypted = _xor_decrypt(raw.decode("utf-8", errors="replace"), proof_token)
+    try:
+        program = json.loads(decrypted)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(program, list):
+        return ""
+    vm = _SentinelObsVM()
+    vm.regs["rt"] = proof_token
+    vm.queue = list(program)
+    vm.run()
+    if vm.result:
+        return vm.result
+    # fallback: 返回 counter
+    return base64.b64encode(str(vm.counter).encode("utf-8")).decode("ascii")
+
+
 def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -> tuple[str, str]:
     """返回 (sentinel_token_json, so_token) 的元组。
 
     so_token 仅在 oauth_create_account flow 时生成。
-    so_token 从 sentinel 响应的 data["so"] 字典中提取 collector_dx 字段。
+    so_token 通过 Sentinel Observer VM 从 collector_dx 计算。
     """
     generator = SentinelTokenGenerator(device_id, user_agent)
+    reqs_token = generator.generate_requirements_token()
     resp = session.post(
         f"{SENTINEL_BASE_URL}/req",
-        data=json.dumps({"p": generator.generate_requirements_token(), "id": device_id, "flow": flow}),
+        data=json.dumps({"p": reqs_token, "id": device_id, "flow": flow}),
         headers={
             "Content-Type": "text/plain;charset=UTF-8",
             "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
@@ -409,8 +619,8 @@ def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -
             collector_dx = str(so_data.get("collector_dx") or "").strip()
             if so_data.get("required") and collector_dx:
                 time.sleep(SO_TOKEN_OBSERVER_WAIT_SECS)
-                so_token = collector_dx
-                log(f"Sentinel SO token 已提取: collector_dx_len={len(collector_dx)}, has_snapshot={bool(so_data.get('snapshot_dx'))}")
+                so_token = generate_so_token_from_collector_dx(collector_dx, reqs_token)
+                log(f"Sentinel SO token 已生成: so_len={len(so_token)}, has_snapshot={bool(so_data.get('snapshot_dx'))}")
             else:
                 log(f"Sentinel so 字段无有效的 collector_dx（required={so_data.get('required')}, has_collector={bool(collector_dx)}）")
 
