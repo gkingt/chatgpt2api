@@ -281,6 +281,15 @@ def wait_for_code(mailbox: dict) -> str | None:
     return mail_provider.wait_for_code({**config["mail"], "proxy": config.get("proxy") or ""}, mailbox)
 
 
+# ── Sentinel SDK 常量（必须在 SentinelTokenGenerator 之前定义）──────────
+SENTINEL_SDK_VERSION = "20260124ceb8"
+# Sentinel endpoint 根据 SDK 加载位置确定:
+#   注册流程 SDK 从 auth.openai.com/sentinel/ 加载，所以 endpoint 用 auth.openai.com
+SENTINEL_BASE_URL = f"{auth_base}/backend-api/sentinel"
+SENTINEL_FRAME_URL = f"{auth_base}/sentinel/{SENTINEL_SDK_VERSION}/frame.html"
+SENTINEL_SDK_URL = f"{auth_base}/sentinel/{SENTINEL_SDK_VERSION}/sdk.js"
+
+
 class SentinelTokenGenerator:
     MAX_ATTEMPTS = 500000
     ERROR_PREFIX = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D"
@@ -311,7 +320,8 @@ class SentinelTokenGenerator:
             4294705152,
             random.random(),
             self.user_agent,
-            "https://sentinel.openai.com/sentinel/20260124ceb8/sdk.js",
+            f"{auth_base}/sentinel/{SENTINEL_SDK_VERSION}/sdk.js",
+
             None,
             None,
             "en-US",
@@ -349,34 +359,36 @@ class SentinelTokenGenerator:
         return "gAAAAAB" + self.ERROR_PREFIX + self._b64(str(None))
 
 
-SENTINEL_SDK_VERSION = "20260124ceb8"
-SENTINEL_SO_OBSERVER_MS = 5000
+SENTINEL_POST_TOKEN_OBSERVER_MS = 5000
 
 
 def request_sentinel(session: requests.Session, device_id: str, flow: str) -> dict:
-    """请求 sentinel/req 并返回包含 sentinel_token / so_token / token 的完整字典。
+    """请求 sentinel/req 并返回包含 sentinel_token / token 的完整字典。
 
-    这是底层函数，对齐浏览器真实注册流程中 create_account 前的 sentinel 请求协议：
-    - 带上 flow=oauth_create_account 等
-    - 从返回体的 requirements 里生成 PoW token
-    - 从返回体的 so 字段生成 so_token (5s observer 等待)
+    对齐官方 Sentinel SDK (20260124ceb8) 的协议:
+    - sentinel/req endpoint 根据 SDK 加载位置确定，注册场景为 auth.openai.com
+    - POST body 为 {p, id, flow} JSON（SDK 的 rn() 函数会自动加 id/flow）
+    - 从返回体生成 PoW enforcement token (用于 header 的 p 字段)
+    - t 字段处理 turnstile.dx（如有）；当前注册场景无 turnstile，t=null
+    - create_account 完成后 SDK 会异步发 flow+"__auto" 的 observer 请求，
+      这里在主流程完成前预先发送以对齐行为。
 
     返回:
         {
-            "sentinel_token": str,   # 用于 OpenAI-Sentinel-Token header
-            "so_token": str,         # 用于 OpenAI-Sentinel-SO-Token header
-            "token": str,            # 服务器签发的 challenge token (c 字段)
-            "raw": dict,             # 原始响应
+            "sentinel_token": str,    # 用于 OpenAI-Sentinel-Token header (JSON字符串)
+            "token": str,             # 服务器签发的 challenge token
+            "raw": dict,              # 原始响应
         }
     """
     generator = SentinelTokenGenerator(device_id, user_agent)
+    p_token = generator.generate_requirements_token()
     resp = session.post(
-        "https://sentinel.openai.com/backend-api/sentinel/req",
-        data=json.dumps({"p": generator.generate_requirements_token(), "id": device_id, "flow": flow}),
+        f"{SENTINEL_BASE_URL}/req",
+        data=json.dumps({"p": p_token, "id": device_id, "flow": flow}),
         headers={
             "Content-Type": "text/plain;charset=UTF-8",
-            "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
-            "Origin": "https://sentinel.openai.com",
+            "Referer": SENTINEL_FRAME_URL,
+            "Origin": auth_base,
             "User-Agent": user_agent,
             "sec-ch-ua": sec_ch_ua,
             "sec-ch-ua-mobile": "?0",
@@ -389,42 +401,65 @@ def request_sentinel(session: requests.Session, device_id: str, flow: str) -> di
     token = str(data.get("token") or "").strip()
     if resp.status_code != 200 or not token:
         raise RuntimeError(f"sentinel_req_failed_{resp.status_code}")
+
+    # 生成 PoW enforcement token (SDK getEnforcementToken)
     pow_data = data.get("proofofwork") or {}
-    p_value = (
-        generator.generate_token(str(pow_data.get("seed") or ""), str(pow_data.get("difficulty") or "0"))
-        if pow_data.get("required") and pow_data.get("seed")
-        else generator.generate_requirements_token()
+    if pow_data.get("required") and pow_data.get("seed"):
+        p_value = generator.generate_token(str(pow_data.get("seed") or ""), str(pow_data.get("difficulty") or "0"))
+    else:
+        p_value = p_token
+
+    # t 字段: SDK 里 t = turnstile.dx ? Ot(dx) : null
+    # 当前注册场景无 turnstile 要求, t 设为 null (JSON null)
+    t_value = None
+
+    sentinel_value = json.dumps(
+        {"p": p_value, "t": t_value, "c": token, "id": device_id, "flow": flow},
+        separators=(",", ":"),
     )
-    sentinel_value = json.dumps({"p": p_value, "t": "", "c": token, "id": device_id, "flow": flow}, separators=(",", ":"))
 
-    # ── so_token: 从 sentinel 返回的 so 字段生成 ──────────────
-    # so_token 的生成依赖 SDK 内部 observer 逻辑 (类似于 PoW)，
-    # 官方前端会在 sentinel frame 里等待 ~5000ms 让 observer 收集数据后提交。
-    # 我们使用 SDK 同款 generator 生成 so proof token。
-    so_token = ""
-    so_data = data.get("so") or {}
-    if isinstance(so_data, dict):
-        so_required = bool(so_data.get("required"))
-        so_seed = str(so_data.get("seed") or "").strip()
-        so_difficulty = str(so_data.get("difficulty") or "").strip()
-        if so_required and so_seed:
-            # 模拟 SDK observer 等待 (5000ms)，让 token 时间戳更真实
-            time.sleep(SENTINEL_SO_OBSERVER_MS / 1000.0)
-            so_token = generator.generate_token(so_seed, so_difficulty or "0")
-
-    # 日志: 只记录长度和是否存在，不记录明文
+    # 日志: 只记录长度，不记录明文
     log(
         f"[sentinel] flow={flow}, sdk={SENTINEL_SDK_VERSION}, "
-        f"token_len={len(sentinel_value)}, so_token={'yes' if so_token else 'no'}"
-        f"{f', so_len={len(so_token)}' if so_token else ''}",
+        f"token_len={len(sentinel_value)}, pow={'yes' if pow_data.get('required') else 'no'}, "
+        f"endpoint={SENTINEL_BASE_URL}/req"
     )
 
     return {
         "sentinel_token": sentinel_value,
-        "so_token": so_token,
         "token": token,
         "raw": data,
     }
+
+
+def post_sentinel_observer(session: requests.Session, device_id: str, flow: str) -> None:
+    """create_account 后异步发送 observer 请求（对齐 SDK 行为）。
+
+    SDK 在 token() 成功后会 setTimeout(5s) 发一个 flow+"__auto" 的 sentinel/req，
+    用于向服务器上报行为数据。这里同步发送以保持一致性。
+    """
+    try:
+        generator = SentinelTokenGenerator(device_id, user_agent)
+        p_token = generator.generate_requirements_token()
+        observer_flow = f"{flow}__auto"
+        session.post(
+            f"{SENTINEL_BASE_URL}/req",
+            data=json.dumps({"p": p_token, "id": device_id, "flow": observer_flow}),
+            headers={
+                "Content-Type": "text/plain;charset=UTF-8",
+                "Referer": SENTINEL_FRAME_URL,
+                "Origin": auth_base,
+                "User-Agent": user_agent,
+                "sec-ch-ua": sec_ch_ua,
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+            },
+            timeout=10,
+            verify=False,
+        )
+        log(f"[sentinel] observer flow={observer_flow} sent")
+    except Exception as exc:
+        log(f"[sentinel] observer send failed: {exc}", "yellow")
 
 
 def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -> str:
@@ -714,17 +749,13 @@ class PlatformRegistrar:
     def _create_account(self, name: str, birthdate: str, index: int) -> str:
         step(index, "开始创建账号资料")
         headers = self._json_headers(f"{auth_base}/about-you")
-        # ── 对齐浏览器真实注册流程 ──────────────────────────────
+        # ── 对齐官方 Sentinel SDK 协议 ──────────────────────────
         # create_account 前先请求 sentinel req (flow=oauth_create_account)
-        # 从返回的 requirements 里生成 Sentinel token 和 so-token
-        # create_account 请求必须同时带两个 Sentinel header:
-        #   OpenAI-Sentinel-Token
-        #   OpenAI-Sentinel-SO-Token
+        # endpoint 为 auth.openai.com/backend-api/sentinel/req（与 SDK 加载位置一致）
+        # 从返回体生成 PoW token，组装 {p, t, c, id, flow} JSON 作为 header 值
         try:
             sentinel_result = request_sentinel(self.session, self.device_id, "oauth_create_account")
             headers["openai-sentinel-token"] = sentinel_result["sentinel_token"]
-            if sentinel_result.get("so_token"):
-                headers["OpenAI-Sentinel-SO-Token"] = sentinel_result["so_token"]
         except Exception as exc:
             step(index, f"sentinel 请求失败，降级使用旧方式: {exc}", "yellow")
             headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "oauth_create_account")
@@ -738,6 +769,8 @@ class PlatformRegistrar:
         payload = _response_json(resp)
         continue_url = str(payload.get("continue_url") or resp.headers.get("Location") or "").strip()
         step(index, "创建账号资料完成")
+        # create_account 成功后发送 sentinel observer (对齐 SDK 行为: flow+"__auto")
+        post_sentinel_observer(self.session, self.device_id, "oauth_create_account")
         return continue_url
     def _finish_registration_and_exchange_tokens(self, code_verifier: str, continue_url: str, index: int) -> dict:
         step(index, "开始注册会话换 token")

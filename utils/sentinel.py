@@ -46,7 +46,7 @@ class SentinelTokenGenerator:
             4294705152,
             random.random(),
             self.user_agent,
-            "https://sentinel.openai.com/sentinel/20260124ceb8/sdk.js",
+            "https://auth.openai.com/sentinel/20260124ceb8/sdk.js",
             None,
             None,
             "en-US",
@@ -120,12 +120,12 @@ def build_sentinel_token(
     ch_ua = sec_ch_ua or DEFAULT_SENTINEL_SEC_CH_UA
     generator = SentinelTokenGenerator(device_id, ua)
     resp = session.post(
-        "https://sentinel.openai.com/backend-api/sentinel/req",
+        "https://auth.openai.com/backend-api/sentinel/req",
         data=json.dumps({"p": generator.generate_requirements_token(), "id": device_id, "flow": flow}),
         headers={
             "Content-Type": "text/plain;charset=UTF-8",
-            "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
-            "Origin": "https://sentinel.openai.com",
+            "Referer": "https://auth.openai.com/sentinel/20260124ceb8/frame.html",
+            "Origin": "https://auth.openai.com",
             "User-Agent": ua,
             "sec-ch-ua": ch_ua,
             "sec-ch-ua-mobile": "?0",
