@@ -10,6 +10,7 @@ from services.protocol.chat_completion_cache import cache_key, chat_completion_c
 from services.protocol.conversation import (
     ConversationRequest,
     ImageOutput,
+    close_backend_after_stream,
     collect_image_outputs,
     collect_text,
     count_message_image_tokens,
@@ -269,7 +270,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         key = cache_key(body, messages, stream=True)
         return chat_completion_cache.get_or_compute_stream(
             key,
-            lambda: stream_text_chat_completion(text_backend(), messages, model),
+            lambda: _stream_text_chat_completion_with_backend(messages, model),
         )
     if is_image_chat_request(body):
         return image_chat_response(body)
@@ -285,3 +286,8 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
             messages=messages,
         ),
     )
+
+
+def _stream_text_chat_completion_with_backend(messages: list[dict[str, Any]], model: str) -> Iterator[dict[str, Any]]:
+    backend = text_backend()
+    return close_backend_after_stream(backend, stream_text_chat_completion(backend, messages, model))

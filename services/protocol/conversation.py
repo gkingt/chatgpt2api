@@ -718,6 +718,15 @@ def text_backend() -> OpenAIBackendAPI:
     return OpenAIBackendAPI(access_token=account_service.get_text_access_token())
 
 
+def close_backend_after_stream(backend: OpenAIBackendAPI, events: Iterable[Any]) -> Iterator[Any]:
+    try:
+        yield from events
+    finally:
+        close = getattr(backend, "close", None)
+        if callable(close):
+            close()
+
+
 def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) -> Iterator[str]:
     attempted_tokens: set[str] = set()
     token = getattr(backend, "access_token", "")
@@ -727,6 +736,7 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
             raise RuntimeError("no available text account")
         if token:
             attempted_tokens.add(token)
+        active_backend = None
         try:
             active_backend = OpenAIBackendAPI(access_token=token)
             for event in conversation_events(active_backend, messages=request.messages, model=request.model, prompt=request.prompt):
@@ -750,10 +760,18 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                 if token:
                     continue
             raise
+        finally:
+            if active_backend is not None:
+                active_backend.close()
 
 
 def collect_text(backend: OpenAIBackendAPI, request: ConversationRequest) -> str:
-    return "".join(stream_text_deltas(backend, request))
+    try:
+        return "".join(stream_text_deltas(backend, request))
+    finally:
+        close = getattr(backend, "close", None)
+        if callable(close):
+            close()
 
 
 def _get_detailed_error_from_tasks(

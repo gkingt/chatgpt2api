@@ -1488,7 +1488,11 @@ class AccountService:
         active_token = access_token if skip_token_refresh else self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
         try:
             from services.openai_backend_api import DisabledAccountError, InvalidAccessTokenError, OpenAIBackendAPI
-            result = OpenAIBackendAPI(active_token).get_user_info()
+            backend = OpenAIBackendAPI(active_token)
+            try:
+                result = backend.get_user_info()
+            finally:
+                backend.close()
         except DisabledAccountError as exc:
             self.update_account(active_token, {"status": "禁用", "quota": 0, "last_refresh_error": str(exc)}, quiet=True)
             raise
@@ -1496,7 +1500,11 @@ class AccountService:
             refreshed_token = self.refresh_access_token(active_token, force=True, event=f"{event}:invalid_access_token")
             if refreshed_token and refreshed_token != active_token:
                 try:
-                    result = OpenAIBackendAPI(refreshed_token).get_user_info()
+                    backend = OpenAIBackendAPI(refreshed_token)
+                    try:
+                        result = backend.get_user_info()
+                    finally:
+                        backend.close()
                 except InvalidAccessTokenError as retry_exc:
                     if self._record_invalid_token_seen(
                         refreshed_token,

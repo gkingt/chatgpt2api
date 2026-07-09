@@ -121,6 +121,26 @@ class ChatCompletionCache:
     def _copy(value: Any) -> Any:
         return copy.deepcopy(value)
 
+    @staticmethod
+    def _inflight_timeout(settings: dict[str, object]) -> float:
+        try:
+            ttl = float(settings.get("ttl_seconds") or 0)
+        except (TypeError, ValueError):
+            ttl = 0
+        return max(1.0, min(300.0, ttl or 300.0))
+
+    def _wait_for_inflight(self, inflight: InflightCall, settings: dict[str, object]) -> Any:
+        deadline = time.monotonic() + self._inflight_timeout(settings)
+        with inflight.condition:
+            while not inflight.done:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("chat completion cache inflight wait timed out")
+                inflight.condition.wait(timeout=remaining)
+            if inflight.error:
+                raise inflight.error
+            return self._copy(inflight.value)
+
     def get_or_compute_response(self, key: str, compute: Callable[[], dict[str, Any]]) -> dict[str, Any]:
         settings = self._settings()
         if not settings.get("enabled") or int(settings.get("ttl_seconds") or 0) <= 0:
@@ -143,12 +163,7 @@ class ChatCompletionCache:
                 owner = False
 
         if not owner:
-            with inflight.condition:
-                while not inflight.done:
-                    inflight.condition.wait()
-                if inflight.error:
-                    raise inflight.error
-                return self._copy(inflight.value)
+            return self._wait_for_inflight(inflight, settings)
 
         try:
             value = compute()
@@ -200,13 +215,8 @@ class ChatCompletionCache:
                 owner = False
 
         if not owner:
-            with inflight.condition:
-                while not inflight.done:
-                    inflight.condition.wait()
-                if inflight.error:
-                    raise inflight.error
-                yield from self._copy(inflight.value)
-                return
+            yield from self._wait_for_inflight(inflight, settings)
+            return
 
         chunks: list[dict[str, Any]] = []
         try:

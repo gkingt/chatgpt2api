@@ -155,6 +155,10 @@ def text_with_url_citations(result: dict[str, Any]) -> tuple[str, list[dict[str,
 
 def run_web_search(query: str) -> dict[str, Any]:
     token = account_service.get_text_access_token()
-    result = OpenAIBackendAPI(token).search(query)
+    backend = OpenAIBackendAPI(token)
+    try:
+        result = backend.search(query)
+    finally:
+        backend.close()
     account_service.mark_text_used(token)
     return result
