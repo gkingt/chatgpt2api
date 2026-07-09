@@ -42,10 +42,10 @@ class FakeBackend(OpenAIBackendAPI):
         index = min(self.calls - 1, len(self.conversations) - 1)
         return self.conversations[index]
 
-    def _get_file_download_url(self, file_id: str) -> str:
+    def _get_file_download_url(self, file_id: str, timeout_secs: float | None = None) -> str:
         return self.file_urls.get(file_id, "")
 
-    def _get_attachment_download_url(self, conversation_id: str, attachment_id: str) -> str:
+    def _get_attachment_download_url(self, conversation_id: str, attachment_id: str, timeout_secs: float | None = None) -> str:
         return self.sediment_urls.get(attachment_id, "")
 
 
@@ -149,6 +149,15 @@ class MultiImageResultTests(unittest.TestCase):
             "https://attachments.test/one.png",
             "https://attachments.test/two.png",
         ])
+
+    def test_resolver_skips_duplicate_sediment_ids_from_file_ids(self) -> None:
+        backend = FakeBackend()
+        backend.file_urls = {"file-one": "https://files.test/one.png"}
+        backend.sediment_urls = {"file-one": "https://attachments.test/duplicate.png"}
+
+        urls = backend._resolve_image_urls("conv-1", ["file-one"], ["file-one"])
+
+        self.assertEqual(urls, ["https://files.test/one.png"])
 
     def test_resolver_keeps_stream_ids_when_poll_extension_fails(self) -> None:
         backend = FakeBackend()

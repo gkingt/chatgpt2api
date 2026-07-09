@@ -2337,20 +2337,20 @@ class OpenAIBackendAPI:
         setattr(exc, "conversation_id", conversation_id or "")
         raise exc
 
-    def _get_file_download_url(self, file_id: str) -> str:
+    def _get_file_download_url(self, file_id: str, timeout_secs: float | None = None) -> str:
         """获取文件下载地址。"""
         path = f"/backend-api/files/{file_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+                                    timeout=timeout_secs or config.image_download_url_timeout_secs)
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
 
-    def _get_attachment_download_url(self, conversation_id: str, attachment_id: str) -> str:
+    def _get_attachment_download_url(self, conversation_id: str, attachment_id: str, timeout_secs: float | None = None) -> str:
         """通过 conversation 附件接口获取下载地址。"""
         path = f"/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+                                    timeout=timeout_secs or config.image_download_url_timeout_secs)
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
@@ -2431,6 +2431,15 @@ class OpenAIBackendAPI:
         """把图片结果 id 解析成可下载 URL。"""
         urls = []
         skip_patterns = {"file_upload"}
+        file_ids = [item for item in dict.fromkeys(file_ids) if item]
+        sediment_ids = [item for item in dict.fromkeys(sediment_ids) if item and item not in file_ids]
+        logger.info({
+            "event": "image_urls_resolve_start",
+            "conversation_id": conversation_id,
+            "file_ids": file_ids,
+            "sediment_ids": sediment_ids,
+            "timeout_secs": config.image_download_url_timeout_secs,
+        })
         for file_id in file_ids:
             if file_id in skip_patterns:
                 logger.debug({
@@ -2441,7 +2450,7 @@ class OpenAIBackendAPI:
                 })
                 continue
             try:
-                url = self._get_file_download_url(file_id)
+                url = self._get_file_download_url(file_id, config.image_download_url_timeout_secs)
             except Exception as exc:
                 logger.debug({
                     "event": "image_download_url_failed",
@@ -2472,7 +2481,7 @@ class OpenAIBackendAPI:
             return urls
         for sediment_id in sediment_ids:
             try:
-                url = self._get_attachment_download_url(conversation_id, sediment_id)
+                url = self._get_attachment_download_url(conversation_id, sediment_id, config.image_download_url_timeout_secs)
             except Exception as exc:
                 logger.debug({
                     "event": "image_download_url_failed",
@@ -2483,7 +2492,6 @@ class OpenAIBackendAPI:
                 })
                 continue
             if url:
-                if url not in urls:
                     urls.append(url)
             else:
                 logger.debug({
@@ -2570,10 +2578,16 @@ class OpenAIBackendAPI:
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         images = []
         for url in urls:
-            response = self.session.get(url, timeout=120)
-            ensure_ok(response, "image_download")
-            if response.content not in images:
-                images.append(response.content)
+            logger.info({"event": "image_download_start", "url_prefix": url[:80], "timeout_secs": config.image_download_timeout_secs})
+            try:
+                response = self.session.get(url, timeout=config.image_download_timeout_secs)
+                ensure_ok(response, "image_download")
+                if response.content not in images:
+                    images.append(response.content)
+                logger.info({"event": "image_download_done", "url_prefix": url[:80], "bytes": len(response.content)})
+            except Exception as exc:
+                logger.warning({"event": "image_download_failed", "url_prefix": url[:80], "error": repr(exc)})
+                raise
         return images
 
     def stream_conversation(

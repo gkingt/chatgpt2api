@@ -443,6 +443,20 @@ class ConfigStore:
             return 10.0
 
     @property
+    def image_download_url_timeout_secs(self) -> float:
+        try:
+            return max(1.0, float(self.data.get("image_download_url_timeout_secs", 20.0)))
+        except (TypeError, ValueError):
+            return 20.0
+
+    @property
+    def image_download_timeout_secs(self) -> float:
+        try:
+            return max(1.0, float(self.data.get("image_download_timeout_secs", 60.0)))
+        except (TypeError, ValueError):
+            return 60.0
+
+    @property
     def image_account_concurrency(self) -> int:
         try:
             return max(1, int(self.data.get("image_account_concurrency", 3)))
@@ -588,6 +602,8 @@ class ConfigStore:
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
+        data["image_download_url_timeout_secs"] = self.image_download_url_timeout_secs
+        data["image_download_timeout_secs"] = self.image_download_timeout_secs
         data["image_account_concurrency"] = self.image_account_concurrency
         data["image_parallel_generation"] = self.image_parallel_generation
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
