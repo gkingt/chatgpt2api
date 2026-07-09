@@ -32,6 +32,10 @@ class InvalidAccessTokenError(RuntimeError):
     pass
 
 
+class DisabledAccountError(RuntimeError):
+    pass
+
+
 class ImagePollTimeoutError(RuntimeError):
     pass
 
@@ -339,10 +343,9 @@ class OpenAIBackendAPI:
         limits_progress = init_payload.get("limits_progress")
         limits_progress = limits_progress if isinstance(limits_progress, list) else []
         quota, restore_at, image_quota_unknown = self._extract_quota_and_restore_at(limits_progress)
+        image_quota_unknown = image_quota_unknown or quota == 0
         is_deactivated = bool(default_account.get("is_deactivated"))
-        status = "禁用" if is_deactivated else (
-            "正常" if image_quota_unknown and plan_type.lower() != "free" else ("限流" if quota == 0 else "正常")
-        )
+        status = "禁用" if is_deactivated else "正常"
         result = {
             "email": me_payload.get("email"),
             "user_id": me_payload.get("id"),

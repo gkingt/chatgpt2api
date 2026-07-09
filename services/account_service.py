@@ -160,6 +160,8 @@ class AccountService:
             return False
         if bool(account.get("image_quota_unknown")):
             return True
+        if str(account.get("status") or "").strip() == "正常" and int(account.get("quota") or 0) == 0:
+            return True
         return int(account.get("quota") or 0) > 0
 
     @staticmethod
@@ -262,7 +264,14 @@ class AccountService:
             normalized["export_type"] = "codex"
             normalized.pop("type", None)
         normalized["type"] = normalized.get("type") or "free"
-        normalized["status"] = normalized.get("status") or "正常"
+        status = str(normalized.get("status") or "正常").strip()
+        status_aliases = {
+            "姝ｅ父": "正常",
+            "闄愭祦": "限流",
+            "寮傚父": "异常",
+            "绂佺敤": "禁用",
+        }
+        normalized["status"] = status_aliases.get(status, status if status in {"正常", "禁用", "限流", "异常"} else "正常")
         normalized["quota"] = max(0, int(normalized.get("quota") if normalized.get("quota") is not None else 0))
         normalized["image_quota_unknown"] = bool(normalized.get("image_quota_unknown"))
         normalized["email"] = normalized.get("email") or None
@@ -1486,26 +1495,27 @@ class AccountService:
             raise ValueError("access_token is required")
 
         active_token = access_token if skip_token_refresh else self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
+        from services import openai_backend_api
+
         try:
-            from services.openai_backend_api import DisabledAccountError, InvalidAccessTokenError, OpenAIBackendAPI
-            backend = OpenAIBackendAPI(active_token)
+            backend = openai_backend_api.OpenAIBackendAPI(active_token)
             try:
                 result = backend.get_user_info()
             finally:
                 backend.close()
-        except DisabledAccountError as exc:
+        except openai_backend_api.DisabledAccountError as exc:
             self.update_account(active_token, {"status": "禁用", "quota": 0, "last_refresh_error": str(exc)}, quiet=True)
             raise
-        except InvalidAccessTokenError as exc:
+        except openai_backend_api.InvalidAccessTokenError as exc:
             refreshed_token = self.refresh_access_token(active_token, force=True, event=f"{event}:invalid_access_token")
             if refreshed_token and refreshed_token != active_token:
                 try:
-                    backend = OpenAIBackendAPI(refreshed_token)
+                    backend = openai_backend_api.OpenAIBackendAPI(refreshed_token)
                     try:
                         result = backend.get_user_info()
                     finally:
                         backend.close()
-                except InvalidAccessTokenError as retry_exc:
+                except openai_backend_api.InvalidAccessTokenError as retry_exc:
                     if self._record_invalid_token_seen(
                         refreshed_token,
                         event,

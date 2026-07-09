@@ -11,7 +11,7 @@ os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
 from services.account_service import AccountService
 from services.auth_service import AuthService
 from services.config import config
-from services.openai_backend_api import InvalidAccessTokenError
+from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
 from services.protocol.conversation import ConversationRequest, ImageOutput, _generate_single_image, is_image_quota_exhausted_error
 from services.register_service import register_service
 from services.storage.json_storage import JSONStorageBackend
@@ -124,6 +124,19 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertEqual(stats["active"], 1)
             self.assertEqual(stats["total_quota"], 8)
             self.assertEqual(stats["unlimited_quota_count"], 1)
+
+    def test_preflight_zero_image_quota_is_treated_as_unknown(self) -> None:
+        api = OpenAIBackendAPI("token")
+        with patch.object(api, "_get_me", return_value={"email": "new@example.com", "id": "user-id"}), patch.object(
+            api,
+            "_get_conversation_init",
+            return_value={"limits_progress": [{"feature_name": "image_gen", "remaining": 0}]},
+        ), patch.object(api, "_get_default_account", return_value={"plan_type": "free", "is_deactivated": False}):
+            result = api.get_user_info()
+
+        self.assertEqual(result["status"], "正常")
+        self.assertTrue(result["image_quota_unknown"])
+        self.assertEqual(result["quota"], 0)
 
     def test_refresh_accounts_can_remove_invalid_token_without_confirmation_delay(self) -> None:
         original_value = config.data.get("auto_remove_invalid_accounts")
