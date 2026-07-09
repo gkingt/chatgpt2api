@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -105,18 +104,13 @@ class ImageTaskService:
         generation_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_generations.handle,
         edit_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_edit.handle,
         retention_days_getter: Callable[[], int] | None = None,
-        worker_count_getter: Callable[[], int] | None = None,
     ):
         self.path = path
         self.generation_handler = generation_handler
         self.edit_handler = edit_handler
         self.retention_days_getter = retention_days_getter or (lambda: config.image_retention_days)
-        self.worker_count_getter = worker_count_getter or (lambda: config.image_task_worker_count)
         self._lock = threading.RLock()
         self._tasks: dict[str, dict[str, Any]] = {}
-        self._executor_lock = threading.Lock()
-        self._executor_workers = 0
-        self._executor: ThreadPoolExecutor | None = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             self._tasks = self._load_locked()
@@ -124,34 +118,6 @@ class ImageTaskService:
             changed = self._cleanup_locked() or changed
             if changed:
                 self._save_locked()
-
-    def _max_workers(self) -> int:
-        try:
-            return max(1, int(self.worker_count_getter()))
-        except Exception:
-            return config.image_account_concurrency
-
-    def _get_executor(self) -> ThreadPoolExecutor:
-        with self._executor_lock:
-            if self._executor is None:
-                max_workers = self._max_workers()
-                self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="image-task")
-                self._executor_workers = max_workers
-            return self._executor
-
-    def close(self) -> None:
-        with self._executor_lock:
-            executor = self._executor
-            self._executor = None
-            self._executor_workers = 0
-        if executor is not None:
-            executor.shutdown(wait=False, cancel_futures=True)
-
-    def __del__(self):
-        try:
-            self.close()
-        except Exception:
-            pass
 
     def submit_generation(
         self,
@@ -264,14 +230,13 @@ class ImageTaskService:
             should_start = True
 
         if should_start:
-            self._get_executor().submit(
-                self._run_task,
-                key,
-                mode,
-                payload,
-                dict(identity),
-                _clean(payload.get("model"), "gpt-image-2"),
+            thread = threading.Thread(
+                target=self._run_task,
+                args=(key, mode, payload, dict(identity), _clean(payload.get("model"), "gpt-image-2")),
+                name=f"image-task-{task_id[:16]}",
+                daemon=True,
             )
+            thread.start()
         return _public_task(task)
 
     def _run_task(
@@ -496,15 +461,13 @@ class ImageTaskService:
             # 将任务状态重置为 running
             self._update_task(key, status=TASK_STATUS_RUNNING, error="")
 
-        self._get_executor().submit(
-            self._run_resume_poll,
-            key,
-            conversation_id,
-            extra_timeout_secs,
-            dict(identity),
-            mode,
-            model,
+        thread = threading.Thread(
+            target=self._run_resume_poll,
+            args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model),
+            name=f"image-resume-{_clean(task_id)[:16]}",
+            daemon=True,
         )
+        thread.start()
         return _public_task(task)
 
     def _run_resume_poll(
