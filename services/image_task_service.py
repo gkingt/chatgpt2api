@@ -224,7 +224,6 @@ class ImageTaskService:
                 "created_at": now,
                 "updated_at": now,
                 "created_ts": time.time(),
-                "submitted_ts": time.time(),
             }
             self._tasks[key] = task
             self._save_locked()
@@ -249,27 +248,11 @@ class ImageTaskService:
         model: str,
     ) -> None:
         started = time.time()
-        submitted_ts = 0.0
-        with self._lock:
-            task = self._tasks.get(key) or {}
-            submitted_ts = float(task.get("submitted_ts") or task.get("created_ts") or started)
-        self._update_task(
-            key,
-            status=TASK_STATUS_RUNNING,
-            error="",
-            worker_started_ts=started,
-            queue_wait_ms=int(max(0.0, started - submitted_ts) * 1000),
-        )
+        self._update_task(key, status=TASK_STATUS_RUNNING, error="")
         # 创建进度回调，每个步骤完成后更新任务状态
         def progress_callback(step: str) -> None:
             if step == "image_stream_resolve_start":
-                upstream_started = time.time()
-                self._update_task(
-                    key,
-                    started_ts=upstream_started,
-                    upstream_started_ts=upstream_started,
-                    pre_upstream_ms=int(max(0.0, upstream_started - started) * 1000),
-                )
+                self._update_task(key, started_ts=time.time())
             self._update_task(key, progress=step)
         # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
         payload_with_progress = {**payload, "progress_callback": progress_callback}
@@ -292,8 +275,7 @@ class ImageTaskService:
                 raise error
             usage = result.get("usage")
             duration_ms = int((time.time() - started) * 1000)
-            timing = self._task_timing(key, started, duration_ms)
-            self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, usage=usage, error="", duration_ms=duration_ms, **timing)
+            self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, usage=usage, error="", duration_ms=duration_ms)
             self._log_call(
                 identity,
                 mode,
@@ -303,17 +285,14 @@ class ImageTaskService:
                 request_preview=request_text(payload.get("prompt")),
                 urls=_collect_image_urls(data),
                 account_email=account_email,
-                timing=timing,
             )
         except Exception as exc:
             error_message = str(exc) or "image task failed"
             account_email = _clean(getattr(exc, "account_email", ""))
             conversation_id = _clean(getattr(exc, "conversation_id", ""))
             duration_ms = int((time.time() - started) * 1000)
-            timing = self._task_timing(key, started, duration_ms)
             self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[],
                               duration_ms=duration_ms,
-                              **timing,
                               **({"conversation_id": conversation_id} if conversation_id else {}))
             self._log_call(
                 identity,
@@ -325,21 +304,7 @@ class ImageTaskService:
                 status="failed",
                 error=error_message,
                 account_email=account_email,
-                timing=timing,
             )
-
-    def _task_timing(self, key: str, started: float, duration_ms: int) -> dict[str, int]:
-        with self._lock:
-            task = self._tasks.get(key) or {}
-            upstream_started = float(task.get("upstream_started_ts") or 0.0)
-        timing: dict[str, int] = {}
-        if upstream_started > 0:
-            upstream_ms = int(max(0.0, time.time() - upstream_started) * 1000)
-            timing["upstream_ms"] = upstream_ms
-            timing["pre_upstream_ms"] = int(max(0, duration_ms - upstream_ms))
-        else:
-            timing["pre_upstream_ms"] = duration_ms
-        return timing
 
     def _log_call(
         self,
@@ -354,7 +319,6 @@ class ImageTaskService:
         error: str = "",
         urls: list[str] | None = None,
         account_email: str = "",
-        timing: dict[str, int] | None = None,
     ) -> None:
         endpoint = "/v1/images/edits" if mode == "edit" else "/v1/images/generations"
         summary_prefix = "图生图" if mode == "edit" else "文生图"
@@ -369,8 +333,6 @@ class ImageTaskService:
             "duration_ms": int((time.time() - started) * 1000),
             "status": status,
         }
-        if timing:
-            detail.update(timing)
         if request_preview:
             detail["request_text"] = request_preview
         if error:
@@ -499,6 +461,7 @@ class ImageTaskService:
             # 将任务状态重置为 running
             self._update_task(key, status=TASK_STATUS_RUNNING, error="")
 
+        # 启动新线程继续轮询
         thread = threading.Thread(
             target=self._run_resume_poll,
             args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model),
@@ -524,7 +487,7 @@ class ImageTaskService:
             from services.openai_backend_api import OpenAIBackendAPI
             from services.protocol.conversation import format_image_result
 
-            backend = OpenAIBackendAPI()
+            backend = OpenAIBackendAPI(proxy_url=config.proxy_url or None)
             file_ids, sediment_ids = backend._poll_image_results(
                 conversation_id,
                 extra_timeout_secs,

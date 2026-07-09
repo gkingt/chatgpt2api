@@ -10,7 +10,6 @@ from services.protocol.chat_completion_cache import cache_key, chat_completion_c
 from services.protocol.conversation import (
     ConversationRequest,
     ImageOutput,
-    close_backend_after_stream,
     collect_image_outputs,
     collect_text,
     count_message_image_tokens,
@@ -37,13 +36,34 @@ from utils.image_tokens import (
     count_image_output_items_tokens,
     image_usage,
 )
-from utils.log import logger
 
 TOOL_UNAVAILABLE_SYSTEM_MESSAGE = (
     "This compatibility backend cannot execute local tools, shell commands, non-search tools, "
     "or file operations. Do not claim to have run tools or inspected external resources. "
     "If a user asks you to use a tool, say that tool execution is unavailable through this backend."
 )
+
+
+def normalize_thinking_effort(value: object) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"", "none"}:
+        return ""
+    if normalized in {"low", "medium", "high"}:
+        return normalized
+    if normalized in {"xhigh", "extended"}:
+        return "extended"
+    return ""
+
+
+def thinking_effort_from_body(body: dict[str, Any]) -> str:
+    if "thinking_effort" in body:
+        return normalize_thinking_effort(body.get("thinking_effort"))
+    if "reasoning_effort" in body:
+        return normalize_thinking_effort(body.get("reasoning_effort"))
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict):
+        return normalize_thinking_effort(reasoning.get("effort"))
+    return ""
 
 
 def completion_chunk(model: str, delta: dict[str, Any], finish_reason: str | None = None, completion_id: str = "", created: int | None = None) -> dict[str, Any]:
@@ -98,11 +118,16 @@ def completion_response(
     }
 
 
-def stream_text_chat_completion(backend, messages: list[dict[str, Any]], model: str) -> Iterator[dict[str, Any]]:
+def stream_text_chat_completion(
+    backend,
+    messages: list[dict[str, Any]],
+    model: str,
+    thinking_effort: str = "",
+) -> Iterator[dict[str, Any]]:
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     sent_role = False
-    request = ConversationRequest(model=model, messages=messages)
+    request = ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)
     for delta_text in stream_text_deltas(backend, request):
         if not sent_role:
             sent_role = True
@@ -206,7 +231,6 @@ def image_result_content(result: dict[str, Any]) -> str:
 
 def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
     model, prompt, n, images = chat_image_args(body)
-    logger.info({"event": "image_chat_sync_start", "model": model, "n": n, "image_count": len(images)})
     result = collect_image_outputs(stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
         model=model,
@@ -214,13 +238,6 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
         response_format="b64_json",
         images=encode_images(images) or None,
     )))
-    logger.info({
-        "event": "image_chat_sync_done",
-        "model": model,
-        "n": n,
-        "data_count": len(result.get("data") or []),
-        "has_message": bool(result.get("message")),
-    })
     response = completion_response(model, image_result_content(result), int(result.get("created") or 0) or None)
     usage = image_usage(
         input_text_tokens=count_text_tokens(prompt, model),
@@ -276,27 +293,24 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         model, messages = text_chat_parts(body)
         if is_web_search_chat_request(body) and not has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
             return stream_web_search_chat_completion(messages, model)
+        thinking_effort = thinking_effort_from_body(body)
         key = cache_key(body, messages, stream=True)
         return chat_completion_cache.get_or_compute_stream(
             key,
-            lambda: _stream_text_chat_completion_with_backend(messages, model),
+            lambda: stream_text_chat_completion(text_backend(), messages, model, thinking_effort),
         )
     if is_image_chat_request(body):
         return image_chat_response(body)
     model, messages = text_chat_parts(body)
     if is_web_search_chat_request(body) and not has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
         return web_search_chat_response(messages, model)
+    thinking_effort = thinking_effort_from_body(body)
     key = cache_key(body, messages, stream=False)
     return chat_completion_cache.get_or_compute_response(
         key,
         lambda: completion_response(
             model,
-            collect_text(text_backend(), ConversationRequest(model=model, messages=messages)),
+            collect_text(text_backend(), ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)),
             messages=messages,
         ),
     )
-
-
-def _stream_text_chat_completion_with_backend(messages: list[dict[str, Any]], model: str) -> Iterator[dict[str, Any]]:
-    backend = text_backend()
-    return close_backend_after_stream(backend, stream_text_chat_completion(backend, messages, model))

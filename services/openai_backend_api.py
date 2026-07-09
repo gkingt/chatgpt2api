@@ -8,7 +8,7 @@ import time
 
 import urllib.error
 import urllib.request
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -29,10 +29,6 @@ from utils.turnstile import solve_turnstile_token
 
 
 class InvalidAccessTokenError(RuntimeError):
-    pass
-
-
-class DisabledAccountError(RuntimeError):
     pass
 
 
@@ -175,7 +171,6 @@ class OpenAIBackendAPI:
             account=self.account,
             impersonate=self.fp["impersonate"],
             verify=True,
-            upstream=True,
         ))
         self.session.headers.update({
             "User-Agent": self.user_agent,
@@ -207,7 +202,25 @@ class OpenAIBackendAPI:
             self.session.headers["Authorization"] = f"Bearer {self.access_token}"
 
     def close(self) -> None:
-        self.session.close()
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        session = getattr(self, "session", None)
+        if session:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+    def __del__(self):
+        self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+        return False
 
     def _build_fp(self) -> Dict[str, str]:
         account = self.account
@@ -245,82 +258,19 @@ class OpenAIBackendAPI:
         headers["X-OpenAI-Target-Route"] = path
         if extra:
             headers.update(extra)
-        return proxy_settings.build_headers(
-            headers,
-            target_url=self.base_url + path,
-            account=self.account,
-            upstream=True,
-        )
-
-    def _ensure_ok_with_clearance_retry(self, request_func: Callable[[], requests.Response], context: str) -> requests.Response:
-        response = request_func()
-        try:
-            ensure_ok(response, context)
-            return response
-        except UpstreamHTTPError as exc:
-            profile = proxy_settings.get_profile(account=self.account, upstream=True)
-            if exc.status_code not in profile.reset_session_status_codes:
-                raise
-            response.close()
-            bundle = proxy_settings.refresh_clearance(
-                target_url=self.base_url,
-                account=self.account,
-                force=True,
-                upstream=True,
-            )
-            if bundle is None:
-                raise
-            response = request_func()
-            ensure_ok(response, context)
-            return response
+        return headers
 
     @staticmethod
-    def _extract_quota_and_restore_at(limits_progress: list[Any]) -> tuple[int, str | None, bool]:
+    def _extract_quota_and_restore_at(limits_progress: list[Any]) -> tuple[int, str | None]:
         for item in limits_progress:
             if isinstance(item, dict) and item.get("feature_name") == "image_gen":
-                return int(item.get("remaining") or 0), str(item.get("reset_after") or "") or None, False
-        return 0, None, True
+                return int(item.get("remaining") or 0), str(item.get("reset_after") or "") or None
+        return 0, None
 
     def _raise_on_error(self, response: Any, path: str) -> None:
         if response.status_code == 401:
             raise InvalidAccessTokenError(f"token invalidated ({path})")
-        body = self._response_error_body(response)
-        body_text = self._body_preview(body).lower()
-        if any(marker in body_text for marker in (
-            "account_deactivated",
-            "account disabled",
-            "account is disabled",
-            "user_deactivated",
-            "deactivated account",
-        )):
-            raise DisabledAccountError(f"account disabled ({path}): {self._body_preview(body)}")
-        if response.status_code in (401, 403) and any(marker in body_text for marker in (
-            "token_invalidated",
-            "token_revoked",
-            "invalidated oauth token",
-            "invalid access token",
-            "unauthorized",
-        )):
-            raise InvalidAccessTokenError(f"token invalidated ({path}): {self._body_preview(body)}")
         raise RuntimeError(f"{path} failed: HTTP {response.status_code}")
-
-    @staticmethod
-    def _response_error_body(response: Any) -> Any:
-        try:
-            return response.json()
-        except Exception:
-            return getattr(response, "text", "")
-
-    @staticmethod
-    def _body_preview(body: Any, limit: int = 500) -> str:
-        if isinstance(body, (dict, list)):
-            try:
-                text = json.dumps(body, ensure_ascii=False)
-            except Exception:
-                text = repr(body)
-        else:
-            text = str(body or "")
-        return text if len(text) <= limit else text[:limit] + "...[truncated]"
 
     def _get_me(self) -> Dict[str, Any]:
         path = "/backend-api/me"
@@ -365,18 +315,6 @@ class OpenAIBackendAPI:
         })
         return default_account
 
-    @staticmethod
-    def _future_result_or_default(future: Future, default: Any, event: str) -> Any:
-        try:
-            return future.result()
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except InvalidAccessTokenError:
-            raise
-        except Exception as exc:
-            logger.debug({"event": event, "error": str(exc)})
-            return default
-
     def get_user_info(self) -> Dict[str, Any]:
         """获取当前 token 的账号信息。"""
         if not self.access_token:
@@ -386,17 +324,7 @@ class OpenAIBackendAPI:
             me_future = executor.submit(self._get_me)
             init_future = executor.submit(self._get_conversation_init)
             account_future = executor.submit(self._get_default_account)
-            me_payload = me_future.result()
-            init_payload = self._future_result_or_default(
-                init_future,
-                {},
-                "backend_user_info_conversation_init_failed",
-            )
-            default_account = self._future_result_or_default(
-                account_future,
-                {},
-                "backend_user_info_account_check_failed",
-            )
+            me_payload, init_payload, default_account = me_future.result(), init_future.result(), account_future.result()
         except (KeyboardInterrupt, SystemExit):
             executor.shutdown(wait=False, cancel_futures=True)
             raise
@@ -407,25 +335,19 @@ class OpenAIBackendAPI:
             executor.shutdown(wait=True, cancel_futures=True)
 
         plan_type = str(default_account.get("plan_type") or "free")
-        is_deactivated = bool(default_account.get("is_deactivated"))
 
         limits_progress = init_payload.get("limits_progress")
         limits_progress = limits_progress if isinstance(limits_progress, list) else []
-        quota, restore_at, image_quota_unknown = self._extract_quota_and_restore_at(limits_progress)
-        status = "禁用" if is_deactivated else (
-            "正常" if image_quota_unknown and plan_type.lower() != "free" else ("限流" if quota == 0 else "正常")
-        )
+        quota, restore_at = self._extract_quota_and_restore_at(limits_progress)
         result = {
             "email": me_payload.get("email"),
             "user_id": me_payload.get("id"),
             "type": plan_type,
-            "quota": 0 if is_deactivated else quota,
-            "image_quota_unknown": image_quota_unknown,
+            "quota": quota,
             "limits_progress": limits_progress,
             "default_model_slug": init_payload.get("default_model_slug"),
             "restore_at": restore_at,
-            "status": status,
-            "is_deactivated": is_deactivated,
+            "status": "限流" if quota == 0 else "正常",
         }
         logger.debug({
             "event": "backend_user_info_result",
@@ -433,7 +355,6 @@ class OpenAIBackendAPI:
             "user_id": result.get("user_id"),
             "type": result.get("type"),
             "quota": result.get("quota"),
-            "image_quota_unknown": result.get("image_quota_unknown"),
             "default_model_slug": result.get("default_model_slug"),
             "restore_at": result.get("restore_at"),
             "status": result.get("status"),
@@ -442,7 +363,7 @@ class OpenAIBackendAPI:
 
     def _bootstrap_headers(self) -> Dict[str, str]:
         """构造首页预热请求头。"""
-        headers = {
+        return {
             "User-Agent": self.user_agent,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
@@ -455,12 +376,6 @@ class OpenAIBackendAPI:
             "Sec-Fetch-User": "?1",
             "Upgrade-Insecure-Requests": "1",
         }
-        return proxy_settings.build_headers(
-            headers,
-            target_url=self.base_url + "/",
-            account=self.account,
-            upstream=True,
-        )
 
     def _build_requirements(self, data: Dict[str, Any], source_p: str = "") -> ChatRequirements:
         """把 sentinel 响应整理成后续对话需要的 token 集合。"""
@@ -578,9 +493,26 @@ class OpenAIBackendAPI:
             })
         return conversation_messages
 
-    def _conversation_payload(self, messages: list[Dict[str, Any]], model: str, timezone: str) -> Dict[str, Any]:
+    @staticmethod
+    def _normalize_thinking_effort(value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized in {"", "none"}:
+            return ""
+        if normalized in {"low", "medium", "high"}:
+            return normalized
+        if normalized in {"xhigh", "extended"}:
+            return "extended"
+        return ""
+
+    def _conversation_payload(
+            self,
+            messages: list[Dict[str, Any]],
+            model: str,
+            timezone: str,
+            thinking_effort: str = "",
+    ) -> Dict[str, Any]:
         """把标准 messages 构造成 web 对话请求体。"""
-        return {
+        payload = {
             "action": "next",
             "messages": self._api_messages_to_conversation_messages(messages),
             "model": model,
@@ -610,6 +542,10 @@ class OpenAIBackendAPI:
                 "screen_width": 2560,
             },
         }
+        normalized_effort = self._normalize_thinking_effort(thinking_effort)
+        if normalized_effort:
+            payload["thinking_effort"] = normalized_effort
+        return payload
 
     def _image_model_slug(self, model: str) -> str:
         """把标准图片模型名映射到底层 model slug。"""
@@ -617,7 +553,7 @@ class OpenAIBackendAPI:
         if not base_model:
             return "auto"
         if base_model == "gpt-image-2":
-            return str(getattr(self, "image_backend_model_override", "") or config.image_backend_model)
+            return "gpt-5-3"
         if base_model == CODEX_IMAGE_MODEL:
             return base_model
         return "auto"
@@ -1084,11 +1020,29 @@ class OpenAIBackendAPI:
         ensure_ok(response, path)
         return response
 
-    def _get_conversation(self, conversation_id: str, timeout_secs: float | None = None) -> Dict[str, Any]:
+    def _get_conversation(self, conversation_id: str) -> Dict[str, Any]:
         """获取完整 conversation 详情。"""
         path = f"/backend-api/conversation/{conversation_id}"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=timeout_secs or 60)
+                                    timeout=60)
+        ensure_ok(response, path)
+        return response.json()
+
+    def delete_conversation(self, conversation_id: str) -> Dict[str, Any]:
+        """删除本地对话记录。"""
+        path = f"/backend-api/conversation/{conversation_id}"
+        headers = self._headers(path, {
+            "Accept": "*/*",
+            "Content-Type": "application/json",
+            "Referer": f"{self.base_url}/c/{conversation_id}",
+            "X-OpenAI-Target-Route": "/backend-api/conversation/{conversation_id}",
+        })
+        response = self.session.patch(
+            self.base_url + path,
+            headers=headers,
+            json={"is_visible": False},
+            timeout=60,
+        )
         ensure_ok(response, path)
         return response.json()
 
@@ -2251,7 +2205,7 @@ class OpenAIBackendAPI:
                 })
 
             try:
-                conversation = self._get_conversation(conversation_id, timeout_secs=config.image_poll_request_timeout_secs)
+                conversation = self._get_conversation(conversation_id)
             except UpstreamHTTPError as exc:
                 if exc.status_code in (429, 500, 502, 503, 504):
                     if _retry_sleep("upstream_status", exc.status_code, None, exc.retry_after):
@@ -2337,20 +2291,20 @@ class OpenAIBackendAPI:
         setattr(exc, "conversation_id", conversation_id or "")
         raise exc
 
-    def _get_file_download_url(self, file_id: str, timeout_secs: float | None = None) -> str:
+    def _get_file_download_url(self, file_id: str) -> str:
         """获取文件下载地址。"""
         path = f"/backend-api/files/{file_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=timeout_secs or config.image_download_url_timeout_secs)
+                                    timeout=60)
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
 
-    def _get_attachment_download_url(self, conversation_id: str, attachment_id: str, timeout_secs: float | None = None) -> str:
+    def _get_attachment_download_url(self, conversation_id: str, attachment_id: str) -> str:
         """通过 conversation 附件接口获取下载地址。"""
         path = f"/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=timeout_secs or config.image_download_url_timeout_secs)
+                                    timeout=60)
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
@@ -2431,15 +2385,6 @@ class OpenAIBackendAPI:
         """把图片结果 id 解析成可下载 URL。"""
         urls = []
         skip_patterns = {"file_upload"}
-        file_ids = [item for item in dict.fromkeys(file_ids) if item]
-        sediment_ids = [item for item in dict.fromkeys(sediment_ids) if item and item not in file_ids]
-        logger.info({
-            "event": "image_urls_resolve_start",
-            "conversation_id": conversation_id,
-            "file_ids": file_ids,
-            "sediment_ids": sediment_ids,
-            "timeout_secs": config.image_download_url_timeout_secs,
-        })
         for file_id in file_ids:
             if file_id in skip_patterns:
                 logger.debug({
@@ -2450,7 +2395,7 @@ class OpenAIBackendAPI:
                 })
                 continue
             try:
-                url = self._get_file_download_url(file_id, config.image_download_url_timeout_secs)
+                url = self._get_file_download_url(file_id)
             except Exception as exc:
                 logger.debug({
                     "event": "image_download_url_failed",
@@ -2481,7 +2426,7 @@ class OpenAIBackendAPI:
             return urls
         for sediment_id in sediment_ids:
             try:
-                url = self._get_attachment_download_url(conversation_id, sediment_id, config.image_download_url_timeout_secs)
+                url = self._get_attachment_download_url(conversation_id, sediment_id)
             except Exception as exc:
                 logger.debug({
                     "event": "image_download_url_failed",
@@ -2492,6 +2437,7 @@ class OpenAIBackendAPI:
                 })
                 continue
             if url:
+                if url not in urls:
                     urls.append(url)
             else:
                 logger.debug({
@@ -2578,16 +2524,10 @@ class OpenAIBackendAPI:
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         images = []
         for url in urls:
-            logger.info({"event": "image_download_start", "url_prefix": url[:80], "timeout_secs": config.image_download_timeout_secs})
-            try:
-                response = self.session.get(url, timeout=config.image_download_timeout_secs)
-                ensure_ok(response, "image_download")
-                if response.content not in images:
-                    images.append(response.content)
-                logger.info({"event": "image_download_done", "url_prefix": url[:80], "bytes": len(response.content)})
-            except Exception as exc:
-                logger.warning({"event": "image_download_failed", "url_prefix": url[:80], "error": repr(exc)})
-                raise
+            response = self.session.get(url, timeout=120)
+            ensure_ok(response, "image_download")
+            if response.content not in images:
+                images.append(response.content)
         return images
 
     def stream_conversation(
@@ -2597,6 +2537,7 @@ class OpenAIBackendAPI:
             prompt: str = "",
             images: Optional[list[str]] = None,
             system_hints: Optional[list[str]] = None,
+            thinking_effort: str = "",
     ) -> Iterator[str]:
         system_hints = system_hints or []
         if "picture_v2" in system_hints:
@@ -2607,7 +2548,7 @@ class OpenAIBackendAPI:
         self._bootstrap()
         requirements = self._get_chat_requirements()
         path, timezone = self._chat_target()
-        payload = self._conversation_payload(normalized, model, timezone)
+        payload = self._conversation_payload(normalized, model, timezone, thinking_effort=thinking_effort)
         response = self.session.post(
             self.base_url + path,
             headers=self._conversation_headers(path, requirements),
@@ -2637,33 +2578,17 @@ class OpenAIBackendAPI:
     ) -> Iterator[str]:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
-        started = time.time()
-
-        def log_stage(stage: str, **extra: Any) -> None:
-            logger.info({
-                "event": "image_upstream_stage",
-                "stage": stage,
-                "elapsed_ms": int((time.time() - started) * 1000),
-                **extra,
-            })
-
         self._report_progress("uploading")
-        log_stage("uploading", image_count=len(images))
         references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images, start=1)]
         self._report_progress("bootstrapping")
-        log_stage("bootstrapping")
         self._bootstrap()
         self._report_progress("getting_token")
-        log_stage("getting_token")
         requirements = self._get_chat_requirements()
         self._report_progress("preparing_conversation")
-        log_stage("preparing_conversation", model=model)
         conduit_token = self._prepare_image_conversation(prompt, requirements, model)
         self._report_progress("starting_generation")
-        log_stage("starting_generation", model=model)
         response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
         self._report_progress("generating")
-        log_stage("generating", model=model)
         try:
             yield from iter_sse_payloads(response)
         finally:
@@ -2671,14 +2596,12 @@ class OpenAIBackendAPI:
 
     def _bootstrap(self) -> None:
         """预热首页，并提取 PoW 相关脚本引用。"""
-        response = self._ensure_ok_with_clearance_retry(
-            lambda: self.session.get(
-                self.base_url + "/",
-                headers=self._bootstrap_headers(),
-                timeout=30,
-            ),
-            "bootstrap",
+        response = self.session.get(
+            self.base_url + "/",
+            headers=self._bootstrap_headers(),
+            timeout=30,
         )
+        ensure_ok(response, "bootstrap")
         self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
         if not self.pow_script_sources:
             self.pow_script_sources = [DEFAULT_POW_SCRIPT]
@@ -2689,15 +2612,13 @@ class OpenAIBackendAPI:
         p_token = build_legacy_requirements_token(self.user_agent, self.pow_script_sources, self.pow_data_build)
 
         prepare_path = base + "/prepare"
-        response = self._ensure_ok_with_clearance_retry(
-            lambda: self.session.post(
-                self.base_url + prepare_path,
-                headers=self._headers(prepare_path, {"Content-Type": "application/json"}),
-                json={"p": p_token},
-                timeout=30,
-            ),
-            "chat_requirements_prepare",
+        response = self.session.post(
+            self.base_url + prepare_path,
+            headers=self._headers(prepare_path, {"Content-Type": "application/json"}),
+            json={"p": p_token},
+            timeout=30,
         )
+        ensure_ok(response, "chat_requirements_prepare")
         prepare_data = response.json()
 
         if (prepare_data.get("arkose") or {}).get("required"):
@@ -2720,19 +2641,17 @@ class OpenAIBackendAPI:
             turnstile_token = solve_turnstile_token(turnstile_info["dx"], p_token) or ""
 
         finalize_path = base + "/finalize"
-        response = self._ensure_ok_with_clearance_retry(
-            lambda: self.session.post(
-                self.base_url + finalize_path,
-                headers=self._headers(finalize_path, {"Content-Type": "application/json"}),
-                json={
-                    "prepare_token": prepare_data.get("prepare_token", ""),
-                    "proof_token": proof_token,
-                    "turnstile_token": turnstile_token,
-                },
-                timeout=30,
-            ),
-            "chat_requirements_finalize",
+        response = self.session.post(
+            self.base_url + finalize_path,
+            headers=self._headers(finalize_path, {"Content-Type": "application/json"}),
+            json={
+                "prepare_token": prepare_data.get("prepare_token", ""),
+                "proof_token": proof_token,
+                "turnstile_token": turnstile_token,
+            },
+            timeout=30,
         )
+        ensure_ok(response, "chat_requirements_finalize")
         data = response.json()
 
         token = data.get("token", "")

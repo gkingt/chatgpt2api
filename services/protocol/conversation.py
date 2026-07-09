@@ -3,8 +3,9 @@ from __future__ import annotations
 import base64
 import json
 import re
+import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator
 
@@ -16,7 +17,6 @@ from services.image_storage_service import image_storage_service
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
 from utils.helper import (
     IMAGE_MODELS,
-    UpstreamHTTPError,
     extract_image_from_message_content,
     is_codex_image_model,
     is_supported_image_model,
@@ -77,63 +77,16 @@ def is_token_invalid_error(message: str) -> bool:
     )
 
 
-def _error_text(value: object) -> str:
-    parts = [str(value or "")]
-    if isinstance(value, UpstreamHTTPError):
-        try:
-            parts.append(json.dumps(value.body, ensure_ascii=False))
-        except Exception:
-            parts.append(str(value.body))
-    return "\n".join(part for part in parts if part)
-
-
-def is_image_quota_exhausted_error(error: object) -> bool:
-    text = _error_text(error).lower()
-    if not text:
-        return False
-    direct_markers = (
-        "image quota",
-        "insufficient quota",
-        "not enough quota",
-        "quota exceeded",
-        "exceeded your current quota",
-        "usage_limits",
-        "reached your image generation limit",
-        "reached the image generation limit",
-        "image generation limit",
-        "图片额度",
-        "额度不足",
-        "额度已用完",
-        "额度耗尽",
-        "达到图片生成上限",
-        "图片生成上限",
-    )
-    if any(marker in text for marker in direct_markers):
-        return True
-    has_image_context = any(marker in text for marker in ("image", "gpt-image", "image_generation", "图片", "生图"))
-    has_quota_context = any(marker in text for marker in ("quota", "额度", "耗尽", "用完", "不足"))
-    return has_image_context and has_quota_context
-
-
-def _outputs_contain_image_quota_error(outputs: list[ImageOutput]) -> bool:
-    return any(output.kind == "message" and is_image_quota_exhausted_error(output.text) for output in outputs)
-
-
 def is_tls_connection_error(message: str) -> bool:
     """检测 TLS/SSL 连接错误，这类错误通常可以通过重试解决。"""
     text = str(message or "").lower()
     return (
         "curl: (35)" in text
-        or "curl: (56)" in text
-        or "curl: (92)" in text
         or "tls connect error" in text
         or "openssl_internal" in text
         or "ssl: wrong_version_number" in text
         or "ssl: certificate_verify_failed" in text
         or "connection aborted" in text
-        or "connection closed abruptly" in text
-        or "http/2 stream" in text
-        or "internal_error" in text
         or "remote disconnected" in text
         or "connection reset by peer" in text
     )
@@ -345,6 +298,7 @@ class ConversationRequest:
     model: str = "auto"
     prompt: str = ""
     messages: list[dict[str, Any]] | None = None
+    thinking_effort: str = ""
     images: list[str] | None = None
     n: int = 1
     size: str | None = None
@@ -703,6 +657,7 @@ def conversation_events(
     images: list[str] | None = None,
     size: str | None = None,
     quality: str = "auto",
+    thinking_effort: str = "",
 ) -> Iterator[dict[str, Any]]:
     normalized = normalize_messages(messages or ([{"role": "user", "content": prompt}] if prompt else []))
     image_model = is_supported_image_model(model)
@@ -715,21 +670,13 @@ def conversation_events(
         prompt=final_prompt,
         images=images if image_model else None,
         system_hints=["picture_v2"] if image_model else None,
+        thinking_effort=thinking_effort if not image_model else "",
     )
     yield from iter_conversation_payloads(payloads, history_text, history_messages)
 
 
 def text_backend() -> OpenAIBackendAPI:
     return OpenAIBackendAPI(access_token=account_service.get_text_access_token())
-
-
-def close_backend_after_stream(backend: OpenAIBackendAPI, events: Iterable[Any]) -> Iterator[Any]:
-    try:
-        yield from events
-    finally:
-        close = getattr(backend, "close", None)
-        if callable(close):
-            close()
 
 
 def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) -> Iterator[str]:
@@ -744,7 +691,13 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
         active_backend = None
         try:
             active_backend = OpenAIBackendAPI(access_token=token)
-            for event in conversation_events(active_backend, messages=request.messages, model=request.model, prompt=request.prompt):
+            for event in conversation_events(
+                active_backend,
+                messages=request.messages,
+                model=request.model,
+                prompt=request.prompt,
+                thinking_effort=request.thinking_effort,
+            ):
                 if event.get("type") != "conversation.delta":
                     continue
                 delta = str(event.get("delta") or "")
@@ -771,12 +724,7 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
 
 
 def collect_text(backend: OpenAIBackendAPI, request: ConversationRequest) -> str:
-    try:
-        return "".join(stream_text_deltas(backend, request))
-    finally:
-        close = getattr(backend, "close", None)
-        if callable(close):
-            close()
+    return "".join(stream_text_deltas(backend, request))
 
 
 def _get_detailed_error_from_tasks(
@@ -826,6 +774,24 @@ def _get_detailed_error_from_tasks(
             "error": str(exc),
         })
         return ""
+
+
+def _remove_image_conversation_later(backend: OpenAIBackendAPI, conversation_id: str) -> None:
+    if not config.image_remove_conversation_after_result or not conversation_id:
+        return
+
+    def _run() -> None:
+        try:
+            backend.delete_conversation(conversation_id)
+            logger.info({"event": "image_conversation_removed", "conversation_id": conversation_id})
+        except Exception as exc:
+            logger.warning({
+                "event": "image_conversation_remove_failed",
+                "conversation_id": conversation_id,
+                "error": str(exc),
+            })
+
+    threading.Thread(target=_run, name=f"remove-image-conversation-{conversation_id}", daemon=True).start()
 
 
 def stream_image_outputs(
@@ -1004,6 +970,7 @@ def stream_image_outputs(
             int(time.time()),
         )["data"]
         if data:
+            _remove_image_conversation_later(backend, conversation_id)
             yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
         return
 
@@ -1101,6 +1068,7 @@ def stream_image_outputs(
                         int(time.time()),
                     )["data"]
                     if data:
+                        _remove_image_conversation_later(backend, conversation_id)
                         yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
                         return
         elif is_text_reply:
@@ -1213,6 +1181,7 @@ def stream_image_outputs(
                     int(time.time()),
                 )["data"]
                 if data:
+                    _remove_image_conversation_later(backend, conversation_id)
                     yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
                     return
         
@@ -1353,9 +1322,6 @@ def _generate_single_image(
                 returned_result = returned_result or output.kind == "result"
                 outputs.append(output)
             if returned_message:
-                if _outputs_contain_image_quota_error(outputs):
-                    account_service.mark_image_quota_exhausted_token(token, "image_stream_message", outputs[-1].text if outputs else "")
-                    continue
                 account_service.mark_image_result(token, False)
                 return outputs
             if not returned_result:
@@ -1417,16 +1383,6 @@ def _generate_single_image(
                 conversation_id=getattr(exc, "conversation_id", ""),
             ) from exc
         except ImageGenerationError as exc:
-            if is_image_quota_exhausted_error(exc):
-                account_service.mark_image_quota_exhausted_token(token, "image_stream_generation_error", str(exc))
-                logger.warning({
-                    "event": "image_quota_exhausted_token_limited",
-                    "request_token": token,
-                    "account_email": account_email,
-                    "error": str(exc)[:300],
-                    "index": index,
-                })
-                continue
             account_service.mark_image_result(token, False)
             if account_email and not getattr(exc, "account_email", ""):
                 exc.account_email = account_email
@@ -1469,16 +1425,6 @@ def _generate_single_image(
             })
             raise
         except Exception as exc:
-            if is_image_quota_exhausted_error(exc):
-                account_service.mark_image_quota_exhausted_token(token, "image_stream_error", str(exc))
-                logger.warning({
-                    "event": "image_quota_exhausted_token_limited",
-                    "request_token": token,
-                    "account_email": account_email,
-                    "error": str(exc)[:300],
-                    "index": index,
-                })
-                continue
             account_service.mark_image_result(token, False)
             last_error = str(exc)
             logger.warning({
@@ -1561,47 +1507,60 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
         "n": request.n,
         "model": request.model,
     })
-    executor = ThreadPoolExecutor(max_workers=request.n)
-    futures = {
-        executor.submit(_generate_single_image, request, index, request.n): index
-        for index in range(1, request.n + 1)
-    }
-    pending = set(futures)
-    emitted = 0
+    # 每张图片一个线程，同时启动
+    futures = {}
+    results: dict[int, list[ImageOutput]] = {}
+    errors: dict[int, Exception] = {}
+    with ThreadPoolExecutor(max_workers=request.n) as executor:
+        for index in range(1, request.n + 1):
+            future = executor.submit(_generate_single_image, request, index, request.n)
+            futures[future] = index
+
+        # 按完成顺序收集结果
+        for future in as_completed(futures):
+            index = futures[future]
+            try:
+                results[index] = future.result()
+            except Exception as exc:
+                errors[index] = exc
+                logger.warning({
+                    "event": "image_parallel_generation_error",
+                    "index": index,
+                    "error": str(exc)[:300],
+                })
+
+    # yield 结果：跳过索引顺序限制，不再让低索引失败阻塞高索引成功结果
+    emitted = False
     last_error = ""
-    try:
-        while pending:
-            done, pending = wait(pending, return_when=FIRST_COMPLETED)
-            for future in done:
-                index = futures[future]
-                try:
-                    outputs = future.result()
-                except Exception as exc:
-                    last_error = str(exc)
-                    logger.warning({
-                        "event": "image_parallel_generation_error",
-                        "index": index,
-                        "error": last_error[:300],
-                    })
-                    if emitted == 0:
-                        logger.warning({
-                            "event": "image_parallel_failure_before_success",
-                            "failed_index": index,
-                            "error": last_error[:200],
-                        })
-                    continue
-                result_outputs = [output for output in outputs if output.kind == "result"]
-                if result_outputs:
-                    emitted += sum(max(1, len(output.data)) for output in result_outputs)
-                for output in outputs:
-                    yield output
-        if emitted:
-            return
+    # 先 yield 所有成功的结果
+    for index in range(1, request.n + 1):
+        if index in results:
+            for output in results[index]:
+                emitted = True
+                yield output
+        elif index in errors:
+            last_error = str(errors[index])
+            if not emitted:
+                logger.warning({
+                    "event": "image_parallel_failure_before_success",
+                    "failed_index": index,
+                    "error": last_error[:200],
+                })
+
+    # 如果有失败但也有成功，记录警告
+    if emitted:
+        for index in range(1, request.n + 1):
+            if index in errors:
+                logger.warning({
+                    "event": "image_parallel_partial_failure",
+                    "failed_index": index,
+                    "error": str(errors[index])[:200],
+                })
+
+    if not emitted:
         if not last_error:
             last_error = "no account in the pool could generate images — check account quota and rate-limit status"
         raise ImageGenerationError(image_stream_error_message(last_error), conversation_id="")
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def stream_image_chunks(outputs: Iterable[ImageOutput]) -> Iterator[dict[str, Any]]:
