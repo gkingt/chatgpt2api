@@ -37,6 +37,7 @@ from utils.image_tokens import (
     count_image_output_items_tokens,
     image_usage,
 )
+from utils.log import logger
 
 TOOL_UNAVAILABLE_SYSTEM_MESSAGE = (
     "This compatibility backend cannot execute local tools, shell commands, non-search tools, "
@@ -205,6 +206,7 @@ def image_result_content(result: dict[str, Any]) -> str:
 
 def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
     model, prompt, n, images = chat_image_args(body)
+    logger.info({"event": "image_chat_sync_start", "model": model, "n": n, "image_count": len(images)})
     result = collect_image_outputs(stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
         model=model,
@@ -212,6 +214,13 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
         response_format="b64_json",
         images=encode_images(images) or None,
     )))
+    logger.info({
+        "event": "image_chat_sync_done",
+        "model": model,
+        "n": n,
+        "data_count": len(result.get("data") or []),
+        "has_message": bool(result.get("message")),
+    })
     response = completion_response(model, image_result_content(result), int(result.get("created") or 0) or None)
     usage = image_usage(
         input_text_tokens=count_text_tokens(prompt, model),

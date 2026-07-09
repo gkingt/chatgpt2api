@@ -5,10 +5,14 @@ import unittest
 from unittest.mock import patch
 
 from services.protocol import conversation
-from services.protocol.conversation import ConversationRequest, ImageOutput
+from services.protocol.conversation import ConversationRequest, ImageOutput, is_tls_connection_error
 
 
 class ImageParallelGenerationTests(unittest.TestCase):
+    def test_image_stream_connection_abort_errors_are_retryable(self):
+        self.assertTrue(is_tls_connection_error("curl: (56) Connection closed abruptly"))
+        self.assertTrue(is_tls_connection_error("curl: (92) HTTP/2 stream 1 was not closed cleanly: INTERNAL_ERROR"))
+
     def test_parallel_generation_yields_fast_result_and_keeps_waiting_for_slow_peer(self):
         calls: list[int] = []
 

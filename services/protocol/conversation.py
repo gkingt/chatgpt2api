@@ -124,11 +124,16 @@ def is_tls_connection_error(message: str) -> bool:
     text = str(message or "").lower()
     return (
         "curl: (35)" in text
+        or "curl: (56)" in text
+        or "curl: (92)" in text
         or "tls connect error" in text
         or "openssl_internal" in text
         or "ssl: wrong_version_number" in text
         or "ssl: certificate_verify_failed" in text
         or "connection aborted" in text
+        or "connection closed abruptly" in text
+        or "http/2 stream" in text
+        or "internal_error" in text
         or "remote disconnected" in text
         or "connection reset by peer" in text
     )

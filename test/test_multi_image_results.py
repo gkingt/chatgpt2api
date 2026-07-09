@@ -37,7 +37,7 @@ class FakeBackend(OpenAIBackendAPI):
         self.file_urls: dict[str, str] = {}
         self.sediment_urls: dict[str, str] = {}
 
-    def _get_conversation(self, conversation_id: str) -> dict:
+    def _get_conversation(self, conversation_id: str, timeout_secs: float | None = None) -> dict:
         self.calls += 1
         index = min(self.calls - 1, len(self.conversations) - 1)
         return self.conversations[index]

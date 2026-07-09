@@ -1084,11 +1084,11 @@ class OpenAIBackendAPI:
         ensure_ok(response, path)
         return response
 
-    def _get_conversation(self, conversation_id: str) -> Dict[str, Any]:
+    def _get_conversation(self, conversation_id: str, timeout_secs: float | None = None) -> Dict[str, Any]:
         """获取完整 conversation 详情。"""
         path = f"/backend-api/conversation/{conversation_id}"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+                                    timeout=timeout_secs or 60)
         ensure_ok(response, path)
         return response.json()
 
@@ -2251,7 +2251,7 @@ class OpenAIBackendAPI:
                 })
 
             try:
-                conversation = self._get_conversation(conversation_id)
+                conversation = self._get_conversation(conversation_id, timeout_secs=config.image_poll_request_timeout_secs)
             except UpstreamHTTPError as exc:
                 if exc.status_code in (429, 500, 502, 503, 504):
                     if _retry_sleep("upstream_status", exc.status_code, None, exc.retry_after):
@@ -2637,17 +2637,33 @@ class OpenAIBackendAPI:
     ) -> Iterator[str]:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
+        started = time.time()
+
+        def log_stage(stage: str, **extra: Any) -> None:
+            logger.info({
+                "event": "image_upstream_stage",
+                "stage": stage,
+                "elapsed_ms": int((time.time() - started) * 1000),
+                **extra,
+            })
+
         self._report_progress("uploading")
+        log_stage("uploading", image_count=len(images))
         references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images, start=1)]
         self._report_progress("bootstrapping")
+        log_stage("bootstrapping")
         self._bootstrap()
         self._report_progress("getting_token")
+        log_stage("getting_token")
         requirements = self._get_chat_requirements()
         self._report_progress("preparing_conversation")
+        log_stage("preparing_conversation", model=model)
         conduit_token = self._prepare_image_conversation(prompt, requirements, model)
         self._report_progress("starting_generation")
+        log_stage("starting_generation", model=model)
         response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
         self._report_progress("generating")
+        log_stage("generating", model=model)
         try:
             yield from iter_sse_payloads(response)
         finally:
