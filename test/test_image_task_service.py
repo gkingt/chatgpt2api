@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -33,6 +34,52 @@ class ImageTaskServiceTests(unittest.TestCase):
             edit_handler=handler or (lambda _payload: {"data": [{"url": "http://example.test/edit.png"}]}),
             retention_days_getter=lambda: 30,
         )
+
+    def test_submit_generation_uses_bounded_worker_pool(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            active = 0
+            max_active = 0
+            calls = 0
+            lock = threading.Lock()
+
+            def handler(_payload):
+                nonlocal active, max_active, calls
+                with lock:
+                    active += 1
+                    calls += 1
+                    max_active = max(max_active, active)
+                try:
+                    time.sleep(0.1)
+                    return {"data": [{"url": "http://example.test/image.png"}]}
+                finally:
+                    with lock:
+                        active -= 1
+
+            service = ImageTaskService(
+                Path(tmp_dir) / "image_tasks.json",
+                generation_handler=handler,
+                edit_handler=handler,
+                retention_days_getter=lambda: 30,
+                max_workers_getter=lambda: 1,
+            )
+            try:
+                for index in range(3):
+                    service.submit_generation(
+                        OWNER,
+                        client_task_id=f"bounded-{index}",
+                        prompt="cat",
+                        model="gpt-image-2",
+                        size=None,
+                        base_url="http://local.test",
+                    )
+
+                for index in range(3):
+                    wait_for_task(service, OWNER, f"bounded-{index}", "success", timeout=3.0)
+
+                self.assertEqual(calls, 3)
+                self.assertEqual(max_active, 1)
+            finally:
+                service.close()
 
     def test_duplicate_submit_uses_existing_task(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

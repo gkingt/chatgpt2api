@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -104,13 +105,18 @@ class ImageTaskService:
         generation_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_generations.handle,
         edit_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_edit.handle,
         retention_days_getter: Callable[[], int] | None = None,
+        max_workers_getter: Callable[[], int] | None = None,
     ):
         self.path = path
         self.generation_handler = generation_handler
         self.edit_handler = edit_handler
         self.retention_days_getter = retention_days_getter or (lambda: config.image_retention_days)
+        self.max_workers_getter = max_workers_getter or (lambda: config.image_task_max_workers)
         self._lock = threading.RLock()
         self._tasks: dict[str, dict[str, Any]] = {}
+        self._executor_lock = threading.Lock()
+        self._executor_workers = 0
+        self._executor: ThreadPoolExecutor | None = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             self._tasks = self._load_locked()
@@ -118,6 +124,34 @@ class ImageTaskService:
             changed = self._cleanup_locked() or changed
             if changed:
                 self._save_locked()
+
+    def _max_workers(self) -> int:
+        try:
+            return max(1, int(self.max_workers_getter()))
+        except Exception:
+            return 2
+
+    def _get_executor(self) -> ThreadPoolExecutor:
+        with self._executor_lock:
+            if self._executor is None:
+                max_workers = self._max_workers()
+                self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="image-task")
+                self._executor_workers = max_workers
+            return self._executor
+
+    def close(self) -> None:
+        with self._executor_lock:
+            executor = self._executor
+            self._executor = None
+            self._executor_workers = 0
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def submit_generation(
         self,
@@ -230,13 +264,14 @@ class ImageTaskService:
             should_start = True
 
         if should_start:
-            thread = threading.Thread(
-                target=self._run_task,
-                args=(key, mode, payload, dict(identity), _clean(payload.get("model"), "gpt-image-2")),
-                name=f"image-task-{task_id[:16]}",
-                daemon=True,
+            self._get_executor().submit(
+                self._run_task,
+                key,
+                mode,
+                payload,
+                dict(identity),
+                _clean(payload.get("model"), "gpt-image-2"),
             )
-            thread.start()
         return _public_task(task)
 
     def _run_task(
@@ -461,14 +496,15 @@ class ImageTaskService:
             # 将任务状态重置为 running
             self._update_task(key, status=TASK_STATUS_RUNNING, error="")
 
-        # 启动新线程继续轮询
-        thread = threading.Thread(
-            target=self._run_resume_poll,
-            args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model),
-            name=f"image-resume-{_clean(task_id)[:16]}",
-            daemon=True,
+        self._get_executor().submit(
+            self._run_resume_poll,
+            key,
+            conversation_id,
+            extra_timeout_secs,
+            dict(identity),
+            mode,
+            model,
         )
-        thread.start()
         return _public_task(task)
 
     def _run_resume_poll(
@@ -482,11 +518,12 @@ class ImageTaskService:
     ) -> None:
         """后台线程：继续轮询已有 conversation_id 的图片结果。"""
         started = time.time()
+        backend = None
         try:
             from services.openai_backend_api import OpenAIBackendAPI
             from services.protocol.conversation import format_image_result
 
-            backend = OpenAIBackendAPI(proxy_url=config.proxy_url or None)
+            backend = OpenAIBackendAPI()
             file_ids, sediment_ids = backend._poll_image_results(
                 conversation_id,
                 extra_timeout_secs,
@@ -541,6 +578,9 @@ class ImageTaskService:
                 status="failed",
                 error=error_message,
             )
+        finally:
+            if backend is not None:
+                backend.close()
 
 
 image_task_service = ImageTaskService(DATA_DIR / "image_tasks.json")
