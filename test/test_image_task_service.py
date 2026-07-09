@@ -35,7 +35,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             retention_days_getter=lambda: 30,
         )
 
-    def test_submit_generation_uses_bounded_worker_pool(self):
+    def test_submit_generation_accepts_all_tasks_with_worker_queue(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             active = 0
             max_active = 0
@@ -60,7 +60,7 @@ class ImageTaskServiceTests(unittest.TestCase):
                 generation_handler=handler,
                 edit_handler=handler,
                 retention_days_getter=lambda: 30,
-                max_workers_getter=lambda: 1,
+                worker_count_getter=lambda: 1,
             )
             try:
                 for index in range(3):

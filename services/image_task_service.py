@@ -105,13 +105,13 @@ class ImageTaskService:
         generation_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_generations.handle,
         edit_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_edit.handle,
         retention_days_getter: Callable[[], int] | None = None,
-        max_workers_getter: Callable[[], int] | None = None,
+        worker_count_getter: Callable[[], int] | None = None,
     ):
         self.path = path
         self.generation_handler = generation_handler
         self.edit_handler = edit_handler
         self.retention_days_getter = retention_days_getter or (lambda: config.image_retention_days)
-        self.max_workers_getter = max_workers_getter or (lambda: config.image_task_max_workers)
+        self.worker_count_getter = worker_count_getter or (lambda: config.image_task_worker_count)
         self._lock = threading.RLock()
         self._tasks: dict[str, dict[str, Any]] = {}
         self._executor_lock = threading.Lock()
@@ -127,9 +127,9 @@ class ImageTaskService:
 
     def _max_workers(self) -> int:
         try:
-            return max(1, int(self.max_workers_getter()))
+            return max(1, int(self.worker_count_getter()))
         except Exception:
-            return 2
+            return config.image_account_concurrency
 
     def _get_executor(self) -> ThreadPoolExecutor:
         with self._executor_lock:

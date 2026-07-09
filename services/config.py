@@ -450,11 +450,12 @@ class ConfigStore:
             return 3
 
     @property
-    def image_task_max_workers(self) -> int:
+    def image_task_worker_count(self) -> int:
         try:
-            return max(1, int(self.data.get("image_task_max_workers", 2)))
+            value = self.data.get("image_task_worker_count", self.data.get("image_task_max_workers", self.image_account_concurrency))
+            return max(1, int(value))
         except (TypeError, ValueError):
-            return 2
+            return self.image_account_concurrency
 
     @property
     def image_parallel_generation(self) -> bool:
@@ -596,7 +597,7 @@ class ConfigStore:
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
         data["image_account_concurrency"] = self.image_account_concurrency
-        data["image_task_max_workers"] = self.image_task_max_workers
+        data["image_task_worker_count"] = self.image_task_worker_count
         data["image_parallel_generation"] = self.image_parallel_generation
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
         data["auto_remove_rate_limited_accounts"] = self.auto_remove_rate_limited_accounts
