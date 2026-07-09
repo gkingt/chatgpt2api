@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import datetime
 from threading import Event
+from time import perf_counter
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,6 +16,14 @@ from api.support import resolve_web_asset, start_limited_account_watcher
 from services.backup_service import backup_service
 from services.config import config
 from services.image_service import start_image_cleanup_scheduler
+from utils.log import logger
+
+
+def _should_log_api_timing(path: str) -> bool:
+    return (
+        path.startswith("/v1/")
+        or path.startswith("/api/image-tasks")
+    )
 
 
 def create_app() -> FastAPI:
@@ -35,6 +46,50 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="chatgpt2api", version=app_version, lifespan=lifespan)
     install_exception_handlers(app)
+
+    @app.middleware("http")
+    async def log_api_timing(request, call_next):
+        path = request.url.path
+        if not _should_log_api_timing(path):
+            return await call_next(request)
+
+        request_id = request.headers.get("x-request-id") or uuid4().hex
+        received_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        started = perf_counter()
+        logger.info({
+            "event": "api_request_received",
+            "request_id": request_id,
+            "method": request.method,
+            "path": path,
+            "received_at": received_at,
+            "client": request.client.host if request.client else "",
+            "content_length": request.headers.get("content-length", ""),
+        })
+        try:
+            response = await call_next(request)
+        except Exception:
+            logger.exception({
+                "event": "api_request_failed",
+                "request_id": request_id,
+                "method": request.method,
+                "path": path,
+                "duration_ms": int((perf_counter() - started) * 1000),
+            })
+            raise
+        duration_ms = int((perf_counter() - started) * 1000)
+        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Received-At"] = received_at
+        response.headers["X-Process-Time-Ms"] = str(duration_ms)
+        logger.info({
+            "event": "api_request_completed",
+            "request_id": request_id,
+            "method": request.method,
+            "path": path,
+            "status_code": response.status_code,
+            "duration_ms": duration_ms,
+        })
+        return response
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
