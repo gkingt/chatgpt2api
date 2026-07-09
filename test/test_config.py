@@ -58,6 +58,28 @@ class ConfigLoadingTests(unittest.TestCase):
                 else:
                     module.os.environ["CHATGPT2API_AUTH_KEY"] = old_env_auth_key
 
+    def test_image_remove_conversation_after_result_defaults_false(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            path.write_text(json.dumps({"auth-key": "test-auth"}), encoding="utf-8")
+
+            store = self.config_module.ConfigStore(path)
+
+            self.assertFalse(store.image_remove_conversation_after_result)
+            self.assertFalse(store.get()["image_remove_conversation_after_result"])
+
+    def test_image_remove_conversation_after_result_accepts_string_true(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            path.write_text(
+                json.dumps({"auth-key": "test-auth", "image_remove_conversation_after_result": "true"}),
+                encoding="utf-8",
+            )
+
+            store = self.config_module.ConfigStore(path)
+
+            self.assertTrue(store.image_remove_conversation_after_result)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -158,10 +158,6 @@ class AccountService:
             return False
         if int(account.get("invalid_count") or 0) > 0:
             return False
-        if bool(account.get("image_quota_unknown")):
-            return True
-        if str(account.get("status") or "").strip() == "正常" and int(account.get("quota") or 0) == 0:
-            return True
         return int(account.get("quota") or 0) > 0
 
     @staticmethod
@@ -1847,11 +1843,11 @@ class AccountService:
         with self._lock:
             items = list(self._accounts.values())
         total = len(items)
-        active = sum(1 for a in items if self._is_image_account_available(a))
+        active = sum(1 for a in items if a.get("status") == "正常")
         limited = sum(1 for a in items if a.get("status") == "限流")
         abnormal = sum(1 for a in items if a.get("status") == "异常")
         disabled = sum(1 for a in items if a.get("status") == "禁用")
-        total_quota = sum(max(0, int(a.get("quota") or 0)) for a in items if self._is_image_account_available(a))
+        total_quota = sum(max(0, int(a.get("quota") or 0)) for a in items if a.get("status") == "正常")
         unlimited = 0
         total_success = sum(int(a.get("success") or 0) for a in items)
         total_fail = sum(int(a.get("fail") or 0) for a in items)

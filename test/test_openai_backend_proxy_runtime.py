@@ -79,14 +79,8 @@ class OpenAIBackendProxyRuntimeTests(unittest.TestCase):
             "_get_conversation_init",
             side_effect=TimeoutError("Connection timed out after 20011 milliseconds"),
         ), patch.object(api, "_get_default_account", return_value={"plan_type": "free"}):
-            result = api.get_user_info()
-
-        self.assertEqual(result["email"], "user@example.com")
-        self.assertEqual(result["user_id"], "user-id")
-        self.assertEqual(result["type"], "free")
-        self.assertEqual(result["quota"], 0)
-        self.assertTrue(result["image_quota_unknown"])
-        self.assertEqual(result["status"], "正常")
+            with self.assertRaisesRegex(TimeoutError, "Connection timed out"):
+                api.get_user_info()
 
 
 if __name__ == "__main__":

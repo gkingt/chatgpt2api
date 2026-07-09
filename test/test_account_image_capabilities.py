@@ -19,13 +19,13 @@ from utils.helper import anonymize_token, split_image_model
 
 
 class AccountCapabilityTests(unittest.TestCase):
-    def test_unknown_quota_accounts_are_available_only_when_not_throttled(self) -> None:
+    def test_unknown_quota_accounts_are_not_image_available(self) -> None:
         self.assertFalse(
             AccountService._is_image_account_available(
                 {"status": "限流", "image_quota_unknown": True, "quota": 0}
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             AccountService._is_image_account_available(
                 {"status": "正常", "image_quota_unknown": True, "quota": 0}
             )
@@ -138,7 +138,7 @@ class AccountCapabilityTests(unittest.TestCase):
         self.assertFalse(result["image_quota_unknown"])
         self.assertEqual(result["quota"], 0)
 
-    def test_missing_image_quota_feature_keeps_unknown_fallback(self) -> None:
+    def test_missing_image_quota_feature_is_refreshed_as_limited(self) -> None:
         api = OpenAIBackendAPI("token")
         with patch.object(api, "_get_me", return_value={"email": "new@example.com", "id": "user-id"}), patch.object(
             api,
@@ -147,8 +147,8 @@ class AccountCapabilityTests(unittest.TestCase):
         ), patch.object(api, "_get_default_account", return_value={"plan_type": "free", "is_deactivated": False}):
             result = api.get_user_info()
 
-        self.assertEqual(result["status"], "正常")
-        self.assertTrue(result["image_quota_unknown"])
+        self.assertEqual(result["status"], "限流")
+        self.assertFalse(result["image_quota_unknown"])
         self.assertEqual(result["quota"], 0)
 
     def test_refresh_accounts_can_remove_invalid_token_without_confirmation_delay(self) -> None:
@@ -226,8 +226,8 @@ class AccountCapabilityTests(unittest.TestCase):
 
             stats = service.get_stats()
 
-            self.assertEqual(stats["active"], 1)
-            self.assertEqual(stats["total_quota"], 2)
+            self.assertEqual(stats["active"], 2)
+            self.assertEqual(stats["total_quota"], 11)
             self.assertEqual(stats["unlimited_quota_count"], 0)
             self.assertEqual(service.list_normal_tokens(), ["good-token"])
 
@@ -243,7 +243,7 @@ class AccountCapabilityTests(unittest.TestCase):
 
             metrics = register_service._pool_metrics()
 
-            self.assertEqual(metrics["current_available"], 2)
+            self.assertEqual(metrics["current_available"], 1)
             self.assertEqual(metrics["current_quota"], 2)
 
     def test_image_quota_error_detector_matches_common_messages(self) -> None:

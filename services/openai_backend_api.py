@@ -265,11 +265,11 @@ class OpenAIBackendAPI:
         return headers
 
     @staticmethod
-    def _extract_quota_and_restore_at(limits_progress: list[Any]) -> tuple[int, str | None, bool]:
+    def _extract_quota_and_restore_at(limits_progress: list[Any]) -> tuple[int, str | None]:
         for item in limits_progress:
             if isinstance(item, dict) and item.get("feature_name") == "image_gen":
-                return int(item.get("remaining") or 0), str(item.get("reset_after") or "") or None, False
-        return 0, None, True
+                return int(item.get("remaining") or 0), str(item.get("reset_after") or "") or None
+        return 0, None
 
     def _raise_on_error(self, response: Any, path: str) -> None:
         if response.status_code == 401:
@@ -328,16 +328,7 @@ class OpenAIBackendAPI:
             me_future = executor.submit(self._get_me)
             init_future = executor.submit(self._get_conversation_init)
             account_future = executor.submit(self._get_default_account)
-            me_payload = me_future.result()
-            default_account = account_future.result()
-            try:
-                init_payload = init_future.result()
-            except Exception as exc:
-                init_payload = {}
-                logger.warning({
-                    "event": "backend_user_info_quota_unknown",
-                    "error": str(exc or "conversation init failed"),
-                })
+            me_payload, init_payload, default_account = me_future.result(), init_future.result(), account_future.result()
         except (KeyboardInterrupt, SystemExit):
             executor.shutdown(wait=False, cancel_futures=True)
             raise
@@ -351,15 +342,15 @@ class OpenAIBackendAPI:
 
         limits_progress = init_payload.get("limits_progress")
         limits_progress = limits_progress if isinstance(limits_progress, list) else []
-        quota, restore_at, image_quota_unknown = self._extract_quota_and_restore_at(limits_progress)
+        quota, restore_at = self._extract_quota_and_restore_at(limits_progress)
         is_deactivated = bool(default_account.get("is_deactivated"))
-        status = "禁用" if is_deactivated else ("正常" if image_quota_unknown or quota > 0 else "限流")
+        status = "禁用" if is_deactivated else ("限流" if quota == 0 else "正常")
         result = {
             "email": me_payload.get("email"),
             "user_id": me_payload.get("id"),
             "type": plan_type,
             "quota": 0 if is_deactivated else quota,
-            "image_quota_unknown": image_quota_unknown,
+            "image_quota_unknown": False,
             "limits_progress": limits_progress,
             "default_model_slug": init_payload.get("default_model_slug"),
             "restore_at": restore_at,
@@ -372,7 +363,6 @@ class OpenAIBackendAPI:
             "user_id": result.get("user_id"),
             "type": result.get("type"),
             "quota": result.get("quota"),
-            "image_quota_unknown": result.get("image_quota_unknown"),
             "default_model_slug": result.get("default_model_slug"),
             "restore_at": result.get("restore_at"),
             "status": result.get("status"),
