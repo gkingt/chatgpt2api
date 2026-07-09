@@ -1852,7 +1852,7 @@ class AccountService:
         abnormal = sum(1 for a in items if a.get("status") == "异常")
         disabled = sum(1 for a in items if a.get("status") == "禁用")
         total_quota = sum(max(0, int(a.get("quota") or 0)) for a in items if self._is_image_account_available(a))
-        unlimited = sum(1 for a in items if self._is_image_account_available(a) and bool(a.get("image_quota_unknown")))
+        unlimited = 0
         total_success = sum(int(a.get("success") or 0) for a in items)
         total_fail = sum(int(a.get("fail") or 0) for a in items)
         by_type = {}

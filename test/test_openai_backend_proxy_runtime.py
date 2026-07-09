@@ -86,7 +86,7 @@ class OpenAIBackendProxyRuntimeTests(unittest.TestCase):
         self.assertEqual(result["type"], "free")
         self.assertEqual(result["quota"], 0)
         self.assertTrue(result["image_quota_unknown"])
-        self.assertEqual(result["status"], "限流")
+        self.assertEqual(result["status"], "正常")
 
 
 if __name__ == "__main__":

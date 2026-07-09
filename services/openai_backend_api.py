@@ -328,7 +328,16 @@ class OpenAIBackendAPI:
             me_future = executor.submit(self._get_me)
             init_future = executor.submit(self._get_conversation_init)
             account_future = executor.submit(self._get_default_account)
-            me_payload, init_payload, default_account = me_future.result(), init_future.result(), account_future.result()
+            me_payload = me_future.result()
+            default_account = account_future.result()
+            try:
+                init_payload = init_future.result()
+            except Exception as exc:
+                init_payload = {}
+                logger.warning({
+                    "event": "backend_user_info_quota_unknown",
+                    "error": str(exc or "conversation init failed"),
+                })
         except (KeyboardInterrupt, SystemExit):
             executor.shutdown(wait=False, cancel_futures=True)
             raise
@@ -343,9 +352,8 @@ class OpenAIBackendAPI:
         limits_progress = init_payload.get("limits_progress")
         limits_progress = limits_progress if isinstance(limits_progress, list) else []
         quota, restore_at, image_quota_unknown = self._extract_quota_and_restore_at(limits_progress)
-        image_quota_unknown = image_quota_unknown or quota == 0
         is_deactivated = bool(default_account.get("is_deactivated"))
-        status = "禁用" if is_deactivated else "正常"
+        status = "禁用" if is_deactivated else ("正常" if image_quota_unknown or quota > 0 else "限流")
         result = {
             "email": me_payload.get("email"),
             "user_id": me_payload.get("id"),

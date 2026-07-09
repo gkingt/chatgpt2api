@@ -123,14 +123,27 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertIn("preflight failed", account["last_refresh_error"])
             self.assertEqual(stats["active"], 1)
             self.assertEqual(stats["total_quota"], 8)
-            self.assertEqual(stats["unlimited_quota_count"], 1)
+            self.assertEqual(stats["unlimited_quota_count"], 0)
 
-    def test_preflight_zero_image_quota_is_treated_as_unknown(self) -> None:
+    def test_preflight_zero_image_quota_is_refreshed_as_limited(self) -> None:
         api = OpenAIBackendAPI("token")
         with patch.object(api, "_get_me", return_value={"email": "new@example.com", "id": "user-id"}), patch.object(
             api,
             "_get_conversation_init",
             return_value={"limits_progress": [{"feature_name": "image_gen", "remaining": 0}]},
+        ), patch.object(api, "_get_default_account", return_value={"plan_type": "free", "is_deactivated": False}):
+            result = api.get_user_info()
+
+        self.assertEqual(result["status"], "限流")
+        self.assertFalse(result["image_quota_unknown"])
+        self.assertEqual(result["quota"], 0)
+
+    def test_missing_image_quota_feature_keeps_unknown_fallback(self) -> None:
+        api = OpenAIBackendAPI("token")
+        with patch.object(api, "_get_me", return_value={"email": "new@example.com", "id": "user-id"}), patch.object(
+            api,
+            "_get_conversation_init",
+            return_value={"limits_progress": [{"feature_name": "messages", "remaining": 10}]},
         ), patch.object(api, "_get_default_account", return_value={"plan_type": "free", "is_deactivated": False}):
             result = api.get_user_info()
 
