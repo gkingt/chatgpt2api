@@ -261,11 +261,11 @@ class OpenAIBackendAPI:
         return headers
 
     @staticmethod
-    def _extract_quota_and_restore_at(limits_progress: list[Any]) -> tuple[int, str | None]:
+    def _extract_quota_and_restore_at(limits_progress: list[Any]) -> tuple[int, str | None, bool]:
         for item in limits_progress:
             if isinstance(item, dict) and item.get("feature_name") == "image_gen":
-                return int(item.get("remaining") or 0), str(item.get("reset_after") or "") or None
-        return 0, None
+                return int(item.get("remaining") or 0), str(item.get("reset_after") or "") or None, False
+        return 0, None, True
 
     def _raise_on_error(self, response: Any, path: str) -> None:
         if response.status_code == 401:
@@ -338,16 +338,22 @@ class OpenAIBackendAPI:
 
         limits_progress = init_payload.get("limits_progress")
         limits_progress = limits_progress if isinstance(limits_progress, list) else []
-        quota, restore_at = self._extract_quota_and_restore_at(limits_progress)
+        quota, restore_at, image_quota_unknown = self._extract_quota_and_restore_at(limits_progress)
+        is_deactivated = bool(default_account.get("is_deactivated"))
+        status = "禁用" if is_deactivated else (
+            "正常" if image_quota_unknown and plan_type.lower() != "free" else ("限流" if quota == 0 else "正常")
+        )
         result = {
             "email": me_payload.get("email"),
             "user_id": me_payload.get("id"),
             "type": plan_type,
-            "quota": quota,
+            "quota": 0 if is_deactivated else quota,
+            "image_quota_unknown": image_quota_unknown,
             "limits_progress": limits_progress,
             "default_model_slug": init_payload.get("default_model_slug"),
             "restore_at": restore_at,
-            "status": "限流" if quota == 0 else "正常",
+            "status": status,
+            "is_deactivated": is_deactivated,
         }
         logger.debug({
             "event": "backend_user_info_result",
@@ -355,6 +361,7 @@ class OpenAIBackendAPI:
             "user_id": result.get("user_id"),
             "type": result.get("type"),
             "quota": result.get("quota"),
+            "image_quota_unknown": result.get("image_quota_unknown"),
             "default_model_slug": result.get("default_model_slug"),
             "restore_at": result.get("restore_at"),
             "status": result.get("status"),
