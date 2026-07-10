@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import requests
 import urllib3
@@ -736,6 +736,9 @@ class PlatformRegistrar:
         self.proxy = proxy
         self.session = create_session(proxy)
         self.device_id = str(uuid.uuid4())
+        self.code_verifier = ""
+        self.passwordless_signup = False
+        self.last_otp_continue_url = ""
 
     def close(self) -> None:
         try:
@@ -760,14 +763,14 @@ class PlatformRegistrar:
         step(index, "开始 platform authorize")
         self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
         self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
-        code_verifier, code_challenge = _generate_pkce()
+        self.code_verifier, code_challenge = _generate_pkce()
         params = {
             "issuer": auth_base,
             "client_id": platform_oauth_client_id,
             "audience": platform_oauth_audience,
             "redirect_uri": platform_oauth_redirect_uri,
             "device_id": self.device_id,
-            "screen_hint": "signup",
+            "screen_hint": "login_or_signup",
             "max_age": "0",
             "login_hint": email,
             "scope": "openid profile email offline_access",
@@ -793,8 +796,27 @@ class PlatformRegistrar:
             err = _response_json(resp).get("error", {}) if resp is not None else {}
             detail = f": {err.get('code', '')} - {err.get('message', '')}".strip(" -") if err else ""
             raise RuntimeError(error or f"platform_authorize_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
-        step(index, "platform authorize 完成")
-        return code_verifier
+        final_url = str(getattr(resp, "url", "") or "")
+        self.passwordless_signup = "/email-verification" in final_url.lower()
+        mode = "passwordless" if self.passwordless_signup else "password"
+        step(index, f"platform authorize 完成 mode={mode} url={final_url[:160]}")
+        return self.code_verifier
+
+    def _start_passwordless_signup(self, index: int) -> None:
+        step(index, "开始切换 passwordless signup 并发送验证码")
+        resp, error = request_with_local_retry(
+            self.session,
+            "post",
+            f"{auth_base}/api/accounts/passwordless/send-otp",
+            headers=self._json_headers(f"{auth_base}/create-account/password"),
+            verify=False,
+        )
+        if resp is None or resp.status_code != 200:
+            data = _response_json(resp) if resp is not None else {}
+            detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""
+            raise RuntimeError(error or f"passwordless_send_otp_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
+        self.passwordless_signup = True
+        step(index, "passwordless signup 验证码发送完成")
 
     def _register_user(self, email: str, password: str, index: int) -> None:
         step(index, "开始提交注册密码")
@@ -845,8 +867,30 @@ class PlatformRegistrar:
             raise RuntimeError(error or f"validate_otp_http_{getattr(resp, 'status_code', 'unknown')}")
         payload = _response_json(resp)
         continue_url = str(payload.get("continue_url") or resp.headers.get("Location") or "").strip()
+        self.last_otp_continue_url = continue_url
+        if continue_url:
+            self._authorize_continue(continue_url, index)
         step(index, "验证码校验完成")
         return continue_url
+
+    def _authorize_continue(self, continue_url: str, index: int) -> None:
+        url = str(continue_url or "").strip()
+        if not url:
+            return
+        if not url.lower().startswith("http"):
+            url = urljoin(f"{auth_base}/", url.lstrip("/"))
+        step(index, "开始执行 authorize/continue")
+        resp, error = request_with_local_retry(
+            self.session,
+            "get",
+            url,
+            headers=self._navigate_headers(f"{auth_base}/email-verification"),
+            allow_redirects=True,
+            verify=False,
+        )
+        if resp is None or resp.status_code not in (200, 302):
+            raise RuntimeError(error or f"authorize_continue_http_{getattr(resp, 'status_code', 'unknown')}")
+        step(index, f"authorize/continue 完成 url={str(getattr(resp, 'url', '') or '')[:160]}")
 
     def _create_account(self, name: str, birthdate: str, index: int, referer: str = "") -> str:
         step(index, "开始创建账号资料")
@@ -1018,19 +1062,20 @@ class PlatformRegistrar:
             raise RuntimeError("邮箱服务未返回 address")
         step(index, f"邮箱创建完成: {email}")
         try:
-            password = _random_password()
+            password = ""
             first_name, last_name = _random_name()
-            self._platform_authorize(email, index)
-            self._register_user(email, password, index)
-            self._send_otp(index)
+            code_verifier = self._platform_authorize(email, index)
+            if not self.passwordless_signup:
+                self._start_passwordless_signup(index)
+            step(index, "已进入 passwordless signup，不创建本地不可用的随机密码")
             step(index, "开始等待注册验证码")
             code = wait_for_code(mailbox)
             if not code:
                 raise RuntimeError("等待注册验证码超时")
             step(index, f"收到注册验证码: {code}")
             continue_url = self._validate_otp(code, index)
-            self._create_account(f"{first_name} {last_name}", _random_birthdate(), index, continue_url or f"{auth_base}/about-you")
-            tokens = self._login_and_exchange_tokens(email, password, mailbox, index)
+            account_continue_url = self._create_account(f"{first_name} {last_name}", _random_birthdate(), index, continue_url or f"{auth_base}/about-you")
+            tokens = self._finish_registration_and_exchange_tokens(code_verifier, account_continue_url, index)
             try:
                 _record_register_domain_result(mailbox, True)
             except Exception as exc:

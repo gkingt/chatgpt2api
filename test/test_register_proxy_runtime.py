@@ -339,7 +339,7 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
         self.assertTrue(any("token_len=15" in line and "so_token=yes" in line and "sdk=20260124ceb8" in line for line in log_lines))
         self.assertFalse(any("sentinel-secret" in line or "so-secret" in line for line in log_lines))
 
-    def test_register_skips_email_continue_after_platform_authorize(self):
+    def test_register_uses_passwordless_signup_after_platform_authorize(self):
         registrar = openai_register.PlatformRegistrar(proxy="")
         calls = []
 
@@ -354,15 +354,19 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
                 side_effect=lambda email, index, referer="": calls.append("email_continue"),
             ), patch.object(registrar, "_register_user", side_effect=lambda email, password, index: calls.append("password_register")), patch.object(
                 registrar,
-                "_send_otp",
-                side_effect=lambda index: calls.append("send_otp"),
-            ), patch.object(registrar, "_validate_otp", side_effect=lambda code, index: calls.append("validate_otp") or "/about-you"), patch.object(
+                "_start_passwordless_signup",
+                side_effect=lambda index: calls.append("passwordless_send_otp") or setattr(registrar, "passwordless_signup", True),
+            ), patch.object(registrar, "_send_otp", side_effect=lambda index: calls.append("send_otp")), patch.object(
+                registrar,
+                "_validate_otp",
+                side_effect=lambda code, index: calls.append("validate_otp") or "/about-you",
+            ), patch.object(
                 registrar,
                 "_create_account",
                 side_effect=lambda name, birthdate, index, referer="": calls.append("create_account") or "/continue",
             ), patch.object(
                 registrar,
-                "_login_and_exchange_tokens",
+                "_finish_registration_and_exchange_tokens",
                 return_value={"access_token": "access", "refresh_token": "refresh", "id_token": "id"},
             ):
                 result = registrar.register(1)
@@ -370,7 +374,10 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
             registrar.close()
 
         self.assertEqual(result["email"], "user@example.com")
-        self.assertEqual(calls[:5], ["authorize", "password_register", "send_otp", "validate_otp", "create_account"])
+        self.assertEqual(calls[:4], ["authorize", "passwordless_send_otp", "validate_otp", "create_account"])
+        self.assertEqual(result["password"], "")
+        self.assertNotIn("password_register", calls)
+        self.assertNotIn("send_otp", calls)
         self.assertNotIn("email_continue", calls)
 
     def test_register_user_logs_account_creation_failed_diagnostic(self):
