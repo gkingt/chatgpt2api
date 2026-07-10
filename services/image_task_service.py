@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +20,7 @@ TASK_STATUS_SUCCESS = "success"
 TASK_STATUS_ERROR = "error"
 TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}
 UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
+IMAGE_TASK_WORKER_LIMIT = 4
 
 
 def _now_iso() -> str:
@@ -111,6 +113,7 @@ class ImageTaskService:
         self.retention_days_getter = retention_days_getter or (lambda: config.image_retention_days)
         self._lock = threading.RLock()
         self._tasks: dict[str, dict[str, Any]] = {}
+        self._executor = ThreadPoolExecutor(max_workers=IMAGE_TASK_WORKER_LIMIT, thread_name_prefix="image-task")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             self._tasks = self._load_locked()
@@ -230,13 +233,14 @@ class ImageTaskService:
             should_start = True
 
         if should_start:
-            thread = threading.Thread(
-                target=self._run_task,
-                args=(key, mode, payload, dict(identity), _clean(payload.get("model"), "gpt-image-2")),
-                name=f"image-task-{task_id[:16]}",
-                daemon=True,
+            self._executor.submit(
+                self._run_task,
+                key,
+                mode,
+                payload,
+                dict(identity),
+                _clean(payload.get("model"), "gpt-image-2"),
             )
-            thread.start()
         return _public_task(task)
 
     def _run_task(
@@ -461,14 +465,15 @@ class ImageTaskService:
             # 将任务状态重置为 running
             self._update_task(key, status=TASK_STATUS_RUNNING, error="")
 
-        # 启动新线程继续轮询
-        thread = threading.Thread(
-            target=self._run_resume_poll,
-            args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model),
-            name=f"image-resume-{_clean(task_id)[:16]}",
-            daemon=True,
+        self._executor.submit(
+            self._run_resume_poll,
+            key,
+            conversation_id,
+            extra_timeout_secs,
+            dict(identity),
+            mode,
+            model,
         )
-        thread.start()
         return _public_task(task)
 
     def _run_resume_poll(
