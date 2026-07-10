@@ -130,10 +130,8 @@ def is_tls_connection_error(message: str) -> bool:
         or "ssl: wrong_version_number" in text
         or "ssl: certificate_verify_failed" in text
         or "connection aborted" in text
-        or "connection closed abruptly" in text
         or "remote disconnected" in text
         or "connection reset by peer" in text
-        or "http/2 stream" in text and "not closed cleanly" in text
     )
 
 
@@ -1579,8 +1577,7 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
     futures = {}
     results: dict[int, list[ImageOutput]] = {}
     errors: dict[int, Exception] = {}
-    max_workers = max(1, min(request.n, config.image_account_concurrency))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=request.n) as executor:
         for index in range(1, request.n + 1):
             future = executor.submit(_generate_single_image, request, index, request.n)
             futures[future] = index

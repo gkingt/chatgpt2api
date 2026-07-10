@@ -7,7 +7,7 @@ import time
 import unittest
 from pathlib import Path
 
-from services.image_task_service import IMAGE_TASK_WORKER_LIMIT, ImageTaskService
+from services.image_task_service import ImageTaskService
 
 
 OWNER = {"id": "owner-1", "name": "Owner", "role": "admin"}
@@ -66,48 +66,6 @@ class ImageTaskServiceTests(unittest.TestCase):
             release.set()
             for index in range(3):
                 wait_for_task(service, OWNER, f"concurrent-{index}", "success", timeout=3.0)
-
-    def test_generation_task_workers_are_bounded(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            active = 0
-            max_active = 0
-            lock = threading.Lock()
-            saturated = threading.Event()
-            release = threading.Event()
-
-            def handler(_payload):
-                nonlocal active, max_active
-                with lock:
-                    active += 1
-                    max_active = max(max_active, active)
-                    if active == IMAGE_TASK_WORKER_LIMIT:
-                        saturated.set()
-                try:
-                    self.assertTrue(release.wait(2.0))
-                    return {"data": [{"url": "http://example.test/image.png"}]}
-                finally:
-                    with lock:
-                        active -= 1
-
-            service = self.make_service(Path(tmp_dir) / "image_tasks.json", handler)
-            for index in range(IMAGE_TASK_WORKER_LIMIT + 2):
-                service.submit_generation(
-                    OWNER,
-                    client_task_id=f"bounded-{index}",
-                    prompt="cat",
-                    model="gpt-image-2",
-                    size=None,
-                    base_url="http://local.test",
-                )
-
-            self.assertTrue(saturated.wait(1.0))
-            tasks = service.list_tasks(OWNER, [f"bounded-{index}" for index in range(IMAGE_TASK_WORKER_LIMIT + 2)])["items"]
-            self.assertLessEqual(sum(1 for item in tasks if item["status"] == "running"), IMAGE_TASK_WORKER_LIMIT)
-            self.assertGreaterEqual(sum(1 for item in tasks if item["status"] == "queued"), 1)
-            release.set()
-            for index in range(IMAGE_TASK_WORKER_LIMIT + 2):
-                wait_for_task(service, OWNER, f"bounded-{index}", "success", timeout=3.0)
-            self.assertEqual(max_active, IMAGE_TASK_WORKER_LIMIT)
 
     def test_duplicate_submit_uses_existing_task(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

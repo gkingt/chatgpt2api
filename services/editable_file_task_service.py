@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -24,7 +23,6 @@ UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
 EDITABLE_FILE_PLAN_TYPES = ("Plus", "Team", "Pro", "Enterprise")
 EDITABLE_FILE_ROOT = DATA_DIR / "files"
 EDITABLE_FILE_TASKS_PATH = DATA_DIR / "editable_file_tasks.json"
-EDITABLE_FILE_TASK_WORKER_LIMIT = 2
 
 
 def _now_iso() -> str:
@@ -90,7 +88,6 @@ class EditableFileTaskService:
         self.path = path
         self._lock = threading.RLock()
         self._tasks: dict[str, dict[str, Any]] = {}
-        self._executor = ThreadPoolExecutor(max_workers=EDITABLE_FILE_TASK_WORKER_LIMIT, thread_name_prefix="editable-file-task")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             self._tasks = self._load_locked()
@@ -126,7 +123,7 @@ class EditableFileTaskService:
             self._tasks[key] = {"id": task_id, "owner_id": owner, "status": TASK_STATUS_QUEUED, "kind": kind, "model": EDITABLE_FILE_MODEL, "created_at": now, "updated_at": now, "created_ts": ts, "updated_ts": ts}
             task = dict(self._tasks[key])
             self._save_locked()
-        self._executor.submit(self._run_task, key, kind, prompt, base64_images, dict(identity), base_url)
+        threading.Thread(target=self._run_task, args=(key, kind, prompt, base64_images, dict(identity), base_url), name=f"{kind}-file-task-{task_id[:16]}", daemon=True).start()
         return _public_task(task)
 
     def _run_task(self, key: str, kind: str, prompt: str, base64_images: list[str], identity: dict[str, object], base_url: str) -> None:
