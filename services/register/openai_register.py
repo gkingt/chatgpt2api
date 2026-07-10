@@ -255,6 +255,20 @@ def _response_error_detail(resp, limit: int = 1200) -> str:
     return ", ".join(parts)
 
 
+def _openai_error_code(data: dict) -> str:
+    error = data.get("error") if isinstance(data, dict) else {}
+    if not isinstance(error, dict):
+        return ""
+    return str(error.get("code") or "").strip()
+
+
+def _openai_error_message(data: dict) -> str:
+    error = data.get("error") if isinstance(data, dict) else {}
+    if not isinstance(error, dict):
+        return str(data.get("message") or "").strip() if isinstance(data, dict) else ""
+    return str(error.get("message") or data.get("message") or "").strip()
+
+
 def _is_cloudflare_challenge(resp) -> bool:
     if resp is None:
         return False
@@ -789,8 +803,12 @@ class PlatformRegistrar:
         resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/user/register", json={"username": email, "password": password}, headers=headers, verify=False)
         if resp is None or resp.status_code != 200:
             data = _response_json(resp) if resp is not None else {}
-            if data.get("message") == "Failed to create account. Please try again.":
-                step(index, "注册失败提示: 邮箱域名很可能因滥用被封禁，请更换邮箱域名", "yellow")
+            error_code = _openai_error_code(data)
+            error_message = _openai_error_message(data)
+            if error_code == "invalid_auth_step":
+                step(index, "注册失败提示: OpenAI 返回 invalid_auth_step，当前会话步骤不匹配", "yellow")
+            elif error_code == "account_creation_failed" or error_message == "Failed to create account. Please try again.":
+                step(index, "注册失败提示: OpenAI 拒绝创建账号，通常是邮箱域名、IP 或会话风控触发，请更换邮箱域名/出口IP后重试", "yellow")
             detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""
             raise RuntimeError(error or f"user_register_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
         step(index, "提交注册密码完成")
@@ -844,8 +862,12 @@ class PlatformRegistrar:
         resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/create_account", json={"name": name, "birthdate": birthdate}, headers=headers, verify=False)
         if resp is None or resp.status_code not in (200, 302):
             data = _response_json(resp) if resp is not None else {}
-            if data.get("message") == "Failed to create account. Please try again.":
-                step(index, "创建账号失败提示: 邮箱域名很可能因滥用被封禁，请更换邮箱域名", "yellow")
+            error_code = _openai_error_code(data)
+            error_message = _openai_error_message(data)
+            if error_code == "invalid_auth_step":
+                step(index, "创建账号失败提示: OpenAI 返回 invalid_auth_step，当前会话步骤不匹配", "yellow")
+            elif error_code == "account_creation_failed" or error_message == "Failed to create account. Please try again.":
+                step(index, "创建账号失败提示: OpenAI 拒绝创建账号，通常是邮箱域名、IP 或会话风控触发，请更换邮箱域名/出口IP后重试", "yellow")
             detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""
             raise RuntimeError(error or f"create_account_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
         payload = _response_json(resp)
@@ -999,7 +1021,6 @@ class PlatformRegistrar:
             password = _random_password()
             first_name, last_name = _random_name()
             self._platform_authorize(email, index)
-            self._submit_email_continue(email, index)
             self._register_user(email, password, index)
             self._send_otp(index)
             step(index, "开始等待注册验证码")

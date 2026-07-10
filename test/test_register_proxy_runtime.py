@@ -339,7 +339,7 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
         self.assertTrue(any("token_len=15" in line and "so_token=yes" in line and "sdk=20260124ceb8" in line for line in log_lines))
         self.assertFalse(any("sentinel-secret" in line or "so-secret" in line for line in log_lines))
 
-    def test_register_submits_email_continue_before_password(self):
+    def test_register_skips_email_continue_after_platform_authorize(self):
         registrar = openai_register.PlatformRegistrar(proxy="")
         calls = []
 
@@ -370,10 +370,54 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
             registrar.close()
 
         self.assertEqual(result["email"], "user@example.com")
-        self.assertEqual(
-            calls[:6],
-            ["authorize", "email_continue", "password_register", "send_otp", "validate_otp", "create_account"],
-        )
+        self.assertEqual(calls[:5], ["authorize", "password_register", "send_otp", "validate_otp", "create_account"])
+        self.assertNotIn("email_continue", calls)
+
+    def test_register_user_logs_account_creation_failed_diagnostic(self):
+        registrar = openai_register.PlatformRegistrar(proxy="")
+        response = FakeResponse(status_code=400, headers={"content-type": "application/json"})
+        response.json = lambda: {
+            "error": {
+                "message": "Failed to create account. Please try again.",
+                "code": "account_creation_failed",
+            }
+        }
+        lines = []
+        try:
+            with patch.object(openai_register, "build_sentinel_tokens", return_value=openai_register.SentinelTokens("token")), patch.object(
+                openai_register,
+                "request_with_local_retry",
+                return_value=(response, ""),
+            ), patch.object(openai_register, "step", side_effect=lambda index, text, color="": lines.append(text)):
+                with self.assertRaisesRegex(RuntimeError, "account_creation_failed"):
+                    registrar._register_user("user@example.com", "Password123!", 1)
+        finally:
+            registrar.close()
+
+        self.assertTrue(any("邮箱域名、IP 或会话风控" in line for line in lines))
+
+    def test_register_user_logs_invalid_auth_step_diagnostic(self):
+        registrar = openai_register.PlatformRegistrar(proxy="")
+        response = FakeResponse(status_code=400, headers={"content-type": "application/json"})
+        response.json = lambda: {
+            "error": {
+                "message": "Invalid authorization step.",
+                "code": "invalid_auth_step",
+            }
+        }
+        lines = []
+        try:
+            with patch.object(openai_register, "build_sentinel_tokens", return_value=openai_register.SentinelTokens("token")), patch.object(
+                openai_register,
+                "request_with_local_retry",
+                return_value=(response, ""),
+            ), patch.object(openai_register, "step", side_effect=lambda index, text, color="": lines.append(text)):
+                with self.assertRaisesRegex(RuntimeError, "invalid_auth_step"):
+                    registrar._register_user("user@example.com", "Password123!", 1)
+        finally:
+            registrar.close()
+
+        self.assertTrue(any("会话步骤不匹配" in line for line in lines))
 
     def test_domain_stats_disable_low_success_domain_and_mail_provider_skips_it(self):
         original_file = openai_register.domain_stats_file
