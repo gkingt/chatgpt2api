@@ -12,6 +12,8 @@ import subprocess
 import threading
 import time
 import uuid
+import ssl
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -134,6 +136,26 @@ def _sdk_headers(user_agent: str, sec_ch_ua: str, referer: str = "") -> dict[str
     return headers
 
 
+def _fetch_sdk_text_with_urllib(url: str, headers: dict[str, str], timeout: float = 20) -> tuple[int, str]:
+    request = urllib.request.Request(url, headers=headers)
+    context = ssl._create_unverified_context()
+    with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+        body = response.read().decode("utf-8", "replace")
+        return int(response.getcode() or 0), body
+
+
+def _post_sentinel_req_with_urllib(url: str, payload: str, headers: dict[str, str], timeout: float = 30) -> tuple[int, dict]:
+    request = urllib.request.Request(url, data=payload.encode("utf-8"), headers=headers, method="POST")
+    context = ssl._create_unverified_context()
+    with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+        body = response.read().decode("utf-8", "replace")
+        try:
+            data = json.loads(body) if body else {}
+        except Exception:
+            data = {}
+        return int(response.getcode() or 0), data if isinstance(data, dict) else {}
+
+
 def _load_current_sdk(session: "Session", user_agent: str, sec_ch_ua: str) -> tuple[str, str, str]:
     now = time.time()
     with _sdk_cache_lock:
@@ -145,27 +167,49 @@ def _load_current_sdk(session: "Session", user_agent: str, sec_ch_ua: str) -> tu
         ):
             return str(_sdk_cache["source"]), str(_sdk_cache["url"]), str(_sdk_cache["version"])
 
+    bootstrap_headers = _sdk_headers(
+        user_agent,
+        sec_ch_ua,
+        "https://sentinel.openai.com/backend-api/sentinel/frame.html",
+    )
     bootstrap_resp = session.get(
         SENTINEL_SDK_BOOTSTRAP_URL,
-        headers=_sdk_headers(user_agent, sec_ch_ua, "https://sentinel.openai.com/backend-api/sentinel/frame.html"),
+        headers=bootstrap_headers,
         timeout=20,
         verify=False,
     )
-    if bootstrap_resp.status_code != 200:
+    bootstrap_status = int(bootstrap_resp.status_code or 0)
+    bootstrap_text = str(bootstrap_resp.text or "")
+    if bootstrap_status != 200:
+        try:
+            bootstrap_status, bootstrap_text = _fetch_sdk_text_with_urllib(
+                SENTINEL_SDK_BOOTSTRAP_URL,
+                bootstrap_headers,
+            )
+        except Exception:
+            pass
+    if bootstrap_status != 200:
         raise RuntimeError(f"sentinel_sdk_bootstrap_http_{bootstrap_resp.status_code}")
-    match = _SDK_SCRIPT_RE.search(str(bootstrap_resp.text or ""))
+    match = _SDK_SCRIPT_RE.search(bootstrap_text)
     if not match:
         raise RuntimeError("sentinel_sdk_url_not_found")
     sdk_url, sdk_version = match.group(1), match.group(2)
+    sdk_headers = _sdk_headers(user_agent, sec_ch_ua, SENTINEL_SDK_BOOTSTRAP_URL)
     sdk_resp = session.get(
         sdk_url,
-        headers=_sdk_headers(user_agent, sec_ch_ua, SENTINEL_SDK_BOOTSTRAP_URL),
+        headers=sdk_headers,
         timeout=20,
         verify=False,
     )
-    if sdk_resp.status_code != 200 or not str(sdk_resp.text or "").strip():
+    sdk_status = int(sdk_resp.status_code or 0)
+    source = str(sdk_resp.text or "")
+    if sdk_status != 200 or not source.strip():
+        try:
+            sdk_status, source = _fetch_sdk_text_with_urllib(sdk_url, sdk_headers)
+        except Exception:
+            pass
+    if sdk_status != 200 or not source.strip():
         raise RuntimeError(f"sentinel_sdk_http_{sdk_resp.status_code}")
-    source = str(sdk_resp.text)
     with _sdk_cache_lock:
         _sdk_cache.update({"source": source, "url": sdk_url, "version": sdk_version, "loaded_at": now})
     return source, sdk_url, sdk_version
@@ -199,14 +243,17 @@ def _post_sentinel_req(
 ) -> dict:
     base = _sentinel_base_from_sdk_url(sdk_url)
     origin = base.split("/backend-api/", 1)[0]
+    url = f"{base}req"
+    payload = _json_compact({"p": p_value, "id": device_id, "flow": flow})
+    headers = {
+        **_sdk_headers(user_agent, sec_ch_ua, f"{base}frame.html?sv={sdk_version}"),
+        "Content-Type": "text/plain;charset=UTF-8",
+        "Origin": origin,
+    }
     resp = session.post(
-        f"{base}req",
-        data=_json_compact({"p": p_value, "id": device_id, "flow": flow}),
-        headers={
-            **_sdk_headers(user_agent, sec_ch_ua, f"{base}frame.html?sv={sdk_version}"),
-            "Content-Type": "text/plain;charset=UTF-8",
-            "Origin": origin,
-        },
+        url,
+        data=payload,
+        headers=headers,
         timeout=30,
         verify=False,
     )
@@ -214,6 +261,13 @@ def _post_sentinel_req(
         data = resp.json() if resp.text else {}
     except Exception:
         data = {}
+    if resp.status_code != 200 or not isinstance(data, dict) or not data.get("token"):
+        try:
+            fallback_status, fallback_data = _post_sentinel_req_with_urllib(url, payload, headers)
+            if fallback_status == 200 and fallback_data.get("token"):
+                return fallback_data
+        except Exception:
+            pass
     if resp.status_code != 200 or not isinstance(data, dict) or not data.get("token"):
         detail = _json_compact(data)[:500] if data else str(getattr(resp, "text", "") or "")[:500]
         raise RuntimeError(f"sentinel_req_failed_{resp.status_code}: {detail}")

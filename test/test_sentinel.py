@@ -116,6 +116,66 @@ class CleanClosedOnSecondResponseProc(FakeProc):
 
 
 class SentinelOfficialSdkTests(unittest.TestCase):
+    def test_load_current_sdk_falls_back_to_urllib_when_session_is_forbidden(self):
+        class ForbiddenResponse:
+            status_code = 403
+            text = "forbidden"
+
+        class ForbiddenSession:
+            def get(self, *args, **kwargs):
+                return ForbiddenResponse()
+
+        fallback_calls = []
+
+        def fake_urllib_fetch(url, headers, timeout=20):
+            fallback_calls.append(url)
+            if url == sentinel.SENTINEL_SDK_BOOTSTRAP_URL:
+                return 200, "script.src='https://sentinel.openai.com/sentinel/current/sdk.js'"
+            return 200, "window.SentinelSDK = {};"
+
+        with patch.object(sentinel, "_fetch_sdk_text_with_urllib", side_effect=fake_urllib_fetch):
+            source, sdk_url, sdk_version = sentinel._load_current_sdk(
+                ForbiddenSession(),
+                "ua",
+                '"Chromium";v="145"',
+            )
+
+        self.assertEqual(source, "window.SentinelSDK = {};")
+        self.assertEqual(sdk_url, "https://sentinel.openai.com/sentinel/current/sdk.js")
+        self.assertEqual(sdk_version, "current")
+        self.assertEqual(fallback_calls, [sentinel.SENTINEL_SDK_BOOTSTRAP_URL, sdk_url])
+
+    def test_post_sentinel_req_falls_back_to_urllib_when_session_is_forbidden(self):
+        class ForbiddenResponse:
+            status_code = 403
+            text = "forbidden"
+
+            def json(self):
+                return {}
+
+        class ForbiddenSession:
+            def post(self, *args, **kwargs):
+                return ForbiddenResponse()
+
+        with patch.object(
+            sentinel,
+            "_post_sentinel_req_with_urllib",
+            return_value=(200, {"token": "sentinel-token", "so": {"required": True}}),
+        ) as fallback:
+            data = sentinel._post_sentinel_req(
+                ForbiddenSession(),
+                sdk_url="https://sentinel.openai.com/sentinel/current/sdk.js",
+                sdk_version="current",
+                flow="oauth_create_account",
+                p_value="payload",
+                device_id="device-id",
+                user_agent="ua",
+                sec_ch_ua='"Chromium";v="145"',
+            )
+
+        self.assertEqual(data["token"], "sentinel-token")
+        fallback.assert_called_once()
+
     def test_official_sdk_replies_to_multiple_sentinel_reqs(self):
         post_calls = []
 
