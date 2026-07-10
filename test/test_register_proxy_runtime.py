@@ -339,7 +339,7 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
         self.assertTrue(any("token_len=15" in line and "so_token=yes" in line and "sdk=20260124ceb8" in line for line in log_lines))
         self.assertFalse(any("sentinel-secret" in line or "so-secret" in line for line in log_lines))
 
-    def test_register_preserves_otp_step_before_create_account(self):
+    def test_register_submits_email_continue_before_password(self):
         registrar = openai_register.PlatformRegistrar(proxy="")
         calls = []
 
@@ -370,8 +370,10 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
             registrar.close()
 
         self.assertEqual(result["email"], "user@example.com")
-        self.assertEqual(calls[:5], ["authorize", "password_register", "send_otp", "validate_otp", "create_account"])
-        self.assertNotIn("email_continue", calls)
+        self.assertEqual(
+            calls[:6],
+            ["authorize", "email_continue", "password_register", "send_otp", "validate_otp", "create_account"],
+        )
 
     def test_domain_stats_disable_low_success_domain_and_mail_provider_skips_it(self):
         original_file = openai_register.domain_stats_file

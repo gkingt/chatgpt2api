@@ -999,6 +999,7 @@ class PlatformRegistrar:
             password = _random_password()
             first_name, last_name = _random_name()
             self._platform_authorize(email, index)
+            self._submit_email_continue(email, index)
             self._register_user(email, password, index)
             self._send_otp(index)
             step(index, "开始等待注册验证码")
