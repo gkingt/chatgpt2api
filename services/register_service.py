@@ -14,6 +14,7 @@ from services.register import mail_provider, openai_register
 
 
 REGISTER_FILE = DATA_DIR / "register.json"
+RUNNING_SAVE_INTERVAL_SECS = 2.0
 
 
 def _serialize_outlook_pool(credentials: list[dict]) -> str:
@@ -66,6 +67,10 @@ class RegisterService:
         self._runner: threading.Thread | None = None
         self._auto_stop_when_target_reached = False
         self._logs: list[dict] = []
+        self._last_running_save_at = 0.0
+        self._last_snapshot = ""
+        self._last_snapshot_payload: dict | None = None
+        self._last_snapshot_json = ""
         openai_register.register_log_sink = self._append_log
         self._config = self._load()
         if self._config["enabled"]:
@@ -81,11 +86,34 @@ class RegisterService:
         self._store_file.parent.mkdir(parents=True, exist_ok=True)
         self._store_file.write_text(json.dumps(self._config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
+    def _save_running_throttled(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._last_running_save_at < RUNNING_SAVE_INTERVAL_SECS:
+            return
+        self._last_running_save_at = now
+        self._save()
+
     def get(self) -> dict:
         with self._lock:
-            snapshot = json.loads(json.dumps({**self._config, "logs": self._logs[-300:]}, ensure_ascii=False))
-        self._redact_outlook_pools(snapshot)
+            source = {**self._config, "logs": self._logs[-300:]}
+            payload = json.dumps(source, ensure_ascii=False, sort_keys=True)
+            if payload == self._last_snapshot and self._last_snapshot_payload is not None:
+                snapshot = json.loads(json.dumps(self._last_snapshot_payload, ensure_ascii=False))
+            else:
+                snapshot = json.loads(payload)
+                self._redact_outlook_pools(snapshot)
+                self._last_snapshot = payload
+                self._last_snapshot_payload = json.loads(json.dumps(snapshot, ensure_ascii=False))
+                self._last_snapshot_json = json.dumps(snapshot, ensure_ascii=False)
         return snapshot
+
+    def snapshot_json(self) -> str:
+        with self._lock:
+            source = {**self._config, "logs": self._logs[-300:]}
+            payload = json.dumps(source, ensure_ascii=False, sort_keys=True)
+            if payload == self._last_snapshot and self._last_snapshot_json:
+                return self._last_snapshot_json
+        return json.dumps(self.get(), ensure_ascii=False)
 
     @staticmethod
     def _mask_email(email: str) -> str:
@@ -179,6 +207,10 @@ class RegisterService:
             self._config["enabled"] = True
             self._drop_mail_proxy()
             self._logs = []
+            self._last_snapshot = ""
+            self._last_snapshot_payload = None
+            self._last_snapshot_json = ""
+            self._last_running_save_at = 0.0
             openai_register.reset_cancel()
             mail_provider.set_cancel_checker(openai_register.ensure_not_cancelled)
             metrics = self._pool_metrics()
@@ -251,6 +283,9 @@ class RegisterService:
         with self._lock:
             self._logs.append({"time": _now(), "text": str(text), "level": str(color or "info")})
             self._logs = self._logs[-300:]
+            self._last_snapshot = ""
+            self._last_snapshot_payload = None
+            self._last_snapshot_json = ""
 
     def _pool_metrics(self) -> dict:
         items = account_service.list_accounts()
@@ -260,17 +295,19 @@ class RegisterService:
             "current_available": len(normal),
         }
 
-    def _target_reached(self, cfg: dict, success: int = 0) -> bool:
+    def _target_reached(self, cfg: dict, success: int = 0, *, metrics: dict | None = None, log_result: bool = True) -> bool:
         mode = str(cfg.get("mode") or "total")
-        metrics = self._pool_metrics()
-        self._bump(**metrics)
+        metrics = metrics or self._pool_metrics()
+        self._bump(save=False, **metrics)
         if mode == "quota":
             reached = metrics["current_quota"] >= int(cfg.get("target_quota") or 1)
-            self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，当前剩余额度={metrics['current_quota']}，目标额度={cfg.get('target_quota')}，{'跳过注册' if reached else '继续注册'}", "yellow")
+            if log_result:
+                self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，当前剩余额度={metrics['current_quota']}，目标额度={cfg.get('target_quota')}，{'跳过注册' if reached else '继续注册'}", "yellow")
             return reached
         if mode == "available":
             reached = metrics["current_available"] >= int(cfg.get("target_available") or 1)
-            self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，目标账号={cfg.get('target_available')}，当前剩余额度={metrics['current_quota']}，{'跳过注册' if reached else '继续注册'}", "yellow")
+            if log_result:
+                self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，目标账号={cfg.get('target_available')}，当前剩余额度={metrics['current_quota']}，{'跳过注册' if reached else '继续注册'}", "yellow")
             return reached
         return success >= int(cfg.get("total") or 1)
 
@@ -280,7 +317,7 @@ class RegisterService:
             return True
         return success + running < int(cfg.get("total") or 1)
 
-    def _bump(self, **updates) -> None:
+    def _bump(self, *, save: bool = True, force_save: bool = False, **updates) -> None:
         with self._lock:
             self._config["stats"].update(updates)
             stats = self._config["stats"]
@@ -297,32 +334,42 @@ class RegisterService:
                 stats["avg_seconds"] = round(elapsed / success, 1) if success else 0
                 stats["success_rate"] = round(success * 100 / max(1, success + fail), 1)
             self._config["stats"]["updated_at"] = _now()
-            self._save()
+            self._last_snapshot = ""
+            self._last_snapshot_payload = None
+            self._last_snapshot_json = ""
+            if save:
+                self._save_running_throttled(force=force_save)
 
     def _run(self) -> None:
-        threads = int(self.get()["threads"])
+        with self._lock:
+            cfg = json.loads(json.dumps(self._config, ensure_ascii=False))
+        threads = int(cfg["threads"])
         submitted, done, success, fail = 0, 0, 0, 0
         executor = ThreadPoolExecutor(max_workers=threads)
         try:
             futures = set()
             while True:
-                cfg = self.get()
-                target_reached = self._target_reached(cfg, success)
+                with self._lock:
+                    cfg = json.loads(json.dumps(self._config, ensure_ascii=False))
+                metrics = self._pool_metrics()
+                target_reached = self._target_reached(cfg, success, metrics=metrics)
                 while (
-                    self.get()["enabled"]
+                    cfg["enabled"]
                     and not target_reached
                     and len(futures) < threads
                     and self._can_submit_more(cfg, success, len(futures))
                 ):
                     submitted += 1
                     futures.add(executor.submit(openai_register.worker, submitted))
-                    target_reached = self._target_reached(cfg, success)
+                    if self._can_submit_more(cfg, success, len(futures)):
+                        continue
+                    target_reached = self._target_reached(cfg, success, metrics=metrics, log_result=False)
                 self._bump(running=len(futures), done=done, success=success, fail=fail)
-                if not self.get()["enabled"]:
+                if not cfg["enabled"]:
                     for future in futures:
                         future.cancel()
                 if not futures and (
-                    not self.get()["enabled"]
+                    not cfg["enabled"]
                     or target_reached
                     or (target_reached and self._auto_stop_when_target_reached)
                 ):

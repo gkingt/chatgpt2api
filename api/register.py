@@ -66,7 +66,7 @@ def create_router() -> APIRouter:
         async def stream():
             last = ""
             while True:
-                payload = json.dumps(register_service.get(), ensure_ascii=False)
+                payload = register_service.snapshot_json()
                 if payload != last:
                     last = payload
                     yield f"data: {payload}\n\n"

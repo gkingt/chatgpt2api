@@ -1,3 +1,4 @@
+import json
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -133,6 +134,59 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
         self.assertTrue(register_service._target_reached(cfg, success=2))
         self.assertFalse(register_service._can_submit_more(cfg, success=1, running=1))
         self.assertTrue(register_service._can_submit_more(cfg, success=1, running=0))
+
+    def test_register_snapshot_cache_keeps_outlook_pool_redaction_stable(self):
+        original_config = register_service._config
+        original_logs = register_service._logs
+        original_snapshot = register_service._last_snapshot
+        original_snapshot_payload = register_service._last_snapshot_payload
+        original_snapshot_json = register_service._last_snapshot_json
+        try:
+            register_service._logs = []
+            register_service._last_snapshot = ""
+            register_service._last_snapshot_payload = None
+            register_service._last_snapshot_json = ""
+            register_service._config = {
+                **original_config,
+                "mail": {
+                    "providers": [
+                        {
+                            "type": "outlook_token",
+                            "mailboxes": "user@example.com----password----client-id----refresh-token",
+                        }
+                    ]
+                },
+            }
+
+            first = register_service.get()
+            second = register_service.get()
+
+            self.assertEqual(first["mail"]["providers"][0]["mailboxes"], "")
+            self.assertEqual(second["mail"]["providers"][0]["mailboxes"], "")
+            self.assertEqual(second["mail"]["providers"][0]["mailboxes_count"], 1)
+            snapshot = json.loads(register_service.snapshot_json())
+            self.assertEqual(snapshot["mail"]["providers"][0]["mailboxes"], "")
+        finally:
+            register_service._config = original_config
+            register_service._logs = original_logs
+            register_service._last_snapshot = original_snapshot
+            register_service._last_snapshot_payload = original_snapshot_payload
+            register_service._last_snapshot_json = original_snapshot_json
+
+    def test_register_stats_save_is_throttled_while_running(self):
+        original_last_save_at = register_service._last_running_save_at
+        try:
+            register_service._last_running_save_at = 0.0
+            with patch.object(register_service, "_save") as mocked_save:
+                with patch("services.register_service.time.monotonic", side_effect=[10.0, 10.5, 11.0, 12.1]):
+                    register_service._bump(running=1)
+                    register_service._bump(running=2)
+                    register_service._bump(running=3)
+                    register_service._bump(running=4)
+
+            self.assertEqual(mocked_save.call_count, 2)
+        finally:
+            register_service._last_running_save_at = original_last_save_at
 
     def test_cloudflare_without_clearance_keeps_clear_register_error(self):
         fake_proxy = FakeProxySettings(bundle=None)
