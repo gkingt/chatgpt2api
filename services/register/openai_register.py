@@ -1080,12 +1080,9 @@ class PlatformRegistrar:
 
     def _send_otp(self, index: int) -> None:
         step(index, "开始发送验证码")
-        headers = self._navigate_headers(f"{auth_base}/email-verification")
-        _apply_sentinel_headers(headers, self._build_sentinel_tokens("authorize_continue"))
-        resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/email-otp/send", headers=headers, allow_redirects=True, verify=False)
+        resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/email-otp/send", headers=self._navigate_headers(f"{auth_base}/create-account/password"), allow_redirects=True, verify=False)
         if resp is None or resp.status_code not in (200, 302):
-            detail = _response_error_detail(resp)
-            raise RuntimeError(error or f"send_otp_http_{getattr(resp, 'status_code', 'unknown')}{', ' + detail if detail else ''}")
+            raise RuntimeError(error or f"send_otp_http_{getattr(resp, 'status_code', 'unknown')}")
         step(index, "发送验证码完成")
 
     def _validate_otp(self, code: str, index: int) -> str:
@@ -1339,13 +1336,6 @@ class PlatformRegistrar:
             code_verifier = self._platform_authorize(email, index)
             if not self.passwordless_signup:
                 self._start_passwordless_signup(index)
-            # 无论 authorize 是否已进入 /email-verification，都主动调用
-            # email-otp/send 确保邮件被真实下发。OpenAI 前端到达验证码页面
-            # 后会自行发这一步；autorize 本身不会自动发邮件。
-            try:
-                self._send_otp(index)
-            except Exception as exc:
-                step(index, f"主动发送 email-otp/send 失败（继续等待）: {exc}", "yellow")
             step(index, "已进入 passwordless signup，不创建本地不可用的随机密码")
             step(index, "开始等待注册验证码")
             code = wait_for_code(mailbox)
