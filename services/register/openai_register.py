@@ -35,8 +35,8 @@ base_dir = Path(__file__).resolve().parent
 config = {
     "mail": {
         "request_timeout": 30,
-        "wait_timeout": 30,
-        "wait_interval": 2,
+        "wait_timeout": 120,
+        "wait_interval": 3,
         "providers": [],
     },
     "proxy": "",
@@ -1011,13 +1011,31 @@ class PlatformRegistrar:
 
     def _start_passwordless_signup(self, index: int) -> None:
         step(index, "开始切换 passwordless signup 并发送验证码")
-        resp, error = request_with_local_retry(
-            self.session,
-            "post",
-            f"{auth_base}/api/accounts/passwordless/send-otp",
-            headers=self._json_headers(f"{auth_base}/create-account/password"),
-            verify=False,
-        )
+
+        def _do_send_otp(ua_override: str = "") -> tuple[Any, str]:
+            headers = self._json_headers(f"{auth_base}/create-account/password")
+            if ua_override:
+                headers["user-agent"] = ua_override
+            # 与 authorize_continue / user_register 一致注入 Sentinel Token，
+            # 否则 OpenAI 风控极易直接判机器流量并在 200 下静默丢弃邮件。
+            _apply_sentinel_headers(headers, self._build_sentinel_tokens("authorize_continue"))
+            return request_with_local_retry(
+                self.session,
+                "post",
+                f"{auth_base}/api/accounts/passwordless/send-otp",
+                headers=headers,
+                verify=False,
+            )
+
+        resp, error = _do_send_otp()
+        # 命中 Cloudflare challenge 时刷新 clearance 并重试一次
+        if _is_cloudflare_challenge(resp):
+            step(index, "passwordless send-otp 命中 Cloudflare，刷新 clearance 重试", "yellow")
+            bundle = proxy_settings.refresh_clearance(target_url=auth_base, proxy=self.proxy, force=True, upstream=True)
+            if bundle is not None:
+                resp, error = _do_send_otp(ua_override=str(bundle.user_agent or ""))
+            if _is_cloudflare_challenge(resp):
+                raise RuntimeError(f"passwordless_send_otp_cloudflare_challenge: {_response_error_detail(resp, 1200)}")
         if resp is None or resp.status_code != 200:
             data = _response_json(resp) if resp is not None else {}
             detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""

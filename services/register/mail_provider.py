@@ -234,8 +234,8 @@ def set_disabled_domains(domains: list[str] | set[str] | tuple[str, ...]) -> Non
 def _config(mail_config: dict) -> dict:
     return {
         "request_timeout": float(mail_config.get("request_timeout") or 30),
-        "wait_timeout": float(mail_config.get("wait_timeout") or 30),
-        "wait_interval": float(mail_config.get("wait_interval") or 2),
+        "wait_timeout": float(mail_config.get("wait_timeout") or 120),
+        "wait_interval": float(mail_config.get("wait_interval") or 3),
         "user_agent": str(mail_config.get("user_agent") or "Mozilla/5.0"),
         "proxy": str(mail_config.get("proxy") or "").strip(),
     }
