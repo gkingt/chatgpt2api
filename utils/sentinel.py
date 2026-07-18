@@ -27,9 +27,12 @@ class SentinelTokenGenerator:
     MAX_ATTEMPTS = 500_000
     ERROR_PREFIX = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D"
 
-    def __init__(self, device_id: str, ua: str):
+    def __init__(self, device_id: str, ua: str, screen_width: int = 1920, screen_height: int = 1080, hardware_concurrency: int = 16):
         self.device_id = device_id
         self.user_agent = ua
+        self.screen_width = int(screen_width or 1920)
+        self.screen_height = int(screen_height or 1080)
+        self.hardware_concurrency = int(hardware_concurrency or 16)
         self.sid = str(uuid.uuid4())
 
     @staticmethod
@@ -48,7 +51,7 @@ class SentinelTokenGenerator:
     def _get_config(self) -> list:
         perf_now = random.uniform(1000, 50000)
         return [
-            "1920x1080",
+            f"{self.screen_width}x{self.screen_height}",
             time.strftime("%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)", time.gmtime()),
             4294705152,
             random.random(),
@@ -64,7 +67,7 @@ class SentinelTokenGenerator:
             perf_now,
             self.sid,
             "",
-            random.choice([4, 8, 12, 16]),
+            self.hardware_concurrency,
             time.time() * 1000 - perf_now,
         ]
 
@@ -283,6 +286,9 @@ def _run_official_sdk(
     sec_ch_ua: str,
     include_so: bool,
     observer_wait_ms: int,
+    screen_width: int = 1920,
+    screen_height: int = 1080,
+    hardware_concurrency: int = 16,
 ) -> SentinelTokenBundle:
     node = shutil.which("node")
     if not node:
@@ -358,6 +364,9 @@ def _run_official_sdk(
             "includeSo": include_so,
             "observerWaitMs": max(0, int(observer_wait_ms or 0)),
             "pageUrl": "https://auth.openai.com/about-you",
+            "screenWidth": int(screen_width or 1920),
+            "screenHeight": int(screen_height or 1080),
+            "hardwareConcurrency": int(hardware_concurrency or 16),
         },
         "start",
     )
@@ -457,10 +466,19 @@ def _build_legacy_sentinel_token(
     *,
     user_agent: str = "",
     sec_ch_ua: str = "",
+    screen_width: int = 1920,
+    screen_height: int = 1080,
+    hardware_concurrency: int = 16,
 ) -> tuple[str, str]:
     ua = user_agent or DEFAULT_SENTINEL_USER_AGENT
     ch_ua = sec_ch_ua or DEFAULT_SENTINEL_SEC_CH_UA
-    generator = SentinelTokenGenerator(device_id, ua)
+    generator = SentinelTokenGenerator(
+        device_id,
+        ua,
+        screen_width=screen_width,
+        screen_height=screen_height,
+        hardware_concurrency=hardware_concurrency,
+    )
     resp = session.post(
         "https://sentinel.openai.com/backend-api/sentinel/req",
         data=_json_compact({"p": generator.generate_requirements_token(), "id": device_id, "flow": flow}),
@@ -505,6 +523,9 @@ def build_sentinel_tokens(
     sec_ch_ua: str = "",
     include_so: bool = False,
     observer_wait_ms: int = SENTINEL_OBSERVER_WAIT_MS,
+    screen_width: int = 1920,
+    screen_height: int = 1080,
+    hardware_concurrency: int = 16,
 ) -> SentinelTokenBundle:
     ua = user_agent or DEFAULT_SENTINEL_USER_AGENT
     ch_ua = sec_ch_ua or DEFAULT_SENTINEL_SEC_CH_UA
@@ -520,6 +541,9 @@ def build_sentinel_tokens(
                     sec_ch_ua=ch_ua,
                     include_so=include_so,
                     observer_wait_ms=observer_wait_ms,
+                    screen_width=screen_width,
+                    screen_height=screen_height,
+                    hardware_concurrency=hardware_concurrency,
                 )
                 break
             except Exception as exc:
@@ -544,6 +568,9 @@ def build_sentinel_tokens(
             flow,
             user_agent=ua,
             sec_ch_ua=ch_ua,
+            screen_width=screen_width,
+            screen_height=screen_height,
+            hardware_concurrency=hardware_concurrency,
         )
         return SentinelTokenBundle(sentinel_token=sentinel_token, oai_sc=oai_sc)
 
@@ -555,6 +582,9 @@ def build_sentinel_token(
     *,
     user_agent: str = "",
     sec_ch_ua: str = "",
+    screen_width: int = 1920,
+    screen_height: int = 1080,
+    hardware_concurrency: int = 16,
 ) -> tuple[str, str]:
     bundle = build_sentinel_tokens(
         session,
@@ -562,5 +592,8 @@ def build_sentinel_token(
         flow,
         user_agent=user_agent,
         sec_ch_ua=sec_ch_ua,
+        screen_width=screen_width,
+        screen_height=screen_height,
+        hardware_concurrency=hardware_concurrency,
     )
     return bundle.sentinel_token, bundle.oai_sc

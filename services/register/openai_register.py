@@ -57,6 +57,8 @@ platform_oauth_client_id = "app_2SKx67EdpoN0G6j64rFvigXD"
 platform_oauth_redirect_uri = f"{platform_base}/auth/callback"
 platform_oauth_audience = "https://api.openai.com/v1"
 platform_auth0_client = "eyJuYW1lIjoiYXV0aDAtc3BhLWpzIiwidmVyc2lvbiI6IjEuMjEuMCJ9"
+
+# 固定的最后回退指纹（仅当未通过 BrowserProfile 注入时使用）
 user_agent = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -64,7 +66,97 @@ user_agent = (
 )
 sec_ch_ua = '"Google Chrome";v="145", "Not?A_Brand";v="8", "Chromium";v="145"'
 sec_ch_ua_full_version_list = '"Chromium";v="145.0.0.0", "Not:A-Brand";v="99.0.0.0", "Google Chrome";v="145.0.0.0"'
-default_timeout = 30
+
+# 常见真实 Chrome/Edge 大版本池（当前主流覆盖范围）
+_CHROME_MAJOR_VERSIONS = [130, 131, 132, 133, 134, 135]
+# 合理的 Windows 平台 + 版本号
+_WINDOWS_PROFILES = [
+    ("Windows", "10.0.0", "Windows NT 10.0"),
+    ("Windows", "11.0.0", "Windows NT 10.0"),  # Win11 仍报告 Windows NT 10.0
+    ("Windows", "15.0.0", "Windows NT 10.0"),
+]
+# 常见桌面屏幕分辨率（横向 x 纵向）
+_SCREEN_RESOLUTIONS = [
+    (1920, 1080),
+    (2560, 1440),
+    (1366, 768),
+    (1536, 864),
+    (1440, 900),
+    (1680, 1050),
+    (1600, 900),
+    (1280, 720),
+]
+_NOT_A_BRAND_POOL = [
+    ('"Not?A_Brand"', '"8"'),
+    ('"Not/A)Brand"', '"99"'),
+    ('"Not.A/Brand"', '"8"'),
+    ('"Not A(Brand"', '"8"'),
+    ('"Not?A(Brand"', '"24"'),
+    ('"Not)A_Brand"', '"8"'),
+    ('"Not:B-Brand"', '"99"'),
+]
+
+
+@dataclass(frozen=True)
+class BrowserProfile:
+    """按账号随机生成的浏览器表面，保持在单次注册流程中一致。"""
+    user_agent: str
+    sec_ch_ua: str
+    sec_ch_ua_full_version_list: str
+    sec_ch_ua_platform: str
+    sec_ch_ua_platform_version: str
+    sec_ch_ua_arch: str
+    sec_ch_ua_bitness: str
+    screen_width: int
+    screen_height: int
+    hardware_concurrency: int
+    accept_language: str
+
+
+def _random_browser_profile() -> BrowserProfile:
+    """按真实使用分布随机选取一组一致的浏览器表面特征。"""
+    chrome_major = random.choice(_CHROME_MAJOR_VERSIONS)
+    chrome_full = f"{chrome_major}.0.0.0"
+    platform_sparse, platform_version, platform_nt = random.choice(_WINDOWS_PROFILES)
+    not_brand_name, not_brand_ver = random.choice(_NOT_A_BRAND_POOL)
+    # Client Hints 三元：Chromium / Google Chrome / Not*A Brand，顺序会随机打乱
+    parts = [
+        f'"Google Chrome";v="{chrome_major}"',
+        f'"Chromium";v="{chrome_major}"',
+        f'{not_brand_name};v={not_brand_ver}',
+    ]
+    random.shuffle(parts)
+    sec_ch_ua_value = ", ".join(parts)
+    full_parts = [
+        (f'"Chromium";v="{chrome_full}"'),
+        (f'"Google Chrome";v="{chrome_full}"'),
+        (f'{not_brand_name};v="{random.choice(["99", chrome_full, "0"])}"') if not_brand_name else f'"Not:A-Brand";v="99.0.0.0"',
+    ]
+    random.shuffle(full_parts)
+    sec_ch_ua_full_value = ", ".join(full_parts)
+    width, height = random.choice(_SCREEN_RESOLUTIONS)
+    ua = (
+        f"Mozilla/5.0 ({platform_nt}; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{chrome_major}.0.0.0 Safari/537.36"
+    )
+    return BrowserProfile(
+        user_agent=ua,
+        sec_ch_ua=sec_ch_ua_value.replace(not_brand_name, not_brand_name),
+        sec_ch_ua_full_version_list=sec_ch_ua_full_value,
+        sec_ch_ua_platform=f'"{platform_sparse}"',
+        sec_ch_ua_platform_version=f'"{platform_version}"',
+        sec_ch_ua_arch='"x86_64"',
+        sec_ch_ua_bitness='"64"',
+        screen_width=width,
+        screen_height=height,
+        hardware_concurrency=random.choice([4, 6, 8, 12, 16]),
+        accept_language=random.choice(["en-US,en;q=0.9", "en-US,en;q=0.8", "en-GB,en-US;q=0.9,en;q=0.8"]),
+    )
+
+
+_default_timeout = 30
+default_timeout = _default_timeout
 print_lock = threading.Lock()
 stats_lock = threading.Lock()
 stats = {"done": 0, "success": 0, "fail": 0, "start_time": 0.0}
@@ -95,44 +187,71 @@ class SentinelTokens:
 class RegistrationCancelled(RuntimeError):
     pass
 
-common_headers = {
-    "accept": "application/json",
-    "accept-language": "en-US,en;q=0.9",
-    "content-type": "application/json",
-    "origin": auth_base,
-    "priority": "u=1, i",
-    "user-agent": user_agent,
-    "sec-ch-ua": sec_ch_ua,
-    "sec-ch-ua-arch": '"x86_64"',
-    "sec-ch-ua-bitness": '"64"',
-    "sec-ch-ua-full-version-list": sec_ch_ua_full_version_list,
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-model": '""',
-    "sec-ch-ua-platform": '"Windows"',
-    "sec-ch-ua-platform-version": '"10.0.0"',
-    "sec-fetch-dest": "empty",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-site": "same-origin",
-}
 
-navigate_headers = {
-    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "accept-language": "en-US,en;q=0.9",
-    "user-agent": user_agent,
-    "sec-ch-ua": sec_ch_ua,
-    "sec-ch-ua-arch": '"x86_64"',
-    "sec-ch-ua-bitness": '"64"',
-    "sec-ch-ua-full-version-list": sec_ch_ua_full_version_list,
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-model": '""',
-    "sec-ch-ua-platform": '"Windows"',
-    "sec-ch-ua-platform-version": '"10.0.0"',
-    "sec-fetch-dest": "document",
-    "sec-fetch-mode": "navigate",
-    "sec-fetch-site": "same-origin",
-    "sec-fetch-user": "?1",
-    "upgrade-insecure-requests": "1",
-}
+def _default_profile() -> BrowserProfile:
+    """兼容历史接口：返回一个稳定的默认 BrowserProfile。"""
+    return BrowserProfile(
+        user_agent=user_agent,
+        sec_ch_ua=sec_ch_ua,
+        sec_ch_ua_full_version_list=sec_ch_ua_full_version_list,
+        sec_ch_ua_platform='"Windows"',
+        sec_ch_ua_platform_version='"10.0.0"',
+        sec_ch_ua_arch='"x86_64"',
+        sec_ch_ua_bitness='"64"',
+        screen_width=1920,
+        screen_height=1080,
+        hardware_concurrency=16,
+        accept_language="en-US,en;q=0.9",
+    )
+
+
+def _build_common_headers(profile: BrowserProfile) -> dict[str, str]:
+    return {
+        "accept": "application/json",
+        "accept-language": profile.accept_language,
+        "content-type": "application/json",
+        "origin": auth_base,
+        "priority": "u=1, i",
+        "user-agent": profile.user_agent,
+        "sec-ch-ua": profile.sec_ch_ua,
+        "sec-ch-ua-arch": profile.sec_ch_ua_arch,
+        "sec-ch-ua-bitness": profile.sec_ch_ua_bitness,
+        "sec-ch-ua-full-version-list": profile.sec_ch_ua_full_version_list,
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-model": '""',
+        "sec-ch-ua-platform": profile.sec_ch_ua_platform,
+        "sec-ch-ua-platform-version": profile.sec_ch_ua_platform_version,
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+    }
+
+
+def _build_navigate_headers(profile: BrowserProfile) -> dict[str, str]:
+    return {
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "accept-language": profile.accept_language,
+        "user-agent": profile.user_agent,
+        "sec-ch-ua": profile.sec_ch_ua,
+        "sec-ch-ua-arch": profile.sec_ch_ua_arch,
+        "sec-ch-ua-bitness": profile.sec_ch_ua_bitness,
+        "sec-ch-ua-full-version-list": profile.sec_ch_ua_full_version_list,
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-model": '""',
+        "sec-ch-ua-platform": profile.sec_ch_ua_platform,
+        "sec-ch-ua-platform-version": profile.sec_ch_ua_platform_version,
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-user": "?1",
+        "upgrade-insecure-requests": "1",
+    }
+
+
+# 缓存的默认 Headers，用于无关历史的独立辅助函数（例如 validate_otp）。
+_default_profile_cache = _default_profile()
+common_headers = _build_common_headers(_default_profile_cache)
+navigate_headers = _build_navigate_headers(_default_profile_cache)
 
 
 def log(text: str, color: str = "") -> None:
@@ -387,9 +506,12 @@ class SentinelTokenGenerator:
     MAX_ATTEMPTS = 500000
     ERROR_PREFIX = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D"
 
-    def __init__(self, device_id: str, ua: str):
+    def __init__(self, device_id: str, ua: str, screen_width: int = 1920, screen_height: int = 1080, hardware_concurrency: int = 16):
         self.device_id = device_id
         self.user_agent = ua
+        self.screen_width = screen_width
+        self.screen_height = screen_height
+        self.hardware_concurrency = hardware_concurrency
         self.sid = str(uuid.uuid4())
 
     @staticmethod
@@ -408,7 +530,7 @@ class SentinelTokenGenerator:
     def _get_config(self) -> list:
         perf_now = random.uniform(1000, 50000)
         return [
-            "1920x1080",
+            f"{self.screen_width}x{self.screen_height}",
             time.strftime("%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)", time.gmtime()),
             4294705152,
             random.random(),
@@ -424,7 +546,7 @@ class SentinelTokenGenerator:
             perf_now,
             self.sid,
             "",
-            random.choice([4, 8, 12, 16]),
+            self.hardware_concurrency,
             time.time() * 1000 - perf_now,
         ]
 
@@ -513,15 +635,29 @@ def _so_shape(value: object) -> str:
     return type(value).__name__
 
 
-def build_sentinel_tokens(session: requests.Session, device_id: str, flow: str) -> SentinelTokens:
+def build_sentinel_tokens(
+    session: requests.Session,
+    device_id: str,
+    flow: str,
+    *,
+    user_agent_override: str = "",
+    sec_ch_ua_override: str = "",
+    include_so_override: bool | None = None,
+    screen_width: int = 1920,
+    screen_height: int = 1080,
+    hardware_concurrency: int = 16,
+) -> SentinelTokens:
     bundle = _build_sentinel_tokens(
         session,
         device_id,
         flow,
-        user_agent=user_agent,
-        sec_ch_ua=sec_ch_ua,
-        include_so=flow == "oauth_create_account",
+        user_agent=user_agent_override or user_agent,
+        sec_ch_ua=sec_ch_ua_override or sec_ch_ua,
+        include_so=(flow == "oauth_create_account") if include_so_override is None else include_so_override,
         observer_wait_ms=SENTINEL_OBSERVER_WAIT_MS,
+        screen_width=screen_width,
+        screen_height=screen_height,
+        hardware_concurrency=hardware_concurrency,
     )
     return SentinelTokens(
         token=bundle.sentinel_token,
@@ -534,8 +670,27 @@ def build_sentinel_tokens(session: requests.Session, device_id: str, flow: str) 
     )
 
 
-def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -> str:
-    sentinel_value, _oai_sc = _build_sentinel_token_tuple(session, device_id, flow, user_agent=user_agent, sec_ch_ua=sec_ch_ua)
+def build_sentinel_token(
+    session: requests.Session,
+    device_id: str,
+    flow: str,
+    *,
+    user_agent_override: str = "",
+    sec_ch_ua_override: str = "",
+    screen_width: int = 1920,
+    screen_height: int = 1080,
+    hardware_concurrency: int = 16,
+) -> str:
+    sentinel_value, _oai_sc = _build_sentinel_token_tuple(
+        session,
+        device_id,
+        flow,
+        user_agent=user_agent_override or user_agent,
+        sec_ch_ua=sec_ch_ua_override or sec_ch_ua,
+        screen_width=screen_width,
+        screen_height=screen_height,
+        hardware_concurrency=hardware_concurrency,
+    )
     return sentinel_value
 
 
@@ -588,15 +743,38 @@ def request_with_local_retry(session: requests.Session, method: str, url: str, r
     return None, last_error
 
 
-def validate_otp(session: requests.Session, device_id: str, code: str):
-    headers = dict(common_headers)
+def validate_otp(
+    session: requests.Session,
+    device_id: str,
+    code: str,
+    *,
+    base_headers: dict[str, str] | None = None,
+    user_agent_override: str = "",
+    sec_ch_ua_override: str = "",
+    screen_width: int = 1920,
+    screen_height: int = 1080,
+    hardware_concurrency: int = 16,
+):
+    headers = dict(base_headers or common_headers)
     headers["referer"] = f"{auth_base}/email-verification"
     headers["oai-device-id"] = device_id
     headers.update(_make_trace_headers())
     resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/email-otp/validate", json={"code": code}, headers=headers, verify=False)
     if resp is not None and resp.status_code == 200:
         return resp, ""
-    _apply_sentinel_headers(headers, build_sentinel_tokens(session, device_id, "authorize_continue"))
+    _apply_sentinel_headers(
+        headers,
+        build_sentinel_tokens(
+            session,
+            device_id,
+            "authorize_continue",
+            user_agent_override=user_agent_override,
+            sec_ch_ua_override=sec_ch_ua_override,
+            screen_width=screen_width,
+            screen_height=screen_height,
+            hardware_concurrency=hardware_concurrency,
+        ),
+    )
     resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/email-otp/validate", json={"code": code}, headers=headers, verify=False)
     return resp, error
 
@@ -736,6 +914,9 @@ class PlatformRegistrar:
         self.proxy = proxy
         self.session = create_session(proxy)
         self.device_id = str(uuid.uuid4())
+        self.profile: BrowserProfile = _random_browser_profile()
+        self.common_headers = _build_common_headers(self.profile)
+        self.navigate_headers = _build_navigate_headers(self.profile)
         self.code_verifier = ""
         self.passwordless_signup = False
         self.last_otp_continue_url = ""
@@ -747,17 +928,43 @@ class PlatformRegistrar:
             _untrack_session(self.session)
 
     def _navigate_headers(self, referer: str = "") -> dict[str, str]:
-        headers = dict(navigate_headers)
+        headers = dict(self.navigate_headers)
         if referer:
             headers["referer"] = referer
         return proxy_settings.build_headers(headers, target_url=auth_base, proxy=self.proxy, upstream=True)
 
     def _json_headers(self, referer: str) -> dict[str, str]:
-        headers = dict(common_headers)
+        headers = dict(self.common_headers)
         headers["referer"] = referer
         headers["oai-device-id"] = self.device_id
         headers.update(_make_trace_headers())
         return headers
+
+    def _build_sentinel_tokens(self, flow: str, *, include_so: bool = False) -> "SentinelTokens":
+        return build_sentinel_tokens(
+            self.session,
+            self.device_id,
+            flow,
+            user_agent=self.profile.user_agent,
+            sec_ch_ua=self.profile.sec_ch_ua,
+            include_so=include_so,
+            screen_width=self.profile.screen_width,
+            screen_height=self.profile.screen_height,
+            hardware_concurrency=self.profile.hardware_concurrency,
+        )
+
+    def _build_sentinel_token(self, flow: str) -> str:
+        sentinel_value, _oai_sc = _build_sentinel_token_tuple(
+            self.session,
+            self.device_id,
+            flow,
+            user_agent=self.profile.user_agent,
+            sec_ch_ua=self.profile.sec_ch_ua,
+            screen_width=self.profile.screen_width,
+            screen_height=self.profile.screen_height,
+            hardware_concurrency=self.profile.hardware_concurrency,
+        )
+        return sentinel_value
 
     def _platform_authorize(self, email: str, index: int) -> str:
         step(index, "开始 platform authorize")
@@ -821,7 +1028,7 @@ class PlatformRegistrar:
     def _register_user(self, email: str, password: str, index: int) -> None:
         step(index, "开始提交注册密码")
         headers = self._json_headers(f"{auth_base}/create-account/password")
-        _apply_sentinel_headers(headers, build_sentinel_tokens(self.session, self.device_id, "username_password_create"))
+        _apply_sentinel_headers(headers, self._build_sentinel_tokens("username_password_create"))
         resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/user/register", json={"username": email, "password": password}, headers=headers, verify=False)
         if resp is None or resp.status_code != 200:
             data = _response_json(resp) if resp is not None else {}
@@ -838,7 +1045,7 @@ class PlatformRegistrar:
     def _submit_email_continue(self, email: str, index: int, referer: str = "") -> None:
         step(index, "开始提交注册邮箱")
         headers = self._json_headers(referer or f"{auth_base}/create-account")
-        _apply_sentinel_headers(headers, build_sentinel_tokens(self.session, self.device_id, "authorize_continue"))
+        _apply_sentinel_headers(headers, self._build_sentinel_tokens("authorize_continue"))
         resp, error = request_with_local_retry(
             self.session,
             "post",
@@ -862,7 +1069,17 @@ class PlatformRegistrar:
 
     def _validate_otp(self, code: str, index: int) -> str:
         step(index, f"开始校验验证码 {code}")
-        resp, error = validate_otp(self.session, self.device_id, code)
+        resp, error = validate_otp(
+            self.session,
+            self.device_id,
+            code,
+            base_headers=self.common_headers,
+            user_agent_override=self.profile.user_agent,
+            sec_ch_ua_override=self.profile.sec_ch_ua,
+            screen_width=self.profile.screen_width,
+            screen_height=self.profile.screen_height,
+            hardware_concurrency=self.profile.hardware_concurrency,
+        )
         if resp is None or resp.status_code != 200:
             raise RuntimeError(error or f"validate_otp_http_{getattr(resp, 'status_code', 'unknown')}")
         payload = _response_json(resp)
@@ -895,7 +1112,7 @@ class PlatformRegistrar:
     def _create_account(self, name: str, birthdate: str, index: int, referer: str = "") -> str:
         step(index, "开始创建账号资料")
         headers = self._json_headers(referer or f"{auth_base}/about-you")
-        sentinel_tokens = build_sentinel_tokens(self.session, self.device_id, "oauth_create_account")
+        sentinel_tokens = self._build_sentinel_tokens("oauth_create_account", include_so=True)
         if not sentinel_tokens.so_token:
             raise RuntimeError("OpenAI-Sentinel-SO-Token 生成失败")
         _apply_sentinel_headers(headers, sentinel_tokens, require_so_header=True)
@@ -976,11 +1193,23 @@ class PlatformRegistrar:
             # [补丁2] 引入 PR 中的分步式流程: 提交流箱
             step(index, "开始提交邮箱")
             def _do_authorize_continue():
-                h = dict(common_headers)
+                h = dict(self.common_headers)
                 h["referer"] = f"{auth_base}/log-in?usernameKind=email"
                 h["oai-device-id"] = login_device_id
                 h.update(_make_trace_headers())
-                _apply_sentinel_headers(h, build_sentinel_tokens(login_session, login_device_id, "authorize_continue"))
+                _apply_sentinel_headers(
+                    h,
+                    build_sentinel_tokens(
+                        login_session,
+                        login_device_id,
+                        "authorize_continue",
+                        user_agent_override=self.profile.user_agent,
+                        sec_ch_ua_override=self.profile.sec_ch_ua,
+                        screen_width=self.profile.screen_width,
+                        screen_height=self.profile.screen_height,
+                        hardware_concurrency=self.profile.hardware_concurrency,
+                    ),
+                )
                 return request_with_local_retry(
                     login_session, "post",
                     f"{auth_base}/api/accounts/authorize/continue",
@@ -1010,11 +1239,23 @@ class PlatformRegistrar:
 
             # 走正常的校验密码逻辑
             step(index, "开始密码校验")
-            headers = dict(common_headers)
+            headers = dict(self.common_headers)
             headers["referer"] = f"{auth_base}/log-in/password"
             headers["oai-device-id"] = login_device_id
             headers.update(_make_trace_headers())
-            _apply_sentinel_headers(headers, build_sentinel_tokens(login_session, login_device_id, "password_verify"))
+            _apply_sentinel_headers(
+                headers,
+                build_sentinel_tokens(
+                    login_session,
+                    login_device_id,
+                    "password_verify",
+                    user_agent_override=self.profile.user_agent,
+                    sec_ch_ua_override=self.profile.sec_ch_ua,
+                    screen_width=self.profile.screen_width,
+                    screen_height=self.profile.screen_height,
+                    hardware_concurrency=self.profile.hardware_concurrency,
+                ),
+            )
             resp, error = request_with_local_retry(login_session, "post", f"{auth_base}/api/accounts/password/verify", json={"password": password}, headers=headers, allow_redirects=False, verify=False)
             if resp is None or resp.status_code != 200:
                 detail = _response_error_detail(resp)
@@ -1030,7 +1271,17 @@ class PlatformRegistrar:
                 code = wait_for_code(mailbox)
                 if not code:
                     raise RuntimeError("独立登录等待验证码超时")
-                resp, reason = validate_otp(login_session, login_device_id, code)
+                resp, reason = validate_otp(
+                    login_session,
+                    login_device_id,
+                    code,
+                    base_headers=self.common_headers,
+                    user_agent_override=self.profile.user_agent,
+                    sec_ch_ua_override=self.profile.sec_ch_ua,
+                    screen_width=self.profile.screen_width,
+                    screen_height=self.profile.screen_height,
+                    hardware_concurrency=self.profile.hardware_concurrency,
+                )
                 if resp is None or resp.status_code != 200:
                     detail = _response_error_detail(resp)
                     if detail:
