@@ -249,6 +249,13 @@ def _random_subdomain_label() -> str:
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=random.randint(4, 10)))
 
 
+def _random_subdomain_suffix() -> str:
+    chars = [random.choice(string.ascii_lowercase), random.choice(string.digits)]
+    chars.extend(random.choices(string.ascii_lowercase + string.digits, k=3))
+    random.shuffle(chars)
+    return "".join(chars)
+
+
 def _next_domain(domains: list[str]) -> str:
     global domain_index
     domains = [str(item).strip() for item in domains if str(item).strip()]
@@ -280,6 +287,19 @@ def _normalize_string_list(value: Any) -> list[str]:
         return [str(item).strip() for item in value if str(item).strip()]
     text = str(value or "").strip()
     return [text] if text else []
+
+
+def _normalize_dns_name(value: Any, field: str) -> str:
+    text = str(value or "").strip().strip(".").lower()
+    if not text:
+        raise RuntimeError(f"{field} 不能为空")
+    labels = text.split(".")
+    if any(not label for label in labels):
+        raise RuntimeError(f"{field} 格式不正确")
+    for label in labels:
+        if len(label) > 63 or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label):
+            raise RuntimeError(f"{field} 包含非法标签: {label}")
+    return text
 
 
 def _create_session(conf: dict):
@@ -450,7 +470,19 @@ class CloudflareTempMailProvider(BaseMailProvider):
         super().__init__(conf, str(entry.get("provider_ref") or ""))
         self.api_base = str(entry["api_base"]).rstrip("/")
         self.admin_password = str(entry["admin_password"]).strip()
-        self.domain = entry.get("domain") or []
+        self.domain = _normalize_string_list(entry.get("domain"))
+        self.subdomain = _normalize_string_list(entry.get("subdomain"))
+        self.subdomain_levels = _normalize_string_list(entry.get("subdomain_levels"))
+        suffix_value = entry.get("append_random_suffix", True)
+        if isinstance(suffix_value, bool):
+            self.append_random_suffix = suffix_value
+        else:
+            self.append_random_suffix = str(suffix_value).strip().lower() not in {"0", "false", "no", "off"}
+        try:
+            depth = int(entry.get("random_subdomain_depth") or 1)
+        except (TypeError, ValueError):
+            depth = 1
+        self.random_subdomain_depth = max(1, min(5, depth))
         self.session = _create_session(conf)
 
     def _request(self, method: str, path: str, headers: dict | None = None, params: dict | None = None, payload: dict | None = None, expected: tuple[int, ...] = (200,)):
@@ -459,8 +491,39 @@ class CloudflareTempMailProvider(BaseMailProvider):
             raise RuntimeError(f"CloudflareTempMail 请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
         return {} if resp.status_code == 204 else resp.json()
 
+    def _resolve_domain(self) -> str:
+        base_domain = _normalize_dns_name(_next_domain(self.domain), "CloudflareTempMail 根域名")
+        if self.subdomain_levels:
+            levels = [
+                _normalize_dns_name(value, f"CloudflareTempMail 第 {index} 级域名")
+                for index, value in enumerate(self.subdomain_levels, start=1)
+            ]
+            if any("." in level for level in levels):
+                raise RuntimeError("CloudflareTempMail 手动域名每一级只能填写一个标签，不能包含点号")
+            if self.append_random_suffix:
+                levels = [
+                    _normalize_dns_name(
+                        f"{level}{_random_subdomain_suffix()}",
+                        f"CloudflareTempMail 第 {index} 级域名（含随机后缀）",
+                    )
+                    for index, level in enumerate(levels, start=1)
+                ]
+            return f"{'.'.join(reversed(levels))}.{base_domain}"
+        if self.subdomain:
+            custom = _normalize_dns_name(random.choice(self.subdomain), "CloudflareTempMail N 级域名")
+            if custom == base_domain or custom.endswith(f".{base_domain}"):
+                return custom
+            return f"{custom}.{base_domain}"
+        prefix = ".".join(_random_subdomain_label() for _ in range(self.random_subdomain_depth))
+        return f"{prefix}.{base_domain}"
+
     def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
-        data = self._request("POST", "/admin/new_address", headers={"x-admin-auth": self.admin_password}, payload={"enablePrefix": True, "name": username or _random_mailbox_name(), "domain": _next_domain(self.domain)})
+        data = self._request(
+            "POST",
+            "/admin/new_address",
+            headers={"x-admin-auth": self.admin_password},
+            payload={"enablePrefix": True, "name": username or _random_mailbox_name(), "domain": self._resolve_domain()},
+        )
         address = str(data.get("address") or "").strip()
         token = str(data.get("jwt") or "").strip()
         if not address or not token:

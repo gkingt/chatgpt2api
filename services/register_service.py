@@ -37,6 +37,14 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _safe_bool(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() not in {"0", "false", "no", "off"}
+
+
 def _default_config() -> dict:
     return {**openai_register.config, "mode": "total", "target_quota": 100, "target_available": 10, "check_interval": 5, "enabled": False, "stats": {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": openai_register.config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "current_quota": 0, "current_available": 0}}
 
@@ -53,6 +61,24 @@ def _normalize(raw: dict) -> dict:
     cfg["proxy"] = str(cfg.get("proxy") or "").strip()
     if isinstance(cfg.get("mail"), dict):
         cfg["mail"].pop("proxy", None)
+        providers = cfg["mail"].get("providers")
+        if isinstance(providers, list):
+            for provider in providers:
+                if not isinstance(provider, dict) or provider.get("type") != "cloudflare_temp_email":
+                    continue
+                provider.pop("rate_limit_cooldown_seconds", None)
+                provider["append_random_suffix"] = _safe_bool(provider.get("append_random_suffix"), True)
+                levels = provider.get("subdomain_levels")
+                if isinstance(levels, list):
+                    provider["subdomain_levels"] = [str(value).strip() for value in levels if str(value).strip()]
+                else:
+                    value = str(levels or "").strip()
+                    provider["subdomain_levels"] = [value] if value else []
+                try:
+                    depth = int(provider.get("random_subdomain_depth") or 1)
+                except (TypeError, ValueError):
+                    depth = 1
+                provider["random_subdomain_depth"] = max(1, min(5, depth))
     cfg["enabled"] = bool(cfg.get("enabled"))
     stats = {**_default_config()["stats"], **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
              "threads": cfg["threads"]}
