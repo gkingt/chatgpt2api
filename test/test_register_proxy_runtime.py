@@ -426,7 +426,7 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
 
         self.assertTrue(any("会话步骤不匹配" in line for line in lines))
 
-    def test_domain_stats_disable_low_success_domain_and_mail_provider_skips_it(self):
+    def test_domain_stats_record_low_success_domain_but_mail_provider_keeps_using_all_domains(self):
         original_file = openai_register.domain_stats_file
         temp_file = Path(__file__).resolve().parent / ".tmp_domain_stats.json"
         try:
@@ -441,7 +441,9 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
                 )
             data = openai_register._load_domain_stats()
             self.assertIn("bad.example", data.get("disabled_domains") or [])
-            self.assertEqual(mail_provider._next_domain(["bad.example", "good.example"]), "good.example")
+            with patch.object(mail_provider.random, "choice", return_value="bad.example") as choose_domain:
+                self.assertEqual(mail_provider._next_domain(["bad.example", "good.example"]), "bad.example")
+            choose_domain.assert_called_once_with(["bad.example", "good.example"])
         finally:
             openai_register.domain_stats_file = original_file
             mail_provider.set_disabled_domains([])

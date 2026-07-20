@@ -257,29 +257,17 @@ def _random_subdomain_suffix() -> str:
 
 
 def _next_domain(domains: list[str]) -> str:
-    global domain_index
     domains = [str(item).strip() for item in domains if str(item).strip()]
-    with disabled_domain_lock:
-        disabled = set(disabled_domains)
-    allowed_domains = [item for item in domains if item.lower().lstrip("*.") not in disabled]
-    if allowed_domains:
-        domains = allowed_domains
     if not domains:
         raise RuntimeError("mail.domain 不能为空")
-    if len(domains) == 1:
-        return domains[0]
-    with domain_lock:
-        value = domains[domain_index % len(domains)]
-        domain_index = (domain_index + 1) % len(domains)
-        return value
+    return random.choice(domains)
 
 
 def _random_domain(domains: list[str]) -> str:
     domains = [str(item).strip() for item in domains if str(item).strip()]
-    with disabled_domain_lock:
-        disabled = set(disabled_domains)
-    allowed_domains = [item for item in domains if item.lower().lstrip("*.") not in disabled]
-    return random.choice(allowed_domains or domains)
+    if not domains:
+        raise RuntimeError("mail.domain 不能为空")
+    return random.choice(domains)
 
 
 def _normalize_string_list(value: Any) -> list[str]:

@@ -86,3 +86,24 @@ class CloudflareTempMailConfigTests(TestCase):
             provider.create_mailbox("user")
 
         self.assertEqual(session.calls[0]["json"]["domain"], "one.two.example.test")
+
+    def test_root_domain_is_selected_randomly_from_all_configured_domains(self):
+        session = FakeSession()
+        conf = {"request_timeout": 30, "wait_timeout": 30, "wait_interval": 2, "user_agent": "test", "proxy": ""}
+        entry = {
+            "api_base": "https://mail.example.test",
+            "admin_password": "secret",
+            "domain": ["one.example", "two.example", "three.example"],
+            "random_subdomain_depth": 1,
+        }
+
+        with (
+            mock.patch.object(mail_provider, "_create_session", return_value=session),
+            mock.patch.object(mail_provider, "_random_subdomain_label", return_value="box"),
+            mock.patch.object(mail_provider.random, "choice", return_value="two.example") as choose_domain,
+        ):
+            provider = mail_provider.CloudflareTempMailProvider(entry, conf)
+            provider.create_mailbox("user")
+
+        self.assertEqual(session.calls[0]["json"]["domain"], "box.two.example")
+        choose_domain.assert_any_call(["one.example", "two.example", "three.example"])
