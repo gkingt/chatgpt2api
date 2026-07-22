@@ -58,6 +58,9 @@ platform_oauth_client_id = "app_2SKx67EdpoN0G6j64rFvigXD"
 platform_oauth_redirect_uri = f"{platform_base}/auth/callback"
 platform_oauth_audience = "https://api.openai.com/v1"
 platform_auth0_client = "eyJuYW1lIjoiYXV0aDAtc3BhLWpzIiwidmVyc2lvbiI6IjEuMjEuMCJ9"
+chatgpt_auth_session_url = "https://chatgpt.com/api/auth/session"
+chatgpt_csrf_url = "https://chatgpt.com/api/auth/csrf"
+chatgpt_signin_openai_url = "https://chatgpt.com/api/auth/signin/openai"
 
 # 固定的最后回退指纹（仅当未通过 BrowserProfile 注入时使用）
 user_agent = (
@@ -458,6 +461,25 @@ def _session_cookie_header(session: requests.Session, domain_hint: str = "chatgp
     return "; ".join(pieces)
 
 
+def _cookie_value(session: requests.Session, name: str) -> str:
+    try:
+        value = session.cookies.get(name, "")
+        if value:
+            return str(value)
+    except Exception:
+        pass
+    try:
+        for cookie in session.cookies:
+            cookie_name = str(getattr(cookie, "name", "") or "")
+            if cookie_name == name:
+                value = str(getattr(cookie, "value", "") or "")
+                if value:
+                    return value
+    except Exception:
+        pass
+    return ""
+
+
 def _load_register_auth_sessions() -> list[dict]:
     try:
         data = json.loads(register_auth_sessions_file.read_text(encoding="utf-8"))
@@ -480,20 +502,125 @@ def fetch_and_save_chatgpt_auth_session(session: requests.Session, device_id: st
     headers["referer"] = "https://chatgpt.com/"
     headers["oai-device-id"] = device_id
     headers.update(_make_trace_headers())
-    response = session.get("https://chatgpt.com/api/auth/session", headers=headers, verify=False, timeout=30)
+    response = session.get(chatgpt_auth_session_url, headers=headers, verify=False, timeout=30)
     data = _response_json(response)
+    session_token = _cookie_value(session, "__Secure-next-auth.session-token") or str(data.get("sessionToken") or data.get("session_token") or "").strip()
     entry = {
         "saved_at": datetime.now(timezone.utc).isoformat(),
         "status_code": getattr(response, "status_code", None),
         "device_id": device_id,
         "oauth_state": str(callback_params.get("state") or "").strip(),
         "oauth_scope": str(callback_params.get("scope") or "").strip(),
-        "session_token": str(session.cookies.get("__Secure-next-auth.session-token", domain=".chatgpt.com") or session.cookies.get("__Secure-next-auth.session-token") or "").strip(),
+        "session_token": session_token,
         "cookie_header": _session_cookie_header(session),
         "response": data,
     }
     _append_register_auth_session(entry)
     return entry
+
+
+def _chatgpt_headers(profile: BrowserProfile, referer: str = "https://chatgpt.com/") -> dict[str, str]:
+    return {
+        "accept": "application/json",
+        "accept-language": profile.accept_language,
+        "origin": "https://chatgpt.com",
+        "referer": referer,
+        "user-agent": profile.user_agent,
+        "sec-ch-ua": profile.sec_ch_ua,
+        "sec-ch-ua-arch": profile.sec_ch_ua_arch,
+        "sec-ch-ua-bitness": profile.sec_ch_ua_bitness,
+        "sec-ch-ua-full-version-list": profile.sec_ch_ua_full_version_list,
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-model": '""',
+        "sec-ch-ua-platform": profile.sec_ch_ua_platform,
+        "sec-ch-ua-platform-version": profile.sec_ch_ua_platform_version,
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        **_make_trace_headers(),
+    }
+
+
+def _normalize_location(location: str, current_url: str) -> str:
+    if not location:
+        return ""
+    return urljoin(current_url, location)
+
+
+def _consume_chatgpt_callback(session: requests.Session, callback_url: str, profile: BrowserProfile) -> None:
+    current_url = callback_url
+    for _ in range(8):
+        headers = dict(_build_navigate_headers(profile))
+        headers["referer"] = "https://auth.openai.com/"
+        response = session.get(current_url, headers=headers, verify=False, timeout=30, allow_redirects=False)
+        if response.status_code not in (301, 302, 303, 307, 308):
+            return
+        location = _normalize_location(str(response.headers.get("Location") or ""), current_url)
+        if not location:
+            return
+        current_url = location
+        parsed = urlparse(current_url)
+        if "chatgpt.com" in parsed.netloc and "/api/auth/callback" not in parsed.path:
+            session.get(current_url, headers=_build_navigate_headers(profile), verify=False, timeout=30, allow_redirects=True)
+            return
+
+
+def create_chatgpt_web_session(auth_session: requests.Session, auth_device_id: str, profile: BrowserProfile) -> dict:
+    chatgpt_session = create_session(config["proxy"])
+    chatgpt_session.cookies.set("oai-did", auth_device_id, domain=".chatgpt.com")
+    try:
+        csrf_resp = chatgpt_session.get(chatgpt_csrf_url, headers=_chatgpt_headers(profile, "https://chatgpt.com/auth/login"), verify=False, timeout=30)
+        csrf_data = _response_json(csrf_resp)
+        csrf_token = str(csrf_data.get("csrfToken") or "").strip()
+        if not csrf_token:
+            raise RuntimeError(f"chatgpt_csrf_missing, {_response_error_detail(csrf_resp, 800)}")
+        signin_headers = _chatgpt_headers(profile, "https://chatgpt.com/auth/login")
+        signin_headers["content-type"] = "application/x-www-form-urlencoded"
+        signin_resp = chatgpt_session.post(
+            chatgpt_signin_openai_url,
+            headers=signin_headers,
+            data={"csrfToken": csrf_token, "callbackUrl": "https://chatgpt.com/", "json": "true"},
+            verify=False,
+            timeout=30,
+        )
+        signin_data = _response_json(signin_resp)
+        auth_url = str(signin_data.get("url") or "").strip()
+        if not auth_url:
+            raise RuntimeError(f"chatgpt_signin_url_missing, {_response_error_detail(signin_resp, 800)}")
+
+        callback_url = ""
+        current_url = auth_url
+        for _ in range(12):
+            auth_headers = dict(_build_navigate_headers(profile))
+            auth_headers["referer"] = "https://chatgpt.com/auth/login"
+            response = auth_session.get(current_url, headers=auth_headers, verify=False, timeout=30, allow_redirects=False)
+            location = _normalize_location(str(response.headers.get("Location") or ""), current_url)
+            candidate = str(getattr(response, "url", "") or current_url)
+            if "/api/auth/callback/openai" in candidate and "code=" in candidate:
+                callback_url = candidate
+                break
+            if "/api/auth/callback/openai" in location and "code=" in location:
+                callback_url = location
+                break
+            if response.status_code not in (301, 302, 303, 307, 308) or not location:
+                break
+            current_url = location
+        if not callback_url:
+            fallback_params, fallback_error = extract_oauth_callback_params_from_consent_session(auth_session, current_url, auth_device_id)
+            if fallback_params:
+                callback_url = "https://chatgpt.com/api/auth/callback/openai?" + urlencode(
+                    {key: value for key, value in fallback_params.items() if value}
+                )
+            else:
+                raise RuntimeError(f"chatgpt_callback_not_found, {fallback_error}")
+
+        _consume_chatgpt_callback(chatgpt_session, callback_url, profile)
+        return fetch_and_save_chatgpt_auth_session(chatgpt_session, auth_device_id, extract_oauth_callback_params_from_url(callback_url) or {})
+    finally:
+        try:
+            chatgpt_session.close()
+        finally:
+            _untrack_session(chatgpt_session)
 
 
 def _email_domain(email: str) -> str:
@@ -909,7 +1036,7 @@ def extract_oauth_callback_params_from_consent_session(session: requests.Session
     return None, f"organization_select_no_callback, {_response_error_detail(org_resp, 800)}{', location=' + org_location if org_location else ''}"
 
 
-def exchange_platform_tokens(session: requests.Session, device_id: str, code_verifier: str, consent_url: str) -> dict:
+def exchange_platform_tokens(session: requests.Session, device_id: str, code_verifier: str, consent_url: str, profile: BrowserProfile | None = None) -> dict:
     callback_params, callback_error = extract_oauth_callback_params_from_consent_session(session, consent_url, device_id)
     
     # [补丁1] 引入 PR 中的回退方案 (Fallback Mechanism)
@@ -934,7 +1061,12 @@ def exchange_platform_tokens(session: requests.Session, device_id: str, code_ver
     code = str(callback_params.get("code") or "").strip()
     if not code:
         raise RuntimeError("oauth_callback_missing_code")
-    auth_session = fetch_and_save_chatgpt_auth_session(session, device_id, callback_params)
+    auth_session: dict = {}
+    if profile is not None:
+        try:
+            auth_session = create_chatgpt_web_session(session, device_id, profile)
+        except Exception as exc:
+            log(f"ChatGPT Web session 保存失败: {exc}", "yellow")
     token_session = create_session(config["proxy"])
     try:
         ensure_not_cancelled()
@@ -1215,7 +1347,7 @@ class PlatformRegistrar:
         return continue_url
     def _finish_registration_and_exchange_tokens(self, code_verifier: str, continue_url: str, index: int) -> dict:
         step(index, "开始注册会话换 token")
-        tokens = exchange_platform_tokens(self.session, self.device_id, code_verifier, continue_url or f"{auth_base}/sign-in-with-chatgpt/codex/consent")
+        tokens = exchange_platform_tokens(self.session, self.device_id, code_verifier, continue_url or f"{auth_base}/sign-in-with-chatgpt/codex/consent", self.profile)
         step(index, "token 换取完成")
         return tokens
 
@@ -1372,7 +1504,7 @@ class PlatformRegistrar:
                 step(index, "独立登录验证码校验完成")
             if not continue_url:
                 continue_url = f"{auth_base}/sign-in-with-chatgpt/codex/consent"
-            tokens = exchange_platform_tokens(login_session, login_device_id, code_verifier, continue_url)
+            tokens = exchange_platform_tokens(login_session, login_device_id, code_verifier, continue_url, self.profile)
             if not tokens:
                 raise RuntimeError("token换取失败")
             step(index, "token 换取完成")

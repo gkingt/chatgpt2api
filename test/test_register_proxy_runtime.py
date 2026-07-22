@@ -16,7 +16,11 @@ class FakeResponse:
         self.url = url
 
     def json(self):
-        return {}
+        try:
+            data = json.loads(self.text or "{}")
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
 
 
 class FakeCookieJar:
@@ -26,6 +30,21 @@ class FakeCookieJar:
     def set(self, name, value, domain=None):
         self.items.append({"name": name, "value": value, "domain": domain})
 
+    def get(self, name, default="", domain=None):
+        for item in reversed(self.items):
+            if item["name"] == name and (domain is None or item.get("domain") == domain):
+                return item["value"]
+        return default
+
+    def __iter__(self):
+        class Cookie:
+            def __init__(self, item):
+                self.name = item["name"]
+                self.value = item["value"]
+                self.domain = item.get("domain") or ""
+
+        return iter(Cookie(item) for item in self.items)
+
 
 class FakeSession:
     def __init__(self, **kwargs):
@@ -33,9 +52,14 @@ class FakeSession:
         self.headers = {}
         self.cookies = FakeCookieJar()
         self.closed = False
+        self.get_calls = []
 
     def close(self):
         self.closed = True
+
+    def get(self, url, **kwargs):
+        self.get_calls.append({"url": url, "kwargs": kwargs})
+        return FakeResponse(status_code=200, text='{"accessToken":"web-access-token"}', headers={"content-type": "application/json"}, url=url)
 
 
 class FakeProxySettings:
@@ -513,6 +537,32 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
 
             data = json.loads(temp_file.read_text(encoding="utf-8"))
             self.assertEqual([item["email"] for item in data], ["one@example.com", "two@example.com"])
+        finally:
+            openai_register.register_auth_sessions_file = original_file
+            if temp_file.exists():
+                temp_file.unlink()
+
+    def test_fetch_chatgpt_auth_session_saves_session_token_and_access_token(self):
+        original_file = openai_register.register_auth_sessions_file
+        temp_file = Path(__file__).resolve().parent / ".tmp_chatgpt_auth_sessions.json"
+        fake_session = FakeSession()
+        fake_session.cookies.set("__Secure-next-auth.session-token", "session-token", domain=".chatgpt.com")
+        fake_session.cookies.set("oai-did", "device-id", domain=".chatgpt.com")
+        try:
+            if temp_file.exists():
+                temp_file.unlink()
+            openai_register.register_auth_sessions_file = temp_file
+
+            entry = openai_register.fetch_and_save_chatgpt_auth_session(
+                fake_session,
+                "device-id",
+                {"state": "oauth-state", "scope": "openid profile email"},
+            )
+
+            self.assertEqual(entry["session_token"], "session-token")
+            self.assertEqual(entry["response"]["accessToken"], "web-access-token")
+            data = json.loads(temp_file.read_text(encoding="utf-8"))
+            self.assertEqual(data[0]["session_token"], "session-token")
         finally:
             openai_register.register_auth_sessions_file = original_file
             if temp_file.exists():
