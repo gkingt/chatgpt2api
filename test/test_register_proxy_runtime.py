@@ -453,14 +453,12 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
     def test_worker_uses_refresh_accounts_after_saving_registered_account(self):
         refreshed_tokens = []
         added_items = []
-        saved_accounts = []
         fake_result = {
             "email": "user@example.com",
             "password": "secret",
             "access_token": "access-token",
             "refresh_token": "refresh-token",
             "id_token": "id-token",
-            "oauth_token_response": {"access_token": "access-token", "expires_in": 3600},
         }
 
         class FakeRegistrar:
@@ -493,7 +491,7 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
                 openai_register.account_service,
                 "refresh_accounts",
                 side_effect=fake_refresh,
-            ), patch.object(openai_register, "save_register_token_response", side_effect=saved_accounts.append), patch.object(openai_register, "log"):
+            ), patch.object(openai_register, "log"):
                 result = openai_register.worker(2)
         finally:
             openai_register.stats.update(original_stats)
@@ -502,7 +500,23 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
         self.assertEqual(refreshed_tokens, ["access-token"])
         self.assertEqual(added_items[0]["source_type"], "web")
         self.assertIn("proxy", added_items[0])
-        self.assertEqual(saved_accounts[0]["oauth_token_response"], {"access_token": "access-token", "expires_in": 3600})
+
+    def test_register_auth_session_appends_json_file(self):
+        original_file = openai_register.register_auth_sessions_file
+        temp_file = Path(__file__).resolve().parent / ".tmp_register_auth_sessions.json"
+        try:
+            if temp_file.exists():
+                temp_file.unlink()
+            openai_register.register_auth_sessions_file = temp_file
+            openai_register._append_register_auth_session({"email": "one@example.com"})
+            openai_register._append_register_auth_session({"email": "two@example.com"})
+
+            data = json.loads(temp_file.read_text(encoding="utf-8"))
+            self.assertEqual([item["email"] for item in data], ["one@example.com", "two@example.com"])
+        finally:
+            openai_register.register_auth_sessions_file = original_file
+            if temp_file.exists():
+                temp_file.unlink()
 
 
 if __name__ == "__main__":
