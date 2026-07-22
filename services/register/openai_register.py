@@ -1372,7 +1372,6 @@ class PlatformRegistrar:
                 "access_token": str(tokens.get("access_token") or "").strip(),
                 "refresh_token": str(tokens.get("refresh_token") or "").strip(),
                 "id_token": str(tokens.get("id_token") or "").strip(),
-                "oauth_token_response": tokens.get("oauth_token_response"),
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
         except Exception:
