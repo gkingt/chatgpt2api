@@ -45,7 +45,7 @@ config = {
 }
 register_config_file = base_dir.parents[1] / "data" / "register.json"
 domain_stats_file = base_dir.parents[1] / "data" / "domain_stats.json"
-register_auth_sessions_file = base_dir.parents[1] / "data" / "register_auth_sessions.json"
+register_token_responses_file = base_dir.parents[1] / "data" / "register_token_responses.jsonl"
 try:
     saved_config = json.loads(register_config_file.read_text(encoding="utf-8"))
     config.update({key: saved_config[key] for key in ("mail", "proxy", "total", "threads") if key in saved_config})
@@ -437,63 +437,6 @@ def create_mailbox(username: str | None = None) -> dict:
 
 def wait_for_code(mailbox: dict) -> str | None:
     return mail_provider.wait_for_code({**config["mail"], "proxy": config.get("proxy") or ""}, mailbox)
-
-
-register_auth_sessions_lock = threading.Lock()
-
-
-def _session_cookie_header(session: requests.Session, domain_hint: str = "chatgpt.com") -> str:
-    pieces: list[str] = []
-    try:
-        for cookie in session.cookies:
-            domain = str(getattr(cookie, "domain", "") or "")
-            if domain_hint and domain_hint not in domain:
-                continue
-            name = str(getattr(cookie, "name", "") or "").strip()
-            value = str(getattr(cookie, "value", "") or "").strip()
-            if name and value:
-                pieces.append(f"{name}={value}")
-    except Exception:
-        return ""
-    return "; ".join(pieces)
-
-
-def _load_register_auth_sessions() -> list[dict]:
-    try:
-        data = json.loads(register_auth_sessions_file.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-    return data if isinstance(data, list) else []
-
-
-def _append_register_auth_session(entry: dict) -> None:
-    register_auth_sessions_file.parent.mkdir(parents=True, exist_ok=True)
-    with register_auth_sessions_lock:
-        items = _load_register_auth_sessions()
-        items.append(entry)
-        register_auth_sessions_file.write_text(json.dumps(items, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-
-def fetch_and_save_chatgpt_auth_session(session: requests.Session, device_id: str, callback_params: dict[str, str]) -> dict:
-    headers = dict(navigate_headers)
-    headers["accept"] = "application/json"
-    headers["referer"] = "https://chatgpt.com/"
-    headers["oai-device-id"] = device_id
-    headers.update(_make_trace_headers())
-    response = session.get("https://chatgpt.com/api/auth/session", headers=headers, verify=False, timeout=30)
-    data = _response_json(response)
-    entry = {
-        "saved_at": datetime.now(timezone.utc).isoformat(),
-        "status_code": getattr(response, "status_code", None),
-        "device_id": device_id,
-        "oauth_state": str(callback_params.get("state") or "").strip(),
-        "oauth_scope": str(callback_params.get("scope") or "").strip(),
-        "session_token": str(session.cookies.get("__Secure-next-auth.session-token", domain=".chatgpt.com") or session.cookies.get("__Secure-next-auth.session-token") or "").strip(),
-        "cookie_header": _session_cookie_header(session),
-        "response": data,
-    }
-    _append_register_auth_session(entry)
-    return entry
 
 
 def _email_domain(email: str) -> str:
@@ -934,7 +877,6 @@ def exchange_platform_tokens(session: requests.Session, device_id: str, code_ver
     code = str(callback_params.get("code") or "").strip()
     if not code:
         raise RuntimeError("oauth_callback_missing_code")
-    auth_session = fetch_and_save_chatgpt_auth_session(session, device_id, callback_params)
     token_session = create_session(config["proxy"])
     try:
         ensure_not_cancelled()
@@ -965,8 +907,23 @@ def exchange_platform_tokens(session: requests.Session, device_id: str, code_ver
         "access_token": str(data.get("access_token") or "").strip(),
         "refresh_token": str(data.get("refresh_token") or "").strip(),
         "id_token": str(data.get("id_token") or "").strip(),
-        "chatgpt_auth_session": auth_session,
+        "oauth_token_response": data,
     }
+
+
+def save_register_token_response(account: dict) -> None:
+    response = account.get("oauth_token_response")
+    if not isinstance(response, dict) or not response:
+        return
+    register_token_responses_file.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "email": str(account.get("email") or "").strip(),
+        "access_token": str(account.get("access_token") or "").strip(),
+        "response": response,
+    }
+    with register_token_responses_file.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
 class PlatformRegistrar:
@@ -1415,7 +1372,7 @@ class PlatformRegistrar:
                 "access_token": str(tokens.get("access_token") or "").strip(),
                 "refresh_token": str(tokens.get("refresh_token") or "").strip(),
                 "id_token": str(tokens.get("id_token") or "").strip(),
-                "chatgpt_auth_session": tokens.get("chatgpt_auth_session"),
+                "oauth_token_response": tokens.get("oauth_token_response"),
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
         except Exception:
@@ -1436,6 +1393,7 @@ def worker(index: int) -> dict:
         cost = time.time() - start
         access_token = str(result["access_token"])
         account_service.add_account_items([{**result, "source_type": "web", "proxy": config["proxy"]}])
+        save_register_token_response(result)
         refresh_result = account_service.refresh_accounts([access_token])
         if refresh_result.get("errors"):
             step(index, f"账号已保存，刷新额度暂未成功，稍后可重试: {refresh_result['errors']}", "yellow")
