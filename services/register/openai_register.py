@@ -4,7 +4,6 @@ import base64
 import hashlib
 import json
 import random
-import re
 import secrets
 import string
 import threading
@@ -566,43 +565,6 @@ def _consume_chatgpt_callback(session: requests.Session, callback_url: str, prof
             return
 
 
-def _choose_account_select(session: requests.Session, html_text: str, current_url: str, profile: BrowserProfile, device_id: str) -> str:
-    match = re.search(r"us_[A-Za-z0-9]{16,}", html_text or "")
-    if not match:
-        return ""
-    session_id = match.group(0)
-    headers = dict(_build_common_headers(profile))
-    headers["referer"] = "https://auth.openai.com/choose-an-account"
-    headers["origin"] = auth_base
-    headers["oai-device-id"] = device_id
-    headers.update(_make_trace_headers())
-    candidates = [
-        (f"{auth_base}/api/accounts/session/select", {"session_id": session_id}, "json"),
-        (f"{auth_base}/choose-an-account", {"intent": "select", "session_id": session_id}, "form"),
-    ]
-    for url, body, kind in candidates:
-        try:
-            request_headers = dict(headers)
-            if kind == "json":
-                request_headers["content-type"] = "application/json"
-                response = session.post(url, headers=request_headers, json=body, verify=False, timeout=30, allow_redirects=False)
-            else:
-                request_headers["content-type"] = "application/x-www-form-urlencoded"
-                response = session.post(url, headers=request_headers, data=urlencode(body), verify=False, timeout=30, allow_redirects=False)
-            if response.status_code not in (200, 201, 302, 303):
-                continue
-            location = str(response.headers.get("Location") or response.headers.get("location") or "").strip()
-            data = _response_json(response)
-            next_url = str(data.get("continue_url") or location or "").strip()
-            if next_url:
-                return _normalize_location(next_url, current_url)
-            if response.status_code == 200:
-                return current_url
-        except Exception:
-            continue
-    return ""
-
-
 def create_chatgpt_web_session(auth_session: requests.Session, auth_device_id: str, profile: BrowserProfile) -> dict:
     chatgpt_session = create_session(config["proxy"])
     chatgpt_session.cookies.set("oai-did", auth_device_id, domain=".chatgpt.com")
@@ -640,11 +602,6 @@ def create_chatgpt_web_session(auth_session: requests.Session, auth_device_id: s
             if "/api/auth/callback/openai" in location and "code=" in location:
                 callback_url = location
                 break
-            if "/choose-an-account" in urlparse(current_url).path and response.status_code == 200:
-                selected_url = _choose_account_select(auth_session, getattr(response, "text", "") or "", current_url, profile, auth_device_id)
-                if selected_url:
-                    current_url = selected_url
-                    continue
             if response.status_code not in (301, 302, 303, 307, 308) or not location:
                 break
             current_url = location

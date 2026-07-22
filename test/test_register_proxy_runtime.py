@@ -53,7 +53,6 @@ class FakeSession:
         self.cookies = FakeCookieJar()
         self.closed = False
         self.get_calls = []
-        self.post_calls = []
 
     def close(self):
         self.closed = True
@@ -61,10 +60,6 @@ class FakeSession:
     def get(self, url, **kwargs):
         self.get_calls.append({"url": url, "kwargs": kwargs})
         return FakeResponse(status_code=200, text='{"accessToken":"web-access-token"}', headers={"content-type": "application/json"}, url=url)
-
-    def post(self, url, **kwargs):
-        self.post_calls.append({"url": url, "kwargs": kwargs})
-        return FakeResponse(status_code=200, text='{"continue_url":"https://chatgpt.com/api/auth/callback/openai?code=abc&state=xyz"}', headers={"content-type": "application/json"}, url=url)
 
 
 class FakeProxySettings:
@@ -572,21 +567,6 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
             openai_register.register_auth_sessions_file = original_file
             if temp_file.exists():
                 temp_file.unlink()
-
-    def test_choose_account_select_returns_continue_url(self):
-        fake_session = FakeSession()
-        profile = openai_register._default_profile()
-
-        next_url = openai_register._choose_account_select(
-            fake_session,
-            '<html><script>"id":"us_abcdefghijklmnop123456"</script></html>',
-            "https://auth.openai.com/choose-an-account",
-            profile,
-            "device-id",
-        )
-
-        self.assertEqual(next_url, "https://chatgpt.com/api/auth/callback/openai?code=abc&state=xyz")
-        self.assertEqual(fake_session.post_calls[0]["url"], "https://auth.openai.com/api/accounts/session/select")
 
 
 if __name__ == "__main__":
