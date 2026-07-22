@@ -45,7 +45,6 @@ config = {
 }
 register_config_file = base_dir.parents[1] / "data" / "register.json"
 domain_stats_file = base_dir.parents[1] / "data" / "domain_stats.json"
-register_token_responses_file = base_dir.parents[1] / "data" / "register_token_responses.jsonl"
 try:
     saved_config = json.loads(register_config_file.read_text(encoding="utf-8"))
     config.update({key: saved_config[key] for key in ("mail", "proxy", "total", "threads") if key in saved_config})
@@ -907,23 +906,7 @@ def exchange_platform_tokens(session: requests.Session, device_id: str, code_ver
         "access_token": str(data.get("access_token") or "").strip(),
         "refresh_token": str(data.get("refresh_token") or "").strip(),
         "id_token": str(data.get("id_token") or "").strip(),
-        "oauth_token_response": data,
     }
-
-
-def save_register_token_response(account: dict) -> None:
-    response = account.get("oauth_token_response")
-    if not isinstance(response, dict) or not response:
-        return
-    register_token_responses_file.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "saved_at": datetime.now(timezone.utc).isoformat(),
-        "email": str(account.get("email") or "").strip(),
-        "access_token": str(account.get("access_token") or "").strip(),
-        "response": response,
-    }
-    with register_token_responses_file.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
 class PlatformRegistrar:
@@ -1392,7 +1375,6 @@ def worker(index: int) -> dict:
         cost = time.time() - start
         access_token = str(result["access_token"])
         account_service.add_account_items([{**result, "source_type": "web", "proxy": config["proxy"]}])
-        save_register_token_response(result)
         refresh_result = account_service.refresh_accounts([access_token])
         if refresh_result.get("errors"):
             step(index, f"账号已保存，刷新额度暂未成功，稍后可重试: {refresh_result['errors']}", "yellow")
