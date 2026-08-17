@@ -451,6 +451,108 @@ class BaseMailProvider:
         pass
 
 
+class MailNestProvider(BaseMailProvider):
+    name = "mailnest"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.api_base = str(entry.get("api_base") or "https://mailnest.top").rstrip("/")
+        self.api_key = str(entry.get("api_key") or "").strip()
+        self.project_code = str(entry.get("project_code") or "ChatGPT0001").strip()
+        self.sale_mode = str(entry.get("sale_mode") or "temporary").strip().lower() or "temporary"
+        if self.sale_mode not in {"temporary", "exclusive"}:
+            self.sale_mode = "temporary"
+        self.session = _create_session(conf)
+
+    def close(self) -> None:
+        self.session.close()
+
+    def _headers(self) -> dict[str, str]:
+        if not self.api_key:
+            raise RuntimeError("MailNest api_key 不能为空")
+        return {"Authorization": f"Bearer {self.api_key}", "User-Agent": self.conf["user_agent"]}
+
+    @staticmethod
+    def _data(resp, action: str) -> Any:
+        try:
+            data = resp.json()
+        except Exception:
+            data = {}
+        if resp.status_code != 200:
+            detail = data.get("detail") if isinstance(data, dict) else ""
+            raise RuntimeError(f"MailNest {action}失败: HTTP {resp.status_code}, {detail or resp.text[:300]}")
+        if not isinstance(data, dict) or data.get("code") != "00000":
+            msg = data.get("msg") if isinstance(data, dict) else ""
+            code = data.get("code") if isinstance(data, dict) else ""
+            raise RuntimeError(f"MailNest {action}失败: {code or 'unknown'} {msg or resp.text[:300]}")
+        return data.get("data")
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {"count": 1}
+        path = "/api/v1/email/exclusive/buy"
+        if self.sale_mode == "temporary":
+            if not self.project_code:
+                raise RuntimeError("MailNest project_code 不能为空")
+            payload["project_code"] = self.project_code
+            path = "/api/v1/email/temporary/buy"
+        resp = self.session.post(
+            f"{self.api_base}{path}",
+            headers=self._headers(),
+            json=payload,
+            timeout=self.conf["request_timeout"],
+            verify=False,
+        )
+        items = self._data(resp, "购买邮箱")
+        if not isinstance(items, list) or not items:
+            raise RuntimeError("MailNest 购买邮箱响应缺少 data[]")
+        item = items[0] if isinstance(items[0], dict) else {}
+        address = str(item.get("email") or "").strip()
+        if not address:
+            raise RuntimeError("MailNest 购买邮箱响应缺少 email")
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": address,
+            "order_id": str(item.get("id") or ""),
+            "sale_mode": str(item.get("sale_mode") or self.sale_mode),
+            "project_code": str(item.get("project_code") or self.project_code),
+        }
+
+    def _normalize_message(self, mailbox: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+        body_type = str(item.get("body_type") or "").lower()
+        body = str(item.get("body") or "")
+        preview = str(item.get("body_preview") or "")
+        return {
+            "provider": self.name,
+            "mailbox": mailbox["address"],
+            "message_id": str(item.get("id") or ""),
+            "subject": str(item.get("subject") or ""),
+            "sender": str(item.get("from_email") or item.get("from_name") or ""),
+            "text_content": "\n".join(part for part in (preview, item.get("code_match") or "", body if body_type != "html" else "") if str(part or "").strip()),
+            "html_content": body if body_type == "html" else "",
+            "received_at": _parse_received_at(item.get("received_at")),
+            "raw": item,
+        }
+
+    def fetch_recent_messages(self, mailbox: dict[str, Any]) -> list[dict[str, Any]]:
+        path = "/api/v1/email/user-mailbox/receive" if mailbox.get("sale_mode") == "user-mailbox" else "/api/v1/email/receive"
+        resp = self.session.post(
+            f"{self.api_base}{path}",
+            headers=self._headers(),
+            json={"email": mailbox["address"]},
+            timeout=self.conf["request_timeout"],
+            verify=False,
+        )
+        items = self._data(resp, "收件")
+        if not isinstance(items, list):
+            return []
+        return [self._normalize_message(mailbox, item) for item in items if isinstance(item, dict)]
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        messages = self.fetch_recent_messages(mailbox)
+        return messages[0] if messages else None
+
+
 class CloudflareTempMailProvider(BaseMailProvider):
     name = "cloudflare_temp_email"
 
@@ -1513,6 +1615,8 @@ def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = 
         return YydsMailProvider(entry, conf)
     if entry["type"] == "outlook_token":
         return OutlookTokenProvider(entry, conf)
+    if entry["type"] == "mailnest":
+        return MailNestProvider(entry, conf)
     raise RuntimeError(f"不支持的 mail.provider: {entry['type']}")
 
 

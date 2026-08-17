@@ -58,6 +58,7 @@ export function RegisterCard() {
       ...(type === "yyds_mail" ? { api_base: "https://maliapi.215.im/v1", api_key: "", domain: [], subdomain: "", wildcard: false } : {}),
       ...(type === "ddg_mail" ? { ddg_token: "", cf_inbox_jwt: "", cf_domain: [], admin_password: "" } : {}),
       ...(type === "outlook_token" ? { mailboxes: "", mode: "graph", imap_host: "outlook.office365.com", message_limit: 10 } : {}),
+      ...(type === "mailnest" ? { api_base: "https://mailnest.top", api_key: "", project_code: "ChatGPT0001", sale_mode: "temporary" } : {}),
     });
   };
 
@@ -199,13 +200,14 @@ export function RegisterCard() {
                             <SelectItem value="yyds_mail">yyds_mail</SelectItem>
                             <SelectItem value="ddg_mail">ddg_mail (DDG邮箱+CF中转)</SelectItem>
                             <SelectItem value="outlook_token">outlook_token (Outlook/Hotmail 邮箱池)</SelectItem>
+                            <SelectItem value="mailnest">mailnest (ChatGPT 邮箱 API)</SelectItem>
                           </SelectContent>
                         </Select>
                       </div>
-                      {type === "cloudmail_gen" || type === "cloudflare_temp_email" || type === "moemail" || type === "inbucket" || type === "yyds_mail" || type === "ddg_mail" ? (
+                      {type === "cloudmail_gen" || type === "cloudflare_temp_email" || type === "moemail" || type === "inbucket" || type === "yyds_mail" || type === "ddg_mail" || type === "mailnest" ? (
                         <>
                           <div className="space-y-2">
-                            <label className="text-sm text-stone-700">{type === "cloudmail_gen" ? "CloudMail URL" : "API Base"}</label>
+                            <label className="text-sm text-stone-700">{type === "cloudmail_gen" ? "CloudMail URL" : type === "mailnest" ? "MailNest URL" : "API Base"}</label>
                             <Input value={String(provider.api_base || "")} onChange={(event) => updateProvider(index, { api_base: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
                           </div>
                           {type === "cloudmail_gen" ? (
@@ -255,11 +257,33 @@ export function RegisterCard() {
                           启用随机子域名
                         </label>
                       ) : null}
-                      {type === "tempmail_lol" || type === "moemail" || type === "duckmail" || type === "gptmail" || type === "yyds_mail" ? (
+                      {type === "tempmail_lol" || type === "moemail" || type === "duckmail" || type === "gptmail" || type === "yyds_mail" || type === "mailnest" ? (
                         <div className="space-y-2">
                           <label className="text-sm text-stone-700">API Key</label>
                           <Input value={String(provider.api_key || "")} onChange={(event) => updateProvider(index, { api_key: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
                         </div>
+                      ) : null}
+                      {type === "mailnest" ? (
+                        <>
+                          <div className="space-y-2">
+                            <label className="text-sm text-stone-700">邮箱模式</label>
+                            <Select value={String(provider.sale_mode || "temporary")} onValueChange={(value) => updateProvider(index, { sale_mode: value })} disabled={config.enabled}>
+                              <SelectTrigger className="h-10 rounded-xl border-stone-200 bg-white">
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="temporary">临时邮箱</SelectItem>
+                                <SelectItem value="exclusive">独占邮箱</SelectItem>
+                              </SelectContent>
+                            </Select>
+                          </div>
+                          {String(provider.sale_mode || "temporary") === "temporary" ? (
+                            <div className="space-y-2">
+                              <label className="text-sm text-stone-700">项目编码</label>
+                              <Input value={String(provider.project_code || "ChatGPT0001")} onChange={(event) => updateProvider(index, { project_code: event.target.value })} placeholder="ChatGPT0001" className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                            </div>
+                          ) : null}
+                        </>
                       ) : null}
                       {type === "duckmail" || type === "gptmail" ? (
                         <div className="space-y-2">

@@ -953,7 +953,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           ...state.registerConfig.mail,
           providers: [
             ...(state.registerConfig.mail.providers || []),
-            { enable: true, type: "cloudmail_gen", api_base: "", admin_email: "", admin_password: "", domain: [], subdomain: [], email_prefix: "" },
+            { enable: true, type: "mailnest", api_base: "https://mailnest.top", api_key: "", project_code: "ChatGPT0001", sale_mode: "temporary" },
           ],
         },
       },

@@ -37,7 +37,16 @@ config = {
         "request_timeout": 30,
         "wait_timeout": 120,
         "wait_interval": 3,
-        "providers": [],
+        "providers": [
+            {
+                "type": "mailnest",
+                "enable": False,
+                "api_base": "https://mailnest.top",
+                "api_key": "",
+                "project_code": "ChatGPT0001",
+                "sale_mode": "temporary",
+            }
+        ],
     },
     "proxy": "",
     "total": 10,
