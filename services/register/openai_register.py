@@ -447,6 +447,28 @@ def wait_for_code(mailbox: dict) -> str | None:
     return mail_provider.wait_for_code({**config["mail"], "proxy": config.get("proxy") or ""}, mailbox)
 
 
+REGISTER_QUOTA_REFRESH_MAX_ATTEMPTS = 5
+REGISTER_QUOTA_REFRESH_RETRY_DELAY_SECONDS = 2.0
+
+
+def refresh_registered_account_quota(access_token: str, index: int, max_attempts: int = REGISTER_QUOTA_REFRESH_MAX_ATTEMPTS) -> dict:
+    attempts = max(1, int(max_attempts or 1))
+    last_result: dict = {"refreshed": 0, "errors": [], "items": []}
+    for attempt in range(1, attempts + 1):
+        ensure_not_cancelled()
+        try:
+            result = account_service.refresh_accounts([access_token])
+        except Exception as exc:
+            result = {"refreshed": 0, "errors": [{"token": "registered-account", "error": str(exc)}], "items": []}
+        last_result = result if isinstance(result, dict) else last_result
+        if int(last_result.get("refreshed") or 0) > 0 and not last_result.get("errors"):
+            return last_result
+        if attempt < attempts:
+            step(index, f"账号额度刷新失败，准备第 {attempt + 1}/{attempts} 次重试: {last_result.get('errors') or '未刷新到账号'}", "yellow")
+            time.sleep(REGISTER_QUOTA_REFRESH_RETRY_DELAY_SECONDS)
+    return last_result
+
+
 def _email_domain(email: str) -> str:
     _, sep, domain = str(email or "").strip().lower().rpartition("@")
     return domain if sep else ""
@@ -1384,7 +1406,7 @@ def worker(index: int) -> dict:
         cost = time.time() - start
         access_token = str(result["access_token"])
         account_service.add_account_items([{**result, "source_type": "web", "proxy": config["proxy"]}])
-        refresh_result = account_service.refresh_accounts([access_token])
+        refresh_result = refresh_registered_account_quota(access_token, index)
         if refresh_result.get("errors"):
             step(index, f"账号已保存，刷新额度暂未成功，稍后可重试: {refresh_result['errors']}", "yellow")
         with stats_lock:

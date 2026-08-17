@@ -501,6 +501,30 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
         self.assertEqual(added_items[0]["source_type"], "web")
         self.assertIn("proxy", added_items[0])
 
+    def test_registered_account_quota_refresh_retries_until_success(self):
+        calls = []
+        responses = [
+            {"refreshed": 0, "errors": [{"error": "temporary failure"}], "items": []},
+            {"refreshed": 0, "errors": [{"error": "temporary failure"}], "items": []},
+            {"refreshed": 0, "errors": [{"error": "temporary failure"}], "items": []},
+            {"refreshed": 0, "errors": [{"error": "temporary failure"}], "items": []},
+            {"refreshed": 1, "errors": [], "items": []},
+        ]
+
+        def fake_refresh(tokens):
+            calls.append(tokens)
+            return responses[len(calls) - 1]
+
+        with patch.object(openai_register.account_service, "refresh_accounts", side_effect=fake_refresh), patch.object(
+            openai_register,
+            "step",
+        ), patch.object(openai_register.time, "sleep") as sleep:
+            result = openai_register.refresh_registered_account_quota("access-token", 2)
+
+        self.assertEqual(result["refreshed"], 1)
+        self.assertEqual(calls, [["access-token"]] * 5)
+        self.assertEqual(sleep.call_count, 4)
+
 
 if __name__ == "__main__":
     unittest.main()
