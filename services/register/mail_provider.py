@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import hashlib
+from html import unescape
 import imaplib
 import json
 import random
 import re
+import secrets
 import string
 import time
 from datetime import datetime, timezone
 from email import message_from_bytes, message_from_string, policy
 from email.header import decode_header, make_header
-from email.utils import parsedate_to_datetime
+from email.utils import getaddresses, parsedate_to_datetime
 from threading import Lock
 from typing import Any, Callable, TypeVar
+from urllib.parse import quote
 
 from curl_cffi import requests
 
@@ -301,7 +304,11 @@ def _create_session(conf: dict):
 def _parse_received_at(value: Any) -> datetime | None:
     if isinstance(value, (int, float)):
         try:
-            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+            timestamp = float(value)
+            # Some APIs (notably testmail.app) return Unix milliseconds.
+            if abs(timestamp) >= 100_000_000_000:
+                timestamp /= 1000
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
         except Exception:
             return None
     text = str(value or "").strip()
@@ -320,8 +327,8 @@ def _parse_received_at(value: Any) -> datetime | None:
 
 
 def _extract_content(data: dict[str, Any]) -> tuple[str, str]:
-    text_content = str(data.get("text_content") or data.get("text") or data.get("body") or data.get("content") or "")
-    html_content = str(data.get("html_content") or data.get("html") or data.get("html_body") or data.get("body_html") or "")
+    text_content = _value_as_text(data.get("text_content") or data.get("text") or data.get("body") or data.get("content"))
+    html_content = _value_as_text(data.get("html_content") or data.get("html") or data.get("html_body") or data.get("body_html"))
     if text_content or html_content:
         return text_content, html_content
     raw = data.get("raw")
@@ -369,10 +376,166 @@ def _extract_text_candidates(value: Any) -> list[str]:
 def _message_matches_email(data: dict[str, Any], email: str) -> bool:
     target = str(email or "").strip().lower()
     candidates: list[str] = []
-    for key in ("to", "mailTo", "receiver", "receivers", "address", "email", "envelope_to"):
+    for key in ("to", "toAddr", "toAddrOrig", "rcptto", "mailTo", "receiver", "receivers", "address", "email", "envelope_to"):
         if key in data:
             candidates.extend(_extract_text_candidates(data.get(key)))
-    return not target or not candidates or any(target in str(item).strip().lower() for item in candidates if str(item).strip())
+    if not target or not candidates:
+        return True
+    for item in candidates:
+        value = str(item).strip().lower()
+        if not value:
+            continue
+        if value == target:
+            return True
+        try:
+            if any(address.lower() == target for _, address in getaddresses([value]) if address):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _response_json(resp: Any, provider: str, action: str, expected: tuple[int, ...] = (200, 201)) -> Any:
+    try:
+        data = resp.json()
+    except Exception:
+        data = str(getattr(resp, "text", "") or "")
+    if getattr(resp, "status_code", 0) not in expected:
+        detail = data.get("message") if isinstance(data, dict) else ""
+        if isinstance(data, dict) and isinstance(data.get("error"), dict):
+            detail = data["error"].get("message") or detail
+        raise RuntimeError(f"{provider} {action}失败: HTTP {getattr(resp, 'status_code', 0)}, {detail or str(getattr(resp, 'text', ''))[:300]}")
+    return data
+
+
+def _response_text(resp: Any, provider: str, action: str, expected: tuple[int, ...] = (200,)) -> str:
+    status_code = getattr(resp, "status_code", 0)
+    if status_code not in expected:
+        raise RuntimeError(f"{provider} {action}失败: HTTP {status_code}, {str(getattr(resp, 'text', ''))[:300]}")
+    return str(getattr(resp, "text", "") or "")
+
+
+def _unwrap_data(data: Any) -> Any:
+    current = data
+    for _ in range(3):
+        if isinstance(current, dict) and isinstance(current.get("data"), (dict, list)):
+            current = current["data"]
+            continue
+        break
+    return current
+
+
+def _payload_items(data: Any, keys: tuple[str, ...] = ("messages", "emails", "items", "results", "data")) -> list[dict[str, Any]]:
+    current = _unwrap_data(data)
+    if isinstance(current, list):
+        return [item for item in current if isinstance(item, dict)]
+    if not isinstance(current, dict):
+        return []
+    for key in keys:
+        value = current.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _payload_value(data: Any, *keys: str) -> Any:
+    current = _unwrap_data(data)
+    if isinstance(current, dict):
+        for key in keys:
+            value = current.get(key)
+            if value not in (None, ""):
+                return value
+        for nested_key in ("inbox", "mailbox", "account", "email"):
+            nested = current.get(nested_key)
+            if isinstance(nested, dict):
+                value = _payload_value(nested, *keys)
+                if value not in (None, ""):
+                    return value
+    return None
+
+
+def _sender_value(value: Any) -> str:
+    if isinstance(value, dict):
+        address = value.get("address") or value.get("email") or value.get("name") or value.get("value") or ""
+        return str(address)
+    if isinstance(value, list):
+        return ", ".join(_sender_value(item) for item in value if _sender_value(item))
+    return str(value or "")
+
+
+def _value_as_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n".join(_value_as_text(item) for item in value if item is not None)
+    if isinstance(value, dict):
+        for key in ("content", "text", "body", "value", "data"):
+            if value.get(key) not in (None, ""):
+                return _value_as_text(value[key])
+    return str(value or "")
+
+
+def _extract_message_content(item: dict[str, Any]) -> tuple[str, str]:
+    body = item.get("body")
+    if isinstance(body, dict):
+        text_content = _value_as_text(body.get("text") or body.get("plain") or body.get("content"))
+        html_content = _value_as_text(body.get("html") or body.get("html_content"))
+    else:
+        text_content, html_content = _extract_content(item)
+    if not text_content:
+        for key in ("text", "text_content", "mail_text", "plain", "data", "content", "body"):
+            value = item.get(key)
+            if isinstance(value, dict):
+                value = value.get("text") or value.get("plain") or value.get("content")
+            if value not in (None, ""):
+                text_content = _value_as_text(value)
+                break
+    if not html_content:
+        for key in ("html", "html_content", "html_body", "mail_html", "body_html"):
+            value = item.get(key)
+            if value not in (None, ""):
+                html_content = _value_as_text(value)
+                break
+    return str(text_content or ""), str(html_content or "")
+
+
+def _message_sort_key(item: dict[str, Any]) -> tuple[float, str]:
+    received = _parse_received_at(
+        item.get("receivedAt")
+        or item.get("received_at")
+        or item.get("receivedDateTime")
+        or item.get("received_date")
+        or item.get("createdAt")
+        or item.get("created_at")
+        or item.get("mail_timestamp")
+        or item.get("timestamp")
+        or item.get("date")
+    )
+    return (received.timestamp() if received else 0.0, str(item.get("id") or item.get("_id") or item.get("message_id") or ""))
+
+
+def _graphql_data(data: Any, provider: str, action: str) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{provider} {action}返回结构不是对象")
+    errors = data.get("errors")
+    if isinstance(errors, list) and errors:
+        details = "; ".join(str(item.get("message") or item) if isinstance(item, dict) else str(item) for item in errors)
+        raise RuntimeError(f"{provider} {action}失败: {details[:300]}")
+    result = data.get("data")
+    if not isinstance(result, dict):
+        raise RuntimeError(f"{provider} {action}响应缺少 data")
+    return result
+
+
+def _local_part(value: str | None) -> str:
+    text = str(value or "").strip()
+    return text.rsplit("@", 1)[0] if "@" in text else text
+
+
+def _configured_domains(entry: dict, default: str = "") -> list[str]:
+    raw = entry.get("domain") or entry.get("domains") or []
+    values = _normalize_string_list(raw)
+    return values or ([default] if default else [])
 
 
 def _extract_code(message: dict[str, Any]) -> str | None:
@@ -435,17 +598,31 @@ class BaseMailProvider:
             mailbox["_seen_code_message_refs"] = seen_value
         seen_refs = {str(item) for item in seen_value}
 
-        def extract_unseen_code(message: dict[str, Any]) -> str | None:
-            ref = _message_tracking_ref(message)
-            if ref in seen_refs:
-                return None
-            code = _extract_code(message)
-            if code:
-                seen_value.append(ref)
+        deadline = time.monotonic() + self.conf["wait_timeout"]
+        while time.monotonic() < deadline:
+            _check_cancelled()
+            fetch_recent = getattr(self, "fetch_recent_messages", None)
+            messages = fetch_recent(mailbox) if callable(fetch_recent) else None
+            if messages is None:
+                latest = self.fetch_latest_message(mailbox)
+                messages = [latest] if latest else []
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+                ref = _message_tracking_ref(message)
+                if ref in seen_refs:
+                    continue
+                code = _extract_code(message)
                 seen_refs.add(ref)
-            return code
-
-        return self.wait_for(mailbox, extract_unseen_code)
+                if code:
+                    seen_value.append(ref)
+                    return code
+            sleep_for = max(0.2, self.conf["wait_interval"])
+            until = min(deadline, time.monotonic() + sleep_for)
+            while time.monotonic() < until:
+                _check_cancelled()
+                time.sleep(min(0.2, until - time.monotonic()))
+        return None
 
     def close(self) -> None:
         pass
@@ -1560,6 +1737,760 @@ class OutlookTokenProvider(BaseMailProvider):
         return None
 
 
+class _ApiPlatformMailProvider(BaseMailProvider):
+    """Mail.tm/Mail.gw 兼容的 API-Platform 临时邮箱实现。"""
+
+    default_api_base = ""
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.api_base = str(entry.get("api_base") or self.default_api_base).rstrip("/")
+        self.domain = _configured_domains(entry)
+        self.session = _create_session(conf)
+
+    def close(self) -> None:
+        self.session.close()
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        token: str = "",
+        params: dict | None = None,
+        payload: dict | None = None,
+        expected: tuple[int, ...] = (200, 201),
+    ) -> Any:
+        headers = {"Accept": "application/json", "User-Agent": self.conf["user_agent"]}
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        resp = self.session.request(
+            method.upper(),
+            f"{self.api_base}{path}",
+            headers=headers,
+            params=params,
+            json=payload,
+            timeout=self.conf["request_timeout"],
+            verify=False,
+        )
+        return _response_json(resp, self.name, path, expected)
+
+    def _resolve_domain(self) -> str:
+        if self.domain:
+            return _next_domain(self.domain).lstrip("@").strip()
+        data = self._request("GET", "/domains", params={"page": 1})
+        items = _payload_items(data, ("hydra:member", "domains", "items", "data"))
+        domains = [
+            str(item.get("domain") or item.get("name") or "").strip().lstrip("@")
+            for item in items
+            if isinstance(item, dict) and item.get("isActive", True) is not False
+        ]
+        domains = [item for item in domains if item]
+        if not domains:
+            raise RuntimeError(f"{self.name} /domains 未返回可用域名")
+        return _next_domain(domains)
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        local_part = re.sub(r"[^a-zA-Z0-9._-]", "", _local_part(username)) or _random_mailbox_name()
+        address = f"{local_part}@{self._resolve_domain()}"
+        password = secrets.token_urlsafe(18)
+        account = self._request("POST", "/accounts", payload={"address": address, "password": password})
+        account_id = str(_payload_value(account, "id") or "").strip()
+        created_address = str(_payload_value(account, "address") or address).strip()
+        token_data = self._request("POST", "/token", payload={"address": created_address, "password": password})
+        token = str(_payload_value(token_data, "token") or "").strip()
+        if not token:
+            raise RuntimeError(f"{self.name} 创建 token 响应缺少 token")
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": created_address,
+            "password": password,
+            "token": token,
+            "account_id": account_id,
+        }
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        token = str(mailbox.get("token") or "").strip()
+        if not token:
+            raise RuntimeError(f"{self.name} mailbox 缺少 token")
+        data = self._request("GET", "/messages", token=token, params={"page": 1})
+        items = _payload_items(data, ("hydra:member", "messages", "items", "data"))
+        if not items:
+            return None
+        item = max(items, key=_message_sort_key)
+        message_id = str(item.get("id") or item.get("message_id") or item.get("@id") or "").strip()
+        if message_id.startswith("/messages/"):
+            message_id = message_id.rsplit("/", 1)[-1]
+        if message_id:
+            item = self._request("GET", f"/messages/{quote(message_id, safe='')}", token=token)
+        text_content, html_content = _extract_message_content(item)
+        html_value = item.get("html")
+        if isinstance(html_value, list) and not html_content:
+            html_content = "".join(str(value) for value in html_value)
+        return {
+            "provider": self.name,
+            "mailbox": mailbox["address"],
+            "message_id": message_id,
+            "subject": str(item.get("subject") or ""),
+            "sender": _sender_value(item.get("from") or item.get("sender")),
+            "text_content": text_content,
+            "html_content": html_content,
+            "received_at": _parse_received_at(item.get("createdAt") or item.get("created_at") or item.get("receivedAt") or item.get("date")),
+            "raw": item,
+        }
+
+
+class MailTmProvider(_ApiPlatformMailProvider):
+    name = "mail_tm"
+    default_api_base = "https://api.mail.tm"
+
+
+class MailGwProvider(_ApiPlatformMailProvider):
+    name = "mail_gw"
+    default_api_base = "https://api.mail.gw"
+
+
+class DropMailProvider(BaseMailProvider):
+    name = "dropmail"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.api_base = str(entry.get("api_base") or "https://dropmail.me/api/graphql").rstrip("/")
+        self.api_token = str(entry.get("token") or entry.get("api_key") or "").strip()
+        self.domain = _configured_domains(entry)
+        self.permanent_domain_only = entry.get("permanent_domain_only", False) is True
+        self.session = _create_session(conf)
+
+    def close(self) -> None:
+        self.session.close()
+
+    def _request(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+        if not self.api_token:
+            raise RuntimeError("DropMail 需要 api_key/token（请填写免费的 af_... API token）")
+        resp = self.session.post(
+            f"{self.api_base}/{self.api_token}",
+            headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": self.conf["user_agent"]},
+            json={"query": query, "variables": variables or {}},
+            timeout=self.conf["request_timeout"],
+            verify=False,
+        )
+        return _graphql_data(_response_json(resp, self.name, "GraphQL", (200,)), self.name, "GraphQL")
+
+    def _domain_id(self) -> str:
+        if not self.domain:
+            return ""
+        data = self._request("query { domains { id name availableVia expiresAt } }")
+        domains = data.get("domains") if isinstance(data.get("domains"), list) else []
+        wanted = {str(value).strip().lstrip("@").lower() for value in self.domain}
+        for item in domains:
+            if isinstance(item, dict) and str(item.get("name") or "").strip().lower() in wanted:
+                return str(item.get("id") or "").strip()
+        raise RuntimeError(f"DropMail 未找到配置的 domain: {', '.join(self.domain)}")
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        # DropMail 的地址 local-part 由服务端分配，username 仅作为兼容接口保留。
+        domain_id = self._domain_id()
+        if domain_id:
+            input_value = f'withAddress: true, domainId: "{domain_id}"'
+        else:
+            input_value = "withAddress: true"
+        if self.permanent_domain_only:
+            input_value += ", permanentDomainOnly: true"
+        query = f"mutation {{ introduceSession(input: {{{input_value}}}) {{ id expiresAt addresses {{ id address restoreKey }} }} }}"
+        data = self._request(query)
+        session_data = data.get("introduceSession") if isinstance(data.get("introduceSession"), dict) else {}
+        addresses = session_data.get("addresses") if isinstance(session_data.get("addresses"), list) else []
+        address_data = addresses[0] if addresses and isinstance(addresses[0], dict) else {}
+        address = str(address_data.get("address") or "").strip()
+        session_id = str(session_data.get("id") or "").strip()
+        if not address or not session_id:
+            raise RuntimeError("DropMail 创建响应缺少 session id 或 address")
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": address,
+            "session_id": session_id,
+            "restore_key": str(address_data.get("restoreKey") or ""),
+            "expires_at": str(session_data.get("expiresAt") or ""),
+        }
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        session_id = str(mailbox.get("session_id") or "").strip()
+        if not session_id:
+            raise RuntimeError("DropMail mailbox 缺少 session_id")
+        query = "query ($id: ID!) { session(id: $id) { mails { id raw fromAddr toAddr receivedAt text html headerFrom headerSubject } } }"
+        data = self._request(query, {"id": session_id})
+        session_data = data.get("session") if isinstance(data.get("session"), dict) else {}
+        items = session_data.get("mails") if isinstance(session_data.get("mails"), list) else []
+        messages = [item for item in items if isinstance(item, dict) and _message_matches_email(item, str(mailbox.get("address") or ""))]
+        if not messages:
+            return None
+        item = max(messages, key=_message_sort_key)
+        text_content, html_content = _extract_message_content(item)
+        return {
+            "provider": self.name,
+            "mailbox": mailbox["address"],
+            "message_id": str(item.get("id") or ""),
+            "subject": str(item.get("headerSubject") or item.get("subject") or ""),
+            "sender": str(item.get("fromAddr") or item.get("headerFrom") or ""),
+            "text_content": text_content,
+            "html_content": html_content,
+            "received_at": _parse_received_at(item.get("receivedAt") or item.get("date")),
+            "raw": item,
+        }
+
+
+class GuerrillaMailProvider(BaseMailProvider):
+    name = "guerrilla_mail"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.api_base = str(entry.get("api_base") or "https://api.guerrillamail.com/ajax.php").strip()
+        self.client_ip = str(entry.get("client_ip") or "127.0.0.1").strip()
+        self.session = _create_session(conf)
+
+    def close(self) -> None:
+        self.session.close()
+
+    def _restore_cookies(self, mailbox: dict[str, Any]) -> None:
+        cookies = mailbox.get("cookies")
+        if isinstance(cookies, dict):
+            for name, value in cookies.items():
+                if value:
+                    try:
+                        self.session.cookies.set(str(name), str(value))
+                    except Exception:
+                        pass
+        for name in ("PHPSESSID", "SUBSCR"):
+            value = str(mailbox.get(name.lower()) or "").strip()
+            if value:
+                try:
+                    self.session.cookies.set(name, value)
+                except Exception:
+                    pass
+
+    def _remember_cookies(self, mailbox: dict[str, Any]) -> None:
+        cookies: dict[str, str] = {}
+        for name in ("PHPSESSID", "SUBSCR"):
+            try:
+                value = self.session.cookies.get(name)
+            except Exception:
+                value = ""
+            if value:
+                cookies[name] = str(value)
+                mailbox[name.lower()] = str(value)
+        if cookies:
+            mailbox["cookies"] = cookies
+
+    def _request(self, function: str, mailbox: dict[str, Any] | None = None, **params: Any) -> dict[str, Any]:
+        if mailbox:
+            self._restore_cookies(mailbox)
+            subscriber = str(mailbox.get("subscr") or mailbox.get("SUBSCR") or "").strip()
+            if subscriber:
+                params.setdefault("SUBSCR", subscriber)
+        query = {"f": function, "ip": self.client_ip, "agent": self.conf["user_agent"], **params}
+        resp = self.session.get(self.api_base, params=query, timeout=self.conf["request_timeout"], verify=False)
+        data = _response_json(resp, self.name, function, (200,))
+        if not isinstance(data, dict):
+            raise RuntimeError(f"GuerrillaMail {function} 返回结构不是对象")
+        if mailbox:
+            self._remember_cookies(mailbox)
+        return data
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        data = self._request("get_email_address", lang="en")
+        address = str(data.get("email_addr") or "").strip()
+        if username:
+            user = _local_part(username)
+            if user:
+                data = self._request("set_email_user", email_user=user, lang="en")
+                address = str(data.get("email_addr") or address).strip()
+        if not address:
+            raise RuntimeError("GuerrillaMail 创建响应缺少 email_addr")
+        mailbox: dict[str, Any] = {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": address,
+            "email_timestamp": data.get("email_timestamp") or data.get("ts"),
+        }
+        self._remember_cookies(mailbox)
+        return mailbox
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        data = self._request("check_email", mailbox=mailbox, seq=0)
+        items = data.get("list") if isinstance(data.get("list"), list) else []
+        messages = [item for item in items if isinstance(item, dict)]
+        if not messages:
+            return None
+        item = max(messages, key=_message_sort_key)
+        message_id = str(item.get("mail_id") or item.get("id") or "").strip()
+        if not message_id:
+            return None
+        detail = self._request("fetch_email", mailbox=mailbox, email_id=message_id)
+        text_content = _value_as_text(detail.get("email_body_plain") or detail.get("mail_body_plain") or detail.get("body_plain") or detail.get("text") or detail.get("mail_excerpt"))
+        html_content = _value_as_text(detail.get("email_body") or detail.get("body") or detail.get("html"))
+        if not text_content and html_content:
+            text_content = unescape(re.sub(r"<[^>]+>", " ", html_content))
+        return {
+            "provider": self.name,
+            "mailbox": mailbox["address"],
+            "message_id": message_id,
+            "subject": unescape(str(detail.get("mail_subject") or item.get("mail_subject") or "")),
+            "sender": str(detail.get("mail_from") or item.get("mail_from") or ""),
+            "text_content": text_content,
+            "html_content": html_content,
+            "received_at": _parse_received_at(detail.get("mail_timestamp") or item.get("mail_timestamp") or detail.get("mail_date") or item.get("mail_date")),
+            "raw": detail,
+        }
+
+
+class MaildropProvider(BaseMailProvider):
+    name = "maildrop"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.api_base = str(entry.get("api_base") or "https://api.maildrop.cc/graphql").rstrip("/")
+        self.default_domain = "maildrop.cc"
+        self.session = _create_session(conf)
+
+    def close(self) -> None:
+        self.session.close()
+
+    def _request(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+        resp = self.session.post(
+            self.api_base,
+            headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": self.conf["user_agent"]},
+            json={"query": query, "variables": variables or {}},
+            timeout=self.conf["request_timeout"],
+            verify=False,
+        )
+        return _graphql_data(_response_json(resp, self.name, "GraphQL", (200,)), self.name, "GraphQL")
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        local_part = re.sub(r"[^a-zA-Z0-9._-]", "", _local_part(username)) or _random_mailbox_name()
+        return {"provider": self.name, "provider_ref": self.provider_ref, "address": f"{local_part}@{self.default_domain}"}
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        address = str(mailbox.get("address") or "").strip()
+        mailbox_name = _local_part(address) or address
+        data = self._request(
+            "query Inbox($mailbox: String!) { inbox(mailbox: $mailbox) { id headerfrom mailfrom rcptto subject date } }",
+            {"mailbox": mailbox_name},
+        )
+        items = data.get("inbox") if isinstance(data.get("inbox"), list) else []
+        messages = [item for item in items if isinstance(item, dict) and _message_matches_email(item, address)]
+        if not messages:
+            return None
+        item = max(messages, key=_message_sort_key)
+        message_id = str(item.get("id") or "").strip()
+        detail = self._request(
+            "query Message($mailbox: String!, $id: String!) { message(mailbox: $mailbox, id: $id) { id headerfrom mailfrom rcptto subject date data html } }",
+            {"mailbox": mailbox_name, "id": message_id},
+        )
+        message = detail.get("message") if isinstance(detail.get("message"), dict) else item
+        text_content = _value_as_text(message.get("data") or message.get("text"))
+        html_content = _value_as_text(message.get("html"))
+        return {
+            "provider": self.name,
+            "mailbox": address,
+            "message_id": message_id,
+            "subject": str(message.get("subject") or ""),
+            "sender": str(message.get("headerfrom") or message.get("mailfrom") or ""),
+            "text_content": text_content,
+            "html_content": html_content,
+            "received_at": _parse_received_at(message.get("date")),
+            "raw": message,
+        }
+
+
+class CatchmailProvider(BaseMailProvider):
+    name = "catchmail"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.api_base = str(entry.get("api_base") or "https://api.catchmail.io").rstrip("/")
+        self.api_key = str(entry.get("api_key") or "").strip()
+        self.domain = _configured_domains(entry, "catchmail.io")
+        self.session = _create_session(conf)
+
+    def close(self) -> None:
+        self.session.close()
+
+    def _request(self, method: str, path: str, params: dict | None = None) -> Any:
+        headers = {"Accept": "application/json", "User-Agent": self.conf["user_agent"]}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+            headers["X-API-Key"] = self.api_key
+        resp = self.session.request(method.upper(), f"{self.api_base}{path}", headers=headers, params=params, timeout=self.conf["request_timeout"], verify=False)
+        return _response_json(resp, self.name, path, (200, 204))
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        address = f"{re.sub(r'[^a-zA-Z0-9._-]', '', _local_part(username)) or _random_mailbox_name()}@{_next_domain(self.domain)}"
+        return {"provider": self.name, "provider_ref": self.provider_ref, "address": address}
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        address = str(mailbox.get("address") or "").strip()
+        data = self._request("GET", "/api/v1/mailbox", {"address": address, "page": 1, "page_size": 50})
+        items = _payload_items(data, ("messages", "items", "data"))
+        messages = [item for item in items if _message_matches_email(item, address)]
+        if not messages:
+            return None
+        item = max(messages, key=_message_sort_key)
+        message_id = str(item.get("id") or item.get("message_id") or "").strip()
+        if not message_id:
+            return None
+        detail = self._request("GET", f"/api/v1/message/{quote(message_id, safe='')}", {"mailbox": address})
+        message = detail if isinstance(detail, dict) else item
+        text_content, html_content = _extract_message_content(message)
+        return {
+            "provider": self.name,
+            "mailbox": address,
+            "message_id": message_id,
+            "subject": str(message.get("subject") or item.get("subject") or ""),
+            "sender": _sender_value(message.get("from") or item.get("from")),
+            "text_content": text_content,
+            "html_content": html_content,
+            "received_at": _parse_received_at(message.get("date") or item.get("date")),
+            "raw": message,
+        }
+
+
+class DustMailProvider(BaseMailProvider):
+    name = "dustmail"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.api_base = str(entry.get("api_base") or "https://dustmail.net/api/v1").rstrip("/")
+        self.api_key = str(entry.get("api_key") or "").strip()
+        self.session = _create_session(conf)
+
+    def close(self) -> None:
+        self.session.close()
+
+    def _request(self, method: str, path: str, payload: dict | None = None) -> Any:
+        if not self.api_key:
+            raise RuntimeError("DustMail 需要 API Key")
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": self.conf["user_agent"],
+            "Authorization": f"Bearer {self.api_key}",
+            "X-API-Key": self.api_key,
+        }
+        resp = self.session.request(method.upper(), f"{self.api_base}{path}", headers=headers, json=payload, timeout=self.conf["request_timeout"], verify=False)
+        return _response_json(resp, self.name, path, (200, 201, 204))
+
+    @staticmethod
+    def _inbox_data(data: Any) -> dict[str, Any]:
+        current = _unwrap_data(data)
+        if isinstance(current, list):
+            return {"messages": current}
+        if isinstance(current, dict):
+            for key in ("inbox", "data"):
+                nested = current.get(key)
+                if isinstance(nested, list):
+                    return {"messages": nested}
+                if isinstance(nested, dict):
+                    return nested
+            return current
+        return {}
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        # username/domain are premium-only on the free plan. Always use the
+        # random free inbox unless the service itself accepts the optional field.
+        data = self._request("POST", "/inbox", payload=None)
+        inbox = self._inbox_data(data)
+        inbox_id = str(inbox.get("id") or inbox.get("_id") or inbox.get("inbox_id") or inbox.get("inboxId") or "").strip()
+        address = str(inbox.get("address") or inbox.get("email") or inbox.get("email_address") or "").strip()
+        if (not inbox_id or not address) and inbox_id:
+            try:
+                detail = self._inbox_data(self._request("GET", f"/inbox/{quote(inbox_id, safe='')}"))
+                address = address or str(detail.get("address") or detail.get("email") or detail.get("email_address") or "").strip()
+            except RuntimeError:
+                pass
+        if not inbox_id or not address:
+            raise RuntimeError("DustMail 创建响应缺少 inbox id 或 address")
+        return {"provider": self.name, "provider_ref": self.provider_ref, "address": address, "inbox_id": inbox_id}
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        inbox_id = str(mailbox.get("inbox_id") or "").strip()
+        if not inbox_id:
+            raise RuntimeError("DustMail mailbox 缺少 inbox_id")
+        data = self._inbox_data(self._request("GET", f"/inbox/{quote(inbox_id, safe='')}"))
+        items = _payload_items(data, ("messages", "emails", "items", "data"))
+        if not items:
+            return None
+        address = str(mailbox.get("address") or "")
+        messages = [item for item in items if _message_matches_email(item, address)]
+        item = max(messages or items, key=_message_sort_key)
+        text_content, html_content = _extract_message_content(item)
+        return {
+            "provider": self.name,
+            "mailbox": address,
+            "message_id": str(item.get("id") or item.get("_id") or item.get("message_id") or ""),
+            "subject": str(item.get("subject") or ""),
+            "sender": _sender_value(item.get("from") or item.get("sender")),
+            "text_content": text_content,
+            "html_content": html_content,
+            "received_at": _parse_received_at(item.get("receivedAt") or item.get("received_at") or item.get("createdAt") or item.get("date")),
+            "raw": item,
+        }
+
+
+class CleanTempMailProvider(BaseMailProvider):
+    name = "cleantempmail"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.api_base = str(entry.get("api_base") or "https://cleantempmail.com/api").rstrip("/")
+        self.api_key = str(entry.get("api_key") or "ct-test").strip() or "ct-test"
+        self.domain = _configured_domains(entry)
+        self.session = _create_session(conf)
+
+    def close(self) -> None:
+        self.session.close()
+
+    def _request(self, method: str, path: str, params: dict | None = None, payload: dict | None = None) -> Any:
+        resp = self.session.request(
+            method.upper(),
+            f"{self.api_base}{path}",
+            headers={"Accept": "application/json", "User-Agent": self.conf["user_agent"], "X-API-Key": self.api_key},
+            params=params,
+            json=payload,
+            timeout=self.conf["request_timeout"],
+            verify=False,
+        )
+        return _response_json(resp, self.name, path, (200, 201, 204))
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if username:
+            payload["prefix"] = _local_part(username)
+        if self.domain:
+            payload["domain"] = _next_domain(self.domain)
+        data = self._request("POST" if payload else "GET", "/generate-email", payload=payload or None)
+        address = str(_payload_value(data, "email", "address", "email_address") or "").strip()
+        if not address and isinstance(data, str):
+            address = data.strip()
+        if not address:
+            raise RuntimeError("CleanTempMail 创建响应缺少 email/address")
+        return {"provider": self.name, "provider_ref": self.provider_ref, "address": address}
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        address = str(mailbox.get("address") or "").strip()
+        data = self._request("GET", "/emails", params={"email": address})
+        items = _payload_items(data, ("emails", "messages", "items", "data"))
+        messages = [item for item in items if _message_matches_email(item, address)]
+        if not messages:
+            return None
+        item = max(messages, key=_message_sort_key)
+        message_id = str(item.get("id") or item.get("_id") or item.get("message_id") or "").strip()
+        detail = self._request("GET", f"/email/{quote(message_id, safe='')}") if message_id else item
+        message = detail if isinstance(detail, dict) else item
+        text_content, html_content = _extract_message_content(message)
+        return {
+            "provider": self.name,
+            "mailbox": address,
+            "message_id": message_id,
+            "subject": str(message.get("subject") or item.get("subject") or ""),
+            "sender": _sender_value(message.get("from") or message.get("sender") or item.get("from")),
+            "text_content": text_content,
+            "html_content": html_content,
+            "received_at": _parse_received_at(message.get("received_at") or message.get("receivedAt") or message.get("created_at") or message.get("date") or item.get("date")),
+            "raw": message,
+        }
+
+
+class TestmailAppProvider(BaseMailProvider):
+    name = "testmail_app"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.api_base = str(entry.get("api_base") or "https://api.testmail.app/api/json").rstrip("/")
+        self.api_key = str(entry.get("api_key") or "").strip()
+        self.namespace = str(entry.get("namespace") or "").strip()
+        self.default_domain = "inbox.testmail.app"
+        self.session = _create_session(conf)
+
+    def close(self) -> None:
+        self.session.close()
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        if not self.api_key or not self.namespace:
+            raise RuntimeError("testmail.app 需要 api_key 和 namespace（从控制台获取）")
+        tag = re.sub(r"[^a-zA-Z0-9._-]", "", _local_part(username)) or "user"
+        # Keep every registration isolated from old messages and parallel runs.
+        tag = f"{tag}.{secrets.token_hex(4)}"
+        address = f"{self.namespace}.{tag}@{self.default_domain}"
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": address,
+            "namespace": self.namespace,
+            "tag": tag,
+            "timestamp_from": int(time.time() * 1000),
+        }
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        params = {
+            "apikey": self.api_key,
+            "namespace": str(mailbox.get("namespace") or self.namespace),
+            "tag": str(mailbox.get("tag") or ""),
+            "timestamp_from": int(mailbox.get("timestamp_from") or 0),
+            "limit": 20,
+        }
+        resp = self.session.get(self.api_base, params=params, headers={"Accept": "application/json", "User-Agent": self.conf["user_agent"]}, timeout=self.conf["request_timeout"], verify=False)
+        data = _response_json(resp, self.name, "inbox", (200,))
+        if isinstance(data, dict) and str(data.get("result") or "success") == "fail":
+            raise RuntimeError(f"testmail.app 收件失败: {data.get('message') or 'unknown error'}")
+        items = _payload_items(data, ("emails", "messages", "items", "data"))
+        address = str(mailbox.get("address") or "")
+        messages = [item for item in items if _message_matches_email(item, address)]
+        if not messages:
+            return None
+        item = max(messages, key=_message_sort_key)
+        text_content, html_content = _extract_message_content(item)
+        sender = item.get("from") or item.get("from_parsed") or item.get("sender")
+        return {
+            "provider": self.name,
+            "mailbox": address,
+            "message_id": str(item.get("id") or item.get("message_id") or item.get("messageId") or ""),
+            "subject": str(item.get("subject") or ""),
+            "sender": _sender_value(sender),
+            "text_content": text_content,
+            "html_content": html_content,
+            "received_at": _parse_received_at(item.get("timestamp") or item.get("received_at") or item.get("date")),
+            "raw": item,
+        }
+
+
+class MailiskProvider(BaseMailProvider):
+    name = "mailisk"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.api_base = str(entry.get("api_base") or "https://api.mailisk.com/api").rstrip("/")
+        self.api_key = str(entry.get("api_key") or "").strip()
+        self.namespace = str(entry.get("namespace") or "").strip()
+        self.default_domain = "mailisk.net"
+        self.session = _create_session(conf)
+
+    def close(self) -> None:
+        self.session.close()
+
+    def _request(self, path: str, params: dict | None = None) -> Any:
+        if not self.api_key or not self.namespace:
+            raise RuntimeError("Mailisk 需要 api_key 和 namespace（从 dashboard 获取）")
+        resp = self.session.get(
+            f"{self.api_base}{path}",
+            params=params,
+            headers={"Accept": "application/json", "User-Agent": self.conf["user_agent"], "X-Api-Key": self.api_key},
+            timeout=self.conf["request_timeout"],
+            verify=False,
+        )
+        return _response_json(resp, self.name, path, (200,))
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        if not self.api_key or not self.namespace:
+            raise RuntimeError("Mailisk 需要 api_key 和 namespace（从 dashboard 获取）")
+        local_part = re.sub(r"[^a-zA-Z0-9._-]", "", _local_part(username)) or _random_mailbox_name()
+        address = f"{local_part}@{self.namespace}.{self.default_domain}"
+        return {"provider": self.name, "provider_ref": self.provider_ref, "address": address, "namespace": self.namespace}
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        address = str(mailbox.get("address") or "")
+        local_part = _local_part(address)
+        params = {"limit": 20, "offset": 0}
+        if local_part:
+            params["to_addr_prefix"] = f"{local_part}@"
+        data = self._request(f"/emails/{quote(str(mailbox.get('namespace') or self.namespace), safe='')}/inbox", params)
+        items = _payload_items(data, ("data", "emails", "messages", "items"))
+        messages = [item for item in items if _message_matches_email(item, address)]
+        if not messages:
+            return None
+        item = max(messages, key=_message_sort_key)
+        text_content, html_content = _extract_message_content(item)
+        return {
+            "provider": self.name,
+            "mailbox": address,
+            "message_id": str(item.get("id") or item.get("message_id") or ""),
+            "subject": str(item.get("subject") or ""),
+            "sender": _sender_value(item.get("from") or item.get("sender")),
+            "text_content": text_content,
+            "html_content": html_content,
+            "received_at": _parse_received_at(item.get("received_date") or item.get("received_timestamp") or item.get("received_at") or item.get("date")),
+            "raw": item,
+        }
+
+
+class MailsacProvider(BaseMailProvider):
+    name = "mailsac"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.api_base = str(entry.get("api_base") or "https://mailsac.com").rstrip("/")
+        self.api_key = str(entry.get("api_key") or "").strip()
+        self.domain = _configured_domains(entry, "mailsac.com")
+        self.session = _create_session(conf)
+
+    def close(self) -> None:
+        self.session.close()
+
+    def _request(self, path: str, params: dict | None = None) -> Any:
+        headers = {"Accept": "application/json", "User-Agent": self.conf["user_agent"]}
+        if self.api_key:
+            headers["Mailsac-Key"] = self.api_key
+        resp = self.session.get(f"{self.api_base}{path}", params=params, headers=headers, timeout=self.conf["request_timeout"], verify=False)
+        return _response_json(resp, self.name, path, (200,))
+
+    def _request_text(self, path: str) -> str:
+        headers = {"Accept": "text/plain, text/html", "User-Agent": self.conf["user_agent"]}
+        if self.api_key:
+            headers["Mailsac-Key"] = self.api_key
+        resp = self.session.get(f"{self.api_base}{path}", headers=headers, timeout=self.conf["request_timeout"], verify=False)
+        return _response_text(resp, self.name, path)
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        local_part = re.sub(r"[^a-zA-Z0-9._-]", "", _local_part(username)) or _random_mailbox_name()
+        address = f"{local_part}@{_next_domain(self.domain)}"
+        return {"provider": self.name, "provider_ref": self.provider_ref, "address": address}
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        address = str(mailbox.get("address") or "").strip()
+        encoded_address = quote(address, safe="@")
+        data = self._request(f"/api/addresses/{encoded_address}/messages")
+        items = _payload_items(data, ("messages", "items", "data"))
+        messages = [item for item in items if _message_matches_email(item, address)]
+        if not messages:
+            return None
+        item = max(messages, key=_message_sort_key)
+        message_id = str(item.get("_id") or item.get("id") or item.get("message_id") or "").strip()
+        if not message_id:
+            return None
+        text_content = ""
+        html_content = ""
+        try:
+            text_content = self._request_text(f"/api/text/{encoded_address}/{quote(message_id, safe='')}")
+        except RuntimeError:
+            pass
+        try:
+            html_content = self._request_text(f"/api/body/{encoded_address}/{quote(message_id, safe='')}")
+        except RuntimeError:
+            pass
+        return {
+            "provider": self.name,
+            "mailbox": address,
+            "message_id": message_id,
+            "subject": str(item.get("subject") or ""),
+            "sender": _sender_value(item.get("from") or item.get("sender")),
+            "text_content": text_content,
+            "html_content": html_content,
+            "received_at": _parse_received_at(item.get("received") or item.get("received_at") or item.get("date")),
+            "raw": {"metadata": item, "text": text_content, "html": html_content},
+        }
+
+
 def _entries(mail_config: dict) -> list[dict]:
     result: list[dict] = []
     counters: dict[str, int] = {}
@@ -1617,6 +2548,28 @@ def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = 
         return OutlookTokenProvider(entry, conf)
     if entry["type"] == "mailnest":
         return MailNestProvider(entry, conf)
+    if entry["type"] == "mail_tm":
+        return MailTmProvider(entry, conf)
+    if entry["type"] == "mail_gw":
+        return MailGwProvider(entry, conf)
+    if entry["type"] == "dropmail":
+        return DropMailProvider(entry, conf)
+    if entry["type"] == "guerrilla_mail":
+        return GuerrillaMailProvider(entry, conf)
+    if entry["type"] == "maildrop":
+        return MaildropProvider(entry, conf)
+    if entry["type"] == "catchmail":
+        return CatchmailProvider(entry, conf)
+    if entry["type"] == "dustmail":
+        return DustMailProvider(entry, conf)
+    if entry["type"] == "cleantempmail":
+        return CleanTempMailProvider(entry, conf)
+    if entry["type"] == "testmail_app":
+        return TestmailAppProvider(entry, conf)
+    if entry["type"] == "mailisk":
+        return MailiskProvider(entry, conf)
+    if entry["type"] == "mailsac":
+        return MailsacProvider(entry, conf)
     raise RuntimeError(f"不支持的 mail.provider: {entry['type']}")
 
 

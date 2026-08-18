@@ -59,6 +59,17 @@ export function RegisterCard() {
       ...(type === "ddg_mail" ? { ddg_token: "", cf_inbox_jwt: "", cf_domain: [], admin_password: "" } : {}),
       ...(type === "outlook_token" ? { mailboxes: "", mode: "graph", imap_host: "outlook.office365.com", message_limit: 10 } : {}),
       ...(type === "mailnest" ? { api_base: "https://mailnest.top", api_key: "", project_code: "ChatGPT0001", sale_mode: "temporary" } : {}),
+      ...(type === "mail_tm" ? { api_base: "https://api.mail.tm", domain: [] } : {}),
+      ...(type === "mail_gw" ? { api_base: "https://api.mail.gw", domain: [] } : {}),
+      ...(type === "dropmail" ? { api_base: "https://dropmail.me/api/graphql", api_key: "", domain: [], permanent_domain_only: false } : {}),
+      ...(type === "guerrilla_mail" ? { api_base: "https://api.guerrillamail.com/ajax.php" } : {}),
+      ...(type === "maildrop" ? { api_base: "https://api.maildrop.cc/graphql" } : {}),
+      ...(type === "catchmail" ? { api_base: "https://api.catchmail.io", api_key: "", domain: ["catchmail.io"] } : {}),
+      ...(type === "dustmail" ? { api_base: "https://dustmail.net/api/v1", api_key: "" } : {}),
+      ...(type === "cleantempmail" ? { api_base: "https://cleantempmail.com/api", api_key: "ct-test", domain: [] } : {}),
+      ...(type === "testmail_app" ? { api_base: "https://api.testmail.app/api/json", api_key: "", namespace: "" } : {}),
+      ...(type === "mailisk" ? { api_base: "https://api.mailisk.com/api", api_key: "", namespace: "" } : {}),
+      ...(type === "mailsac" ? { api_base: "https://mailsac.com", api_key: "", domain: ["mailsac.com"] } : {}),
     });
   };
 
@@ -201,10 +212,21 @@ export function RegisterCard() {
                             <SelectItem value="ddg_mail">ddg_mail (DDG邮箱+CF中转)</SelectItem>
                             <SelectItem value="outlook_token">outlook_token (Outlook/Hotmail 邮箱池)</SelectItem>
                             <SelectItem value="mailnest">mailnest (ChatGPT 邮箱 API)</SelectItem>
+                            <SelectItem value="mail_tm">mail_tm (Mail.tm)</SelectItem>
+                            <SelectItem value="mail_gw">mail_gw (Mail.gw)</SelectItem>
+                            <SelectItem value="dropmail">dropmail (DropMail)</SelectItem>
+                            <SelectItem value="guerrilla_mail">guerrilla_mail (Guerrilla Mail)</SelectItem>
+                            <SelectItem value="maildrop">maildrop (Maildrop)</SelectItem>
+                            <SelectItem value="catchmail">catchmail (Catchmail)</SelectItem>
+                            <SelectItem value="dustmail">dustmail (DustMail)</SelectItem>
+                            <SelectItem value="cleantempmail">cleantempmail (CleanTempMail)</SelectItem>
+                            <SelectItem value="testmail_app">testmail_app (testmail.app)</SelectItem>
+                            <SelectItem value="mailisk">mailisk (Mailisk)</SelectItem>
+                            <SelectItem value="mailsac">mailsac (Mailsac)</SelectItem>
                           </SelectContent>
                         </Select>
                       </div>
-                      {type === "cloudmail_gen" || type === "cloudflare_temp_email" || type === "moemail" || type === "inbucket" || type === "yyds_mail" || type === "ddg_mail" || type === "mailnest" ? (
+                      {type === "cloudmail_gen" || type === "cloudflare_temp_email" || type === "moemail" || type === "inbucket" || type === "yyds_mail" || type === "ddg_mail" || type === "mailnest" || type === "mail_tm" || type === "mail_gw" || type === "dropmail" || type === "guerrilla_mail" || type === "maildrop" || type === "catchmail" || type === "dustmail" || type === "cleantempmail" || type === "testmail_app" || type === "mailisk" || type === "mailsac" ? (
                         <>
                           <div className="space-y-2">
                             <label className="text-sm text-stone-700">{type === "cloudmail_gen" ? "CloudMail URL" : type === "mailnest" ? "MailNest URL" : "API Base"}</label>
@@ -257,10 +279,16 @@ export function RegisterCard() {
                           启用随机子域名
                         </label>
                       ) : null}
-                      {type === "tempmail_lol" || type === "moemail" || type === "duckmail" || type === "gptmail" || type === "yyds_mail" || type === "mailnest" ? (
+                      {type === "tempmail_lol" || type === "moemail" || type === "duckmail" || type === "gptmail" || type === "yyds_mail" || type === "mailnest" || type === "dropmail" || type === "catchmail" || type === "dustmail" || type === "cleantempmail" || type === "testmail_app" || type === "mailisk" || type === "mailsac" ? (
                         <div className="space-y-2">
-                          <label className="text-sm text-stone-700">API Key</label>
+                          <label className="text-sm text-stone-700">{type === "dropmail" ? "API Token" : "API Key"}</label>
                           <Input value={String(provider.api_key || "")} onChange={(event) => updateProvider(index, { api_key: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                        </div>
+                      ) : null}
+                      {type === "testmail_app" || type === "mailisk" ? (
+                        <div className="space-y-2">
+                          <label className="text-sm text-stone-700">Namespace</label>
+                          <Input value={String(provider.namespace || "")} onChange={(event) => updateProvider(index, { namespace: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} placeholder="控制台分配的 namespace" />
                         </div>
                       ) : null}
                       {type === "mailnest" ? (
@@ -290,6 +318,17 @@ export function RegisterCard() {
                           <label className="text-sm text-stone-700">Default Domain</label>
                           <Input value={String(provider.default_domain || "")} onChange={(event) => updateProvider(index, { default_domain: event.target.value })} placeholder={type === "duckmail" ? "duckmail.sbs" : ""} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
                         </div>
+                      ) : null}
+                      {type === "maildrop" || type === "testmail_app" || type === "mailisk" ? (
+                        <div className="rounded-lg border border-sky-200 bg-sky-50 p-3 text-xs text-sky-800">
+                          固定收件域名：{type === "maildrop" ? "maildrop.cc" : type === "testmail_app" ? "inbox.testmail.app" : "{namespace}.mailisk.net"}
+                        </div>
+                      ) : null}
+                      {type === "dropmail" ? (
+                        <label className="flex items-center gap-3 pt-8 text-sm text-stone-700">
+                          <Checkbox checked={Boolean(provider.permanent_domain_only)} onCheckedChange={(checked) => updateProvider(index, { permanent_domain_only: Boolean(checked) })} disabled={config.enabled} />
+                          仅使用长期域名
+                        </label>
                       ) : null}
                       {type === "yyds_mail" ? (
                         <>
@@ -366,7 +405,7 @@ export function RegisterCard() {
                       );
                     })() : null}
 
-                    {type === "cloudmail_gen" || type === "tempmail_lol" || type === "cloudflare_temp_email" || type === "moemail" || type === "inbucket" || type === "yyds_mail" || type === "ddg_mail" ? (
+                    {type === "cloudmail_gen" || type === "tempmail_lol" || type === "cloudflare_temp_email" || type === "moemail" || type === "inbucket" || type === "yyds_mail" || type === "ddg_mail" || type === "mail_tm" || type === "mail_gw" || type === "dropmail" || type === "catchmail" || type === "cleantempmail" || type === "mailsac" ? (
                       <div className="space-y-2">
                         <label className="text-sm text-stone-700">{type === "cloudmail_gen" ? "邮箱域名" : type === "cloudflare_temp_email" ? "根域名" : type === "inbucket" ? "基础域名列表" : "Domain"}</label>
                         <Textarea value={domains} onChange={(event) => updateProvider(index, { domain: event.target.value.split(/[\n,]/).map((item) => item.trim()) })} placeholder={type === "cloudmail_gen" ? "每行一个域名，留空则使用服务默认域名" : type === "cloudflare_temp_email" ? "每行一个根域名，例如 example.com" : type === "inbucket" ? "每行一个基础域名，系统会自动生成随机子域名" : type === "moemail" ? "每行一个域名" : "每行一个域名，留空则使用服务默认域名"} className="min-h-20 rounded-xl border-stone-200 bg-white font-mono text-xs" disabled={config.enabled} />
