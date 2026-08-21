@@ -35,6 +35,7 @@ import {
   type ProxyRuntimeEgressMode,
   type ProxyRuntimeSettings,
   type RegisterConfig,
+  type RegisterProvider,
   type SettingsConfig,
   type ThirdPartyAppsSettings,
 } from "@/lib/api";
@@ -118,8 +119,8 @@ function normalizeProxyRuntime(value: unknown): ProxyRuntimeSettings {
 function normalizeThirdPartyApps(value: unknown): ThirdPartyAppsSettings {
   const source = typeof value === "object" && value !== null ? value as Partial<ThirdPartyAppsSettings> : {};
   const canvas = typeof source.infinite_canvas === "object" && source.infinite_canvas
-    ? source.infinite_canvas
-    : {};
+    ? source.infinite_canvas as Partial<ThirdPartyAppsSettings["infinite_canvas"]>
+    : {} as Partial<ThirdPartyAppsSettings["infinite_canvas"]>;
   return {
     infinite_canvas: {
       enabled: Boolean(canvas.enabled),
@@ -340,6 +341,7 @@ type SettingsStore = {
   setRegisterMailField: (key: "request_timeout" | "wait_timeout" | "wait_interval", value: string) => void;
   addRegisterProvider: () => void;
   updateRegisterProvider: (index: number, updates: Record<string, unknown>) => void;
+  replaceRegisterProvider: (index: number, provider: RegisterProvider) => void;
   deleteRegisterProvider: (index: number) => void;
   saveRegister: () => Promise<void>;
   toggleRegister: () => Promise<void>;
@@ -953,7 +955,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           ...state.registerConfig.mail,
           providers: [
             ...(state.registerConfig.mail.providers || []),
-            { enable: true, type: "mailnest", api_base: "https://mailnest.top", api_key: "", project_code: "ChatGPT0001", sale_mode: "temporary" },
+            { id: `provider-${crypto.randomUUID()}`, enable: true, type: "tempy_email", api_base: "https://tempy.email/api/v1" },
           ],
         },
       },
@@ -965,6 +967,15 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       if (!state.registerConfig) return {};
       const providers = [...(state.registerConfig.mail.providers || [])];
       providers[index] = { ...(providers[index] || {}), ...updates };
+      return { registerConfig: { ...state.registerConfig, mail: { ...state.registerConfig.mail, providers } } };
+    });
+  },
+
+  replaceRegisterProvider: (index, provider) => {
+    set((state) => {
+      if (!state.registerConfig) return {};
+      const providers = [...(state.registerConfig.mail.providers || [])];
+      providers[index] = provider;
       return { registerConfig: { ...state.registerConfig, mail: { ...state.registerConfig.mail, providers } } };
     });
   },

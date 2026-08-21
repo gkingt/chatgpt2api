@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from services.proxy_service import ClearanceBundle
 from services.register import mail_provider, openai_register
+import services.register_service as register_service_module
 from services.register_service import register_service
 
 
@@ -64,6 +65,20 @@ class FakeProxySettings:
 
 
 class RegisterProxyRuntimeTests(unittest.TestCase):
+    def test_register_normalize_assigns_provider_id_once(self):
+        raw = {
+            "mail": {
+                "providers": [
+                    {"type": "tempy_email", "enable": True},
+                ],
+            },
+        }
+
+        normalized = register_service_module._normalize(raw)
+        provider_id = normalized["mail"]["providers"][0]["id"]
+        self.assertRegex(provider_id, r"^provider-[0-9a-f]{16}$")
+        self.assertEqual(register_service_module._normalize(normalized)["mail"]["providers"][0]["id"], provider_id)
+
     def test_mail_provider_session_uses_mail_proxy(self):
         created = []
 
@@ -169,6 +184,167 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
         finally:
             register_service._config = original_config
             register_service._logs = original_logs
+            register_service._last_snapshot = original_snapshot
+            register_service._last_snapshot_payload = original_snapshot_payload
+            register_service._last_snapshot_json = original_snapshot_json
+
+    def test_register_snapshot_redacts_provider_secrets_and_log_values(self):
+        original_config = register_service._config
+        original_logs = register_service._logs
+        original_snapshot = register_service._last_snapshot
+        original_snapshot_payload = register_service._last_snapshot_payload
+        original_snapshot_json = register_service._last_snapshot_json
+        try:
+            register_service._logs = [{
+                "time": "2026-06-10T12:00:00+00:00",
+                "text": "api_key=provider-api-secret Authorization: Bearer runtime-token-secret",
+                "level": "info",
+            }]
+            register_service._last_snapshot = ""
+            register_service._last_snapshot_payload = None
+            register_service._last_snapshot_json = ""
+            register_service._config = {
+                **original_config,
+                "mail": {
+                    "providers": [{
+                        "type": "mailnest",
+                        "api_key": "provider-api-secret",
+                        "token": "runtime-token-secret",
+                        "admin_password": "admin-password-secret",
+                        "project_code": "safe-project",
+                    }],
+                },
+            }
+
+            snapshot = register_service.get()
+            provider = snapshot["mail"]["providers"][0]
+            self.assertEqual(provider["api_key"], "[REDACTED]")
+            self.assertEqual(provider["token"], "[REDACTED]")
+            self.assertEqual(provider["admin_password"], "[REDACTED]")
+            self.assertEqual(provider["project_code"], "safe-project")
+            snapshot_text = json.dumps(snapshot, ensure_ascii=False)
+            self.assertNotIn("provider-api-secret", snapshot_text)
+            self.assertNotIn("runtime-token-secret", snapshot_text)
+            self.assertNotIn("admin-password-secret", register_service.snapshot_json())
+        finally:
+            register_service._config = original_config
+            register_service._logs = original_logs
+            register_service._last_snapshot = original_snapshot
+            register_service._last_snapshot_payload = original_snapshot_payload
+            register_service._last_snapshot_json = original_snapshot_json
+
+    def test_register_update_preserves_masked_provider_secrets(self):
+        original_config = register_service._config
+        original_snapshot = register_service._last_snapshot
+        original_snapshot_payload = register_service._last_snapshot_payload
+        original_snapshot_json = register_service._last_snapshot_json
+        try:
+            register_service._config = {
+                **original_config,
+                "mail": {
+                    "providers": [{
+                        "type": "mailnest",
+                        "api_key": "provider-api-secret",
+                        "project_code": "old-project",
+                    }],
+                },
+            }
+            register_service._last_snapshot = ""
+            register_service._last_snapshot_payload = None
+            register_service._last_snapshot_json = ""
+            updates = {
+                "mail": {
+                    "providers": [{
+                        "type": "mailnest",
+                        "api_key": "[REDACTED]",
+                        "project_code": "new-project",
+                    }],
+                },
+            }
+            with patch.object(register_service, "_save"):
+                register_service.update(updates)
+
+            provider = register_service._config["mail"]["providers"][0]
+            self.assertEqual(provider["api_key"], "provider-api-secret")
+            self.assertEqual(provider["project_code"], "new-project")
+        finally:
+            register_service._config = original_config
+            register_service._last_snapshot = original_snapshot
+            register_service._last_snapshot_payload = original_snapshot_payload
+            register_service._last_snapshot_json = original_snapshot_json
+
+    def test_register_update_matches_provider_secrets_by_stable_id_after_reorder(self):
+        original_config = register_service._config
+        original_snapshot = register_service._last_snapshot
+        original_snapshot_payload = register_service._last_snapshot_payload
+        original_snapshot_json = register_service._last_snapshot_json
+        try:
+            register_service._config = {
+                **original_config,
+                "mail": {
+                    "providers": [
+                        {"id": "provider-a", "type": "agentmail", "api_key": "key-a"},
+                        {"id": "provider-b", "type": "agentmail", "api_key": "key-b"},
+                    ],
+                },
+            }
+            register_service._last_snapshot = ""
+            register_service._last_snapshot_payload = None
+            register_service._last_snapshot_json = ""
+            updates = {
+                "mail": {
+                    "providers": [
+                        {"id": "provider-b", "type": "agentmail", "api_key": "[REDACTED]"},
+                        {"id": "provider-a", "type": "agentmail", "api_key": "[REDACTED]"},
+                    ],
+                },
+            }
+            with patch.object(register_service, "_save"):
+                register_service.update(updates)
+
+            providers = register_service._config["mail"]["providers"]
+            self.assertEqual(providers[0]["api_key"], "key-b")
+            self.assertEqual(providers[1]["api_key"], "key-a")
+        finally:
+            register_service._config = original_config
+            register_service._last_snapshot = original_snapshot
+            register_service._last_snapshot_payload = original_snapshot_payload
+            register_service._last_snapshot_json = original_snapshot_json
+
+    def test_register_update_matches_outlook_pool_by_stable_id_after_reorder(self):
+        original_config = register_service._config
+        original_snapshot = register_service._last_snapshot
+        original_snapshot_payload = register_service._last_snapshot_payload
+        original_snapshot_json = register_service._last_snapshot_json
+        try:
+            register_service._config = {
+                **original_config,
+                "mail": {
+                    "providers": [
+                        {"id": "provider-a", "type": "outlook_token", "mailboxes": "a@example.com----pass-a----client-a----refresh-a"},
+                        {"id": "provider-b", "type": "outlook_token", "mailboxes": "b@example.com----pass-b----client-b----refresh-b"},
+                    ],
+                },
+            }
+            register_service._last_snapshot = ""
+            register_service._last_snapshot_payload = None
+            register_service._last_snapshot_json = ""
+            updates = {
+                "mail": {
+                    "providers": [
+                        {"id": "provider-b", "type": "outlook_token", "mailboxes": ""},
+                        {"id": "provider-a", "type": "outlook_token", "mailboxes": ""},
+                    ],
+                },
+            }
+            with patch.object(register_service, "_save"):
+                register_service.update(updates)
+
+            providers = register_service._config["mail"]["providers"]
+            self.assertIn("b@example.com----pass-b----client-b----refresh-b", providers[0]["mailboxes"])
+            self.assertIn("a@example.com----pass-a----client-a----refresh-a", providers[1]["mailboxes"])
+        finally:
+            register_service._config = original_config
             register_service._last_snapshot = original_snapshot
             register_service._last_snapshot_payload = original_snapshot_payload
             register_service._last_snapshot_json = original_snapshot_json
@@ -344,7 +520,13 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
         calls = []
 
         try:
-            with patch.object(openai_register, "create_mailbox", return_value={"address": "user@example.com"}), patch.object(
+            with patch.object(openai_register, "create_mailbox", return_value={"address": "user@example.com", "provider": "outlook_token"}), patch.object(
+                openai_register.mail_provider,
+                "mark_mailbox_result",
+            ) as mark_mailbox_result, patch.object(
+                openai_register.mail_provider,
+                "release_mailbox",
+            ) as release_mailbox, patch.object(
                 openai_register,
                 "wait_for_code",
                 return_value="123456",
@@ -379,6 +561,34 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
         self.assertNotIn("password_register", calls)
         self.assertNotIn("send_otp", calls)
         self.assertNotIn("email_continue", calls)
+        mark_mailbox_result.assert_called_once()
+        mark_mailbox_result.assert_called_once_with({"address": "user@example.com", "provider": "outlook_token"}, success=True)
+        release_mailbox.assert_not_called()
+
+    def test_register_marks_mailbox_failed_when_signup_fails(self):
+        registrar = openai_register.PlatformRegistrar(proxy="")
+        mailbox = {"address": "user@example.com", "provider": "outlook_token"}
+        try:
+            with patch.object(openai_register, "create_mailbox", return_value=mailbox), patch.object(
+                openai_register.mail_provider,
+                "mark_mailbox_result",
+            ) as mark_mailbox_result, patch.object(
+                openai_register.mail_provider,
+                "release_mailbox",
+            ) as release_mailbox, patch.object(
+                registrar,
+                "_platform_authorize",
+                side_effect=RuntimeError("signup failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "signup failed"):
+                    registrar.register(1)
+        finally:
+            registrar.close()
+
+        mark_mailbox_result.assert_called_once()
+        self.assertFalse(mark_mailbox_result.call_args.kwargs["success"])
+        self.assertIsInstance(mark_mailbox_result.call_args.kwargs["error"], RuntimeError)
+        release_mailbox.assert_not_called()
 
     def test_register_user_logs_account_creation_failed_diagnostic(self):
         registrar = openai_register.PlatformRegistrar(proxy="")

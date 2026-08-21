@@ -25,6 +25,7 @@ export function RegisterCard() {
   const setMailField = useSettingsStore((state) => state.setRegisterMailField);
   const addProvider = useSettingsStore((state) => state.addRegisterProvider);
   const updateProvider = useSettingsStore((state) => state.updateRegisterProvider);
+  const replaceProvider = useSettingsStore((state) => state.replaceRegisterProvider);
   const deleteProvider = useSettingsStore((state) => state.deleteRegisterProvider);
   const save = useSettingsStore((state) => state.saveRegister);
   const toggle = useSettingsStore((state) => state.toggleRegister);
@@ -45,7 +46,7 @@ export function RegisterCard() {
   const providers = config.mail.providers || [];
   const logs = config.logs || [];
   const updateProviderType = (index: number, type: string) => {
-    updateProvider(index, {
+    const defaults: Record<string, unknown> = {
       type,
       enable: true,
       ...(type === "cloudmail_gen" ? { api_base: "", admin_email: "", admin_password: "", domain: [], subdomain: [], email_prefix: "" } : {}),
@@ -66,11 +67,19 @@ export function RegisterCard() {
       ...(type === "maildrop" ? { api_base: "https://api.maildrop.cc/graphql" } : {}),
       ...(type === "catchmail" ? { api_base: "https://api.catchmail.io", api_key: "", domain: ["catchmail.io"] } : {}),
       ...(type === "dustmail" ? { api_base: "https://dustmail.net/api/v1", api_key: "" } : {}),
-      ...(type === "cleantempmail" ? { api_base: "https://cleantempmail.com/api", api_key: "ct-test", domain: [] } : {}),
+      ...(type === "cleantempmail" ? { api_base: "https://cleantempmail.com/api", api_key: "", domain: [] } : {}),
       ...(type === "testmail_app" ? { api_base: "https://api.testmail.app/api/json", api_key: "", namespace: "" } : {}),
       ...(type === "mailisk" ? { api_base: "https://api.mailisk.com/api", api_key: "", namespace: "" } : {}),
       ...(type === "mailsac" ? { api_base: "https://mailsac.com", api_key: "", domain: ["mailsac.com"] } : {}),
-    });
+      ...(type === "tempy_email" ? { api_base: "https://tempy.email/api/v1" } : {}),
+      ...(type === "qack" ? { api_base: "https://api.qack.dev", realistic: false } : {}),
+      ...(type === "smails" ? { api_base: "https://smails.dev", domain: [] } : {}),
+      ...(type === "agentmail" ? { api_base: "https://api.agentmail.to", api_key: "", domain: [] } : {}),
+      ...(type === "mailslurp" ? { api_base: "https://api.mailslurp.com", api_key: "", domain: [] } : {}),
+      ...(type === "mailosaur" ? { api_base: "https://mailosaur.com/api", api_key: "", server_id: "", domain: "" } : {}),
+    };
+    const current = providers[index];
+    replaceProvider(index, current?.id ? { id: current.id, ...defaults } : defaults);
   };
 
   return (
@@ -223,10 +232,16 @@ export function RegisterCard() {
                             <SelectItem value="testmail_app">testmail_app (testmail.app)</SelectItem>
                             <SelectItem value="mailisk">mailisk (Mailisk)</SelectItem>
                             <SelectItem value="mailsac">mailsac (Mailsac)</SelectItem>
+                            <SelectItem value="tempy_email">tempy_email (Tempy.email)</SelectItem>
+                            <SelectItem value="qack">qack (Qack，公共收件箱)</SelectItem>
+                            <SelectItem value="smails">smails (Smails)</SelectItem>
+                            <SelectItem value="agentmail">agentmail (AgentMail，账户型)</SelectItem>
+                            <SelectItem value="mailslurp">mailslurp (MailSlurp，账户型)</SelectItem>
+                            <SelectItem value="mailosaur">mailosaur (Mailosaur，账户型)</SelectItem>
                           </SelectContent>
                         </Select>
                       </div>
-                      {type === "cloudmail_gen" || type === "cloudflare_temp_email" || type === "moemail" || type === "inbucket" || type === "yyds_mail" || type === "ddg_mail" || type === "mailnest" || type === "mail_tm" || type === "mail_gw" || type === "dropmail" || type === "guerrilla_mail" || type === "maildrop" || type === "catchmail" || type === "dustmail" || type === "cleantempmail" || type === "testmail_app" || type === "mailisk" || type === "mailsac" ? (
+                      {type === "cloudmail_gen" || type === "cloudflare_temp_email" || type === "moemail" || type === "inbucket" || type === "yyds_mail" || type === "ddg_mail" || type === "mailnest" || type === "mail_tm" || type === "mail_gw" || type === "dropmail" || type === "guerrilla_mail" || type === "maildrop" || type === "catchmail" || type === "dustmail" || type === "cleantempmail" || type === "testmail_app" || type === "mailisk" || type === "mailsac" || type === "tempy_email" || type === "qack" || type === "smails" || type === "agentmail" || type === "mailslurp" || type === "mailosaur" ? (
                         <>
                           <div className="space-y-2">
                             <label className="text-sm text-stone-700">{type === "cloudmail_gen" ? "CloudMail URL" : type === "mailnest" ? "MailNest URL" : "API Base"}</label>
@@ -279,10 +294,43 @@ export function RegisterCard() {
                           启用随机子域名
                         </label>
                       ) : null}
-                      {type === "tempmail_lol" || type === "moemail" || type === "duckmail" || type === "gptmail" || type === "yyds_mail" || type === "mailnest" || type === "dropmail" || type === "catchmail" || type === "dustmail" || type === "cleantempmail" || type === "testmail_app" || type === "mailisk" || type === "mailsac" ? (
+                      {type === "tempmail_lol" || type === "moemail" || type === "duckmail" || type === "gptmail" || type === "yyds_mail" || type === "mailnest" || type === "dropmail" || type === "catchmail" || type === "dustmail" || type === "cleantempmail" || type === "testmail_app" || type === "mailisk" || type === "mailsac" || type === "agentmail" || type === "mailslurp" || type === "mailosaur" ? (
                         <div className="space-y-2">
                           <label className="text-sm text-stone-700">{type === "dropmail" ? "API Token" : "API Key"}</label>
                           <Input value={String(provider.api_key || "")} onChange={(event) => updateProvider(index, { api_key: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                        </div>
+                      ) : null}
+                      {type === "mailosaur" ? (
+                        <>
+                          <div className="space-y-2">
+                            <label className="text-sm text-stone-700">Server ID</label>
+                            <Input value={String(provider.server_id || "")} onChange={(event) => updateProvider(index, { server_id: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                          </div>
+                          <div className="space-y-2">
+                            <label className="text-sm text-stone-700">邮箱域名</label>
+                            <Input value={String(provider.domain || "")} onChange={(event) => updateProvider(index, { domain: event.target.value })} placeholder="your-server.mailosaur.net" className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                          </div>
+                        </>
+                      ) : null}
+                      {type === "mailslurp" || type === "mailosaur" ? (
+                        <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-800">
+                          账户型测试邮箱服务：必须填写你自己的 API key；Mailosaur 还需要 Server ID。相关邮箱和资源由你的账户负责，不能当作匿名公共临时邮箱使用。
+                        </div>
+                      ) : null}
+                      {type === "qack" ? (
+                        <label className="flex items-center gap-3 pt-8 text-sm text-stone-700">
+                          <Checkbox checked={Boolean(provider.realistic)} onCheckedChange={(checked) => updateProvider(index, { realistic: Boolean(checked) })} disabled={config.enabled} />
+                          使用 realistic 地址
+                        </label>
+                      ) : null}
+                      {type === "qack" ? (
+                        <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-800">
+                          公共收件箱：任何知道邮箱地址的人都可能读取或影响邮件。不要用于敏感账号；验证码可能串扰，并受服务端 TTL、限流或容量限制影响。
+                        </div>
+                      ) : null}
+                      {type === "agentmail" ? (
+                        <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-800">
+                          AgentMail 是账户型服务：需要填写你自己的 API key；可选 Domain 必须是 AgentMail 账户中已验证的域名，不能填写任意公共域名。
                         </div>
                       ) : null}
                       {type === "testmail_app" || type === "mailisk" ? (
@@ -405,10 +453,10 @@ export function RegisterCard() {
                       );
                     })() : null}
 
-                    {type === "cloudmail_gen" || type === "tempmail_lol" || type === "cloudflare_temp_email" || type === "moemail" || type === "inbucket" || type === "yyds_mail" || type === "ddg_mail" || type === "mail_tm" || type === "mail_gw" || type === "dropmail" || type === "catchmail" || type === "cleantempmail" || type === "mailsac" ? (
+                    {type === "cloudmail_gen" || type === "tempmail_lol" || type === "cloudflare_temp_email" || type === "moemail" || type === "inbucket" || type === "yyds_mail" || type === "ddg_mail" || type === "mail_tm" || type === "mail_gw" || type === "dropmail" || type === "catchmail" || type === "cleantempmail" || type === "mailsac" || type === "smails" || type === "agentmail" ? (
                       <div className="space-y-2">
-                        <label className="text-sm text-stone-700">{type === "cloudmail_gen" ? "邮箱域名" : type === "cloudflare_temp_email" ? "根域名" : type === "inbucket" ? "基础域名列表" : "Domain"}</label>
-                        <Textarea value={domains} onChange={(event) => updateProvider(index, { domain: event.target.value.split(/[\n,]/).map((item) => item.trim()) })} placeholder={type === "cloudmail_gen" ? "每行一个域名，留空则使用服务默认域名" : type === "cloudflare_temp_email" ? "每行一个根域名，例如 example.com" : type === "inbucket" ? "每行一个基础域名，系统会自动生成随机子域名" : type === "moemail" ? "每行一个域名" : "每行一个域名，留空则使用服务默认域名"} className="min-h-20 rounded-xl border-stone-200 bg-white font-mono text-xs" disabled={config.enabled} />
+                        <label className="text-sm text-stone-700">{type === "cloudmail_gen" ? "邮箱域名" : type === "cloudflare_temp_email" ? "根域名" : type === "inbucket" ? "基础域名列表" : type === "agentmail" ? "已验证 Domain（可选）" : "Domain"}</label>
+                        <Textarea value={domains} onChange={(event) => updateProvider(index, { domain: event.target.value.split(/[\n,]/).map((item) => item.trim()) })} placeholder={type === "cloudmail_gen" ? "每行一个域名，留空则使用服务默认域名" : type === "cloudflare_temp_email" ? "每行一个根域名，例如 example.com" : type === "inbucket" ? "每行一个基础域名，系统会自动生成随机子域名" : type === "moemail" ? "每行一个域名" : type === "agentmail" ? "每行一个已在 AgentMail 账户中验证的域名；留空使用 agentmail.to" : "每行一个域名，留空则使用服务默认域名"} className="min-h-20 rounded-xl border-stone-200 bg-white font-mono text-xs" disabled={config.enabled} />
                       </div>
                     ) : null}
                     {type === "cloudmail_gen" ? (

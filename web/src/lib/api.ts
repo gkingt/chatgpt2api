@@ -333,7 +333,7 @@ export type RegisterConfig = {
     request_timeout: number;
     wait_timeout: number;
     wait_interval: number;
-    providers: Array<Record<string, unknown>>;
+    providers: RegisterProvider[];
   };
   proxy: string;
   total: number;
@@ -363,6 +363,12 @@ export type RegisterConfig = {
     text: string;
     level: string;
   }>;
+};
+
+export type RegisterProvider = Record<string, unknown> & {
+  id?: string;
+  type?: string;
+  enable?: boolean;
 };
 
 export async function login(authKey: string) {

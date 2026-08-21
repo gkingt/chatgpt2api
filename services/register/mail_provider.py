@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 from html import unescape
 import imaplib
 import json
@@ -445,7 +446,7 @@ def _payload_value(data: Any, *keys: str) -> Any:
             value = current.get(key)
             if value not in (None, ""):
                 return value
-        for nested_key in ("inbox", "mailbox", "account", "email"):
+        for nested_key in ("inbox", "mailbox", "account", "email", "result"):
             nested = current.get(nested_key)
             if isinstance(nested, dict):
                 value = _payload_value(nested, *keys)
@@ -626,6 +627,161 @@ class BaseMailProvider:
 
     def close(self) -> None:
         pass
+
+
+class MailSlurpProvider(BaseMailProvider):
+    """MailSlurp account API; requires the user's own API key."""
+
+    name = "mailslurp"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.api_base = str(entry.get("api_base") or "https://api.mailslurp.com").rstrip("/")
+        self.api_key = str(entry.get("api_key") or "").strip()
+        if not self.api_key:
+            raise RuntimeError("MailSlurp api_key 不能为空；请填写你自己的 MailSlurp API key")
+        self.domain = _configured_domains(entry)
+        self.session = _create_session(conf)
+
+    def close(self) -> None:
+        self.session.close()
+
+    def _request(self, method: str, path: str, payload: dict | None = None, params: dict | None = None, expected: tuple[int, ...] = (200, 201)) -> Any:
+        headers = {
+            "Accept": "application/json",
+            "Authorization": self.api_key,
+            "User-Agent": self.conf["user_agent"],
+        }
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+        resp = self.session.request(
+            method.upper(),
+            f"{self.api_base}{path}",
+            headers=headers,
+            params=params,
+            json=payload,
+            timeout=self.conf["request_timeout"],
+            verify=False,
+        )
+        return _response_json(resp, self.name, path, expected)
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        local_part = _local_part(username)
+        if local_part:
+            payload["emailAddress"] = f"{local_part}@{_next_domain(self.domain)}" if self.domain else f"{local_part}@mailslurp.com"
+        data = self._request("POST", "/inboxes", payload=payload)
+        inbox_id = str(data.get("id") or "").strip()
+        address = str(data.get("emailAddress") or data.get("email_address") or "").strip()
+        if not inbox_id or not address:
+            raise RuntimeError("MailSlurp 创建响应缺少 id 或 emailAddress")
+        return {"provider": self.name, "provider_ref": self.provider_ref, "address": address, "inbox_id": inbox_id}
+
+    def _normalize_message(self, mailbox: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+        text_content = _value_as_text(item.get("body") or item.get("bodyExtracted") or item.get("text"))
+        html_content = _value_as_text(item.get("bodyExtracted")) if str(item.get("bodyExtracted") or "").strip().startswith("<") else ""
+        return {
+            "provider": self.name,
+            "mailbox": mailbox["address"],
+            "message_id": str(item.get("id") or "").strip(),
+            "subject": str(item.get("subject") or ""),
+            "sender": _sender_value(item.get("from") or item.get("sender")),
+            "text_content": text_content,
+            "html_content": html_content,
+            "received_at": _parse_received_at(item.get("createdAt") or item.get("created_at") or item.get("receivedAt")),
+            "raw": item,
+        }
+
+    def fetch_recent_messages(self, mailbox: dict[str, Any]) -> list[dict[str, Any]]:
+        inbox_id = str(mailbox.get("inbox_id") or "").strip()
+        address = str(mailbox.get("address") or "").strip()
+        if not inbox_id or not address:
+            raise RuntimeError("MailSlurp mailbox 缺少 inbox_id 或 address")
+        data = self._request("GET", f"/inboxes/{quote(inbox_id, safe='')}/emails", params={"size": 20})
+        items = _payload_items(data, ("content", "messages", "items", "data"))
+        result: list[dict[str, Any]] = []
+        for item in items:
+            message_id = str(item.get("id") or "").strip()
+            if not message_id:
+                continue
+            detail = self._request("GET", f"/emails/{quote(message_id, safe='')}", expected=(200,))
+            if _message_matches_email(detail, address) or not _payload_value(detail, "to", "toRecipients"):
+                result.append(self._normalize_message(mailbox, detail))
+        result.sort(key=_message_sort_key, reverse=True)
+        return result
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        messages = self.fetch_recent_messages(mailbox)
+        return messages[0] if messages else None
+
+
+class MailosaurProvider(BaseMailProvider):
+    """Mailosaur server API; requires the user's own API key and server ID."""
+
+    name = "mailosaur"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.api_base = str(entry.get("api_base") or "https://mailosaur.com/api").rstrip("/")
+        self.api_key = str(entry.get("api_key") or "").strip()
+        self.server_id = str(entry.get("server_id") or "").strip()
+        self.domain = str(entry.get("domain") or "").strip() or f"{self.server_id}.mailosaur.net"
+        if not self.api_key or not self.server_id:
+            raise RuntimeError("Mailosaur api_key 和 server_id 不能为空")
+        self.session = _create_session(conf)
+
+    def close(self) -> None:
+        self.session.close()
+
+    def _request(self, method: str, path: str, params: dict | None = None, expected: tuple[int, ...] = (200,)) -> Any:
+        encoded = base64.b64encode(f"{self.api_key}:".encode("utf-8")).decode("ascii")
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Basic {encoded}",
+            "User-Agent": self.conf["user_agent"],
+        }
+        resp = self.session.request(
+            method.upper(),
+            f"{self.api_base}{path}",
+            headers=headers,
+            params=params,
+            timeout=self.conf["request_timeout"],
+            verify=False,
+        )
+        return _response_json(resp, self.name, path, expected)
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        local_part = re.sub(r"[^a-zA-Z0-9._-]", "", _local_part(username)) or _random_mailbox_name()
+        address = f"{local_part}@{self.domain}"
+        return {"provider": self.name, "provider_ref": self.provider_ref, "address": address, "server_id": self.server_id}
+
+    def _normalize_message(self, mailbox: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+        text = item.get("text") if isinstance(item.get("text"), dict) else {}
+        html = item.get("html") if isinstance(item.get("html"), dict) else {}
+        return {
+            "provider": self.name,
+            "mailbox": mailbox["address"],
+            "message_id": str(item.get("id") or "").strip(),
+            "subject": str(item.get("subject") or ""),
+            "sender": _sender_value(item.get("from") or item.get("sender")),
+            "text_content": _value_as_text(text.get("body") or item.get("text")),
+            "html_content": _value_as_text(html.get("body") or item.get("html")),
+            "received_at": _parse_received_at(item.get("received") or item.get("receivedAt")),
+            "raw": item,
+        }
+
+    def fetch_recent_messages(self, mailbox: dict[str, Any]) -> list[dict[str, Any]]:
+        address = str(mailbox.get("address") or "").strip()
+        server_id = str(mailbox.get("server_id") or self.server_id).strip()
+        data = self._request("GET", "/messages", params={"server": server_id, "sentTo": address, "itemsPerPage": 20})
+        items = _payload_items(data, ("items", "messages", "content", "data"))
+        result = [self._normalize_message(mailbox, item) for item in items if isinstance(item, dict)]
+        result.sort(key=_message_sort_key, reverse=True)
+        return result
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        messages = self.fetch_recent_messages(mailbox)
+        return messages[0] if messages else None
 
 
 class MailNestProvider(BaseMailProvider):
@@ -2244,7 +2400,7 @@ class CleanTempMailProvider(BaseMailProvider):
     def __init__(self, entry: dict, conf: dict):
         super().__init__(conf, str(entry.get("provider_ref") or ""))
         self.api_base = str(entry.get("api_base") or "https://cleantempmail.com/api").rstrip("/")
-        self.api_key = str(entry.get("api_key") or "ct-test").strip() or "ct-test"
+        self.api_key = str(entry.get("api_key") or "").strip()
         self.domain = _configured_domains(entry)
         self.session = _create_session(conf)
 
@@ -2252,6 +2408,8 @@ class CleanTempMailProvider(BaseMailProvider):
         self.session.close()
 
     def _request(self, method: str, path: str, params: dict | None = None, payload: dict | None = None) -> Any:
+        if not self.api_key:
+            raise RuntimeError("CleanTempMail 需要 API Key")
         resp = self.session.request(
             method.upper(),
             f"{self.api_base}{path}",
@@ -2491,16 +2649,436 @@ class MailsacProvider(BaseMailProvider):
         }
 
 
+class TempyEmailProvider(BaseMailProvider):
+    """tempy.email versioned REST API (no signup or API key)."""
+
+    name = "tempy_email"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.api_base = str(entry.get("api_base") or "https://tempy.email/api/v1").rstrip("/")
+        self.session = _create_session(conf)
+
+    def close(self) -> None:
+        self.session.close()
+
+    def _request(self, method: str, path: str, payload: dict | None = None, expected: tuple[int, ...] = (200, 201)) -> Any:
+        headers = {"Accept": "application/json", "User-Agent": self.conf["user_agent"]}
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+        resp = self.session.request(
+            method.upper(),
+            f"{self.api_base}{path}",
+            headers=headers,
+            json=payload,
+            timeout=self.conf["request_timeout"],
+            verify=False,
+        )
+        return _response_json(resp, self.name, path, expected)
+
+    @staticmethod
+    def _address(data: Any) -> str:
+        if isinstance(data, dict):
+            value = _payload_value(data, "email", "address")
+            return str(value or "").strip()
+        if isinstance(data, list) and data:
+            return TempyEmailProvider._address(data[0])
+        return str(data or "").strip() if isinstance(data, str) else ""
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        # The documented API generates the local part server-side; username is
+        # intentionally ignored rather than sent as an undocumented field.
+        data = self._request("POST", "/mailbox", payload={})
+        address = self._address(data)
+        if not address:
+            raise RuntimeError("Tempy.email 创建响应缺少 email/address")
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": address,
+            "expires_at": str(_payload_value(data, "expires_at", "expiresAt") or ""),
+            "seconds_remaining": _payload_value(data, "seconds_remaining", "secondsRemaining"),
+        }
+
+    def fetch_recent_messages(self, mailbox: dict[str, Any]) -> list[dict[str, Any]]:
+        address = str(mailbox.get("address") or "").strip()
+        if not address:
+            raise RuntimeError("Tempy.email mailbox 缺少 address")
+        encoded_address = quote(address, safe="@")
+        data = self._request("GET", f"/mailbox/{encoded_address}/messages")
+        items = _payload_items(data, ("messages", "items", "data"))
+        messages = [item for item in items if _message_matches_email(item, address)]
+        messages.sort(key=_message_sort_key, reverse=True)
+        result: list[dict[str, Any]] = []
+        for item in messages:
+            result.append(
+                {
+                    "provider": self.name,
+                    "mailbox": address,
+                    "message_id": str(item.get("id") or item.get("message_id") or "").strip(),
+                    "subject": str(item.get("subject") or ""),
+                    "sender": _sender_value(item.get("from") or item.get("sender")),
+                    "text_content": _value_as_text(item.get("body_text") or item.get("text") or item.get("body")),
+                    "html_content": _value_as_text(item.get("html") or item.get("html_content")),
+                    "received_at": _parse_received_at(item.get("received_at") or item.get("receivedAt") or item.get("date")),
+                    "raw": item,
+                }
+            )
+        return result
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        messages = self.fetch_recent_messages(mailbox)
+        return messages[0] if messages else None
+
+
+class QackProvider(BaseMailProvider):
+    """Qack hosted CI inbox API (v1 is unauthenticated and public-read)."""
+
+    name = "qack"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.api_base = str(entry.get("api_base") or "https://api.qack.dev").rstrip("/")
+        self.realistic = entry.get("realistic") is True
+        self.session = _create_session(conf)
+
+    def close(self) -> None:
+        self.session.close()
+
+    def _request(self, method: str, path: str, payload: dict | None = None, expected: tuple[int, ...] = (200, 201)) -> Any:
+        headers = {"Accept": "application/json", "User-Agent": self.conf["user_agent"]}
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+        resp = self.session.request(
+            method.upper(),
+            f"{self.api_base}{path}",
+            headers=headers,
+            json=payload,
+            timeout=self.conf["request_timeout"],
+            verify=False,
+        )
+        return _response_json(resp, self.name, path, expected)
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        payload = {"realistic": True} if self.realistic else {}
+        data = self._request("POST", "/v1/inboxes", payload=payload)
+        address = str(_payload_value(data, "address", "email") or "").strip()
+        if not address:
+            raise RuntimeError("Qack 创建响应缺少 address/email")
+        return {"provider": self.name, "provider_ref": self.provider_ref, "address": address}
+
+    @staticmethod
+    def _message_item(data: Any) -> dict[str, Any]:
+        if isinstance(data, dict):
+            for key in ("message", "data", "result"):
+                value = data.get(key)
+                if isinstance(value, dict):
+                    return value
+            return data
+        return {}
+
+    def _normalize_message(self, mailbox: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+        text_content = _value_as_text(item.get("extracted_text"))
+        html_content = _value_as_text(item.get("extracted_html"))
+        fallback_text, fallback_html = _extract_message_content(item)
+        if not text_content:
+            text_content = fallback_text
+        if not html_content:
+            html_content = fallback_html
+        return {
+            "provider": self.name,
+            "mailbox": mailbox["address"],
+            "message_id": str(item.get("id") or item.get("message_id") or item.get("_id") or "").strip(),
+            "subject": str(item.get("subject") or ""),
+            "sender": _sender_value(item.get("from") or item.get("sender") or item.get("from_addr")),
+            "text_content": text_content,
+            "html_content": html_content,
+            "received_at": _parse_received_at(item.get("received_at") or item.get("receivedAt") or item.get("created_at") or item.get("createdAt") or item.get("date") or item.get("timestamp")),
+            "raw": item,
+        }
+
+    def fetch_recent_messages(self, mailbox: dict[str, Any]) -> list[dict[str, Any]]:
+        address = str(mailbox.get("address") or "").strip()
+        if not address:
+            raise RuntimeError("Qack mailbox 缺少 address")
+        encoded_address = quote(address, safe="@")
+        data = self._request("GET", f"/v1/inboxes/{encoded_address}/messages")
+        items = _payload_items(data, ("messages", "items", "results", "data"))
+        summaries = [item for item in items if _message_matches_email(item, address)]
+        summaries.sort(key=_message_sort_key, reverse=True)
+        result: list[dict[str, Any]] = []
+        for summary in summaries:
+            message_id = str(summary.get("id") or summary.get("message_id") or summary.get("_id") or "").strip()
+            item = summary
+            if message_id:
+                detail = self._message_item(self._request("GET", f"/v1/inboxes/{encoded_address}/messages/{quote(message_id, safe='')}"))
+                if detail:
+                    item = {**summary, **detail}
+            result.append(self._normalize_message(mailbox, item))
+        return result
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        messages = self.fetch_recent_messages(mailbox)
+        return messages[0] if messages else None
+
+
+class SmailsProvider(BaseMailProvider):
+    """smails REST API; the create response token authenticates the mailbox."""
+
+    name = "smails"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.api_base = str(entry.get("api_base") or "https://smails.dev").rstrip("/")
+        self.domain = _configured_domains(entry)
+        self.session = _create_session(conf)
+
+    def close(self) -> None:
+        self.session.close()
+
+    def _request(self, method: str, path: str, token: str = "", payload: dict | None = None, expected: tuple[int, ...] = (200, 201)) -> Any:
+        headers = {"Accept": "application/json", "User-Agent": self.conf["user_agent"]}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+        resp = self.session.request(
+            method.upper(),
+            f"{self.api_base}{path}",
+            headers=headers,
+            json=payload,
+            timeout=self.conf["request_timeout"],
+            verify=False,
+        )
+        return _response_json(resp, self.name, path, expected)
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        payload = {"domain": _next_domain(self.domain)} if self.domain else {}
+        data = self._request("POST", "/api/mailbox", payload=payload)
+        address = str(_payload_value(data, "address", "email") or "").strip()
+        token = str(_payload_value(data, "token", "access_token") or "").strip()
+        if not address or not token:
+            raise RuntimeError("Smails 创建响应缺少 address 或 token")
+        return {"provider": self.name, "provider_ref": self.provider_ref, "address": address, "token": token}
+
+    def _normalize_message(self, mailbox: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+        text_content = _value_as_text(item.get("extracted_text"))
+        html_content = _value_as_text(item.get("extracted_html"))
+        fallback_text, fallback_html = _extract_message_content(item)
+        if not text_content:
+            text_content = fallback_text
+        if not html_content:
+            html_content = fallback_html
+        return {
+            "provider": self.name,
+            "mailbox": mailbox["address"],
+            "message_id": str(item.get("id") or item.get("message_id") or item.get("_id") or "").strip(),
+            "subject": str(item.get("subject") or ""),
+            "sender": _sender_value(item.get("from_addr") or item.get("from") or item.get("sender")),
+            "text_content": text_content,
+            "html_content": html_content,
+            "received_at": _parse_received_at(item.get("received_at") or item.get("receivedAt") or item.get("created_at") or item.get("createdAt") or item.get("date")),
+            "raw": item,
+        }
+
+    def fetch_recent_messages(self, mailbox: dict[str, Any]) -> list[dict[str, Any]]:
+        token = str(mailbox.get("token") or "").strip()
+        if not token:
+            raise RuntimeError("Smails mailbox 缺少 token")
+        data = self._request("GET", "/api/mailbox/messages", token=token)
+        items = _payload_items(data, ("messages", "items", "results", "data"))
+        summaries = [item for item in items if _message_matches_email(item, str(mailbox.get("address") or ""))]
+        summaries.sort(key=_message_sort_key, reverse=True)
+        result: list[dict[str, Any]] = []
+        for summary in summaries:
+            message_id = str(summary.get("id") or summary.get("message_id") or summary.get("_id") or "").strip()
+            item = summary
+            if message_id:
+                detail = _unwrap_data(self._request("GET", f"/api/mailbox/messages/{quote(message_id, safe='')}" , token=token))
+                if isinstance(detail, dict):
+                    item = {**summary, **detail}
+            result.append(self._normalize_message(mailbox, item))
+        return result
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        messages = self.fetch_recent_messages(mailbox)
+        return messages[0] if messages else None
+
+
+class AgentMailProvider(BaseMailProvider):
+    """AgentMail inbox API (requires the user's own API key)."""
+
+    name = "agentmail"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.api_base = str(entry.get("api_base") or "https://api.agentmail.to").rstrip("/")
+        self.api_key = str(entry.get("api_key") or "").strip()
+        if not self.api_key:
+            raise RuntimeError("AgentMail api_key 不能为空；请填写你自己的 AgentMail API key")
+        self.domain = _configured_domains(entry)
+        self.session = _create_session(conf)
+
+    def close(self) -> None:
+        self.session.close()
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: dict | None = None,
+        params: dict | None = None,
+        expected: tuple[int, ...] = (200, 201),
+    ) -> Any:
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+            "User-Agent": self.conf["user_agent"],
+        }
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+        resp = self.session.request(
+            method.upper(),
+            f"{self.api_base}{path}",
+            headers=headers,
+            params=params,
+            json=payload,
+            timeout=self.conf["request_timeout"],
+            verify=False,
+        )
+        return _response_json(resp, self.name, path, expected)
+
+    @staticmethod
+    def _message_item(data: Any) -> dict[str, Any]:
+        if not isinstance(data, dict):
+            return {}
+        for key in ("message", "data", "result"):
+            nested = data.get(key)
+            if isinstance(nested, dict):
+                return nested
+        return data
+
+    @staticmethod
+    def _belongs_to_inbox(item: dict[str, Any], inbox_id: str) -> bool:
+        item_inbox_id = str(item.get("inbox_id") or "").strip()
+        return not item_inbox_id or item_inbox_id == inbox_id
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        local_part = str(username or "").strip()
+        if local_part:
+            payload["username"] = local_part
+        if self.domain:
+            payload["domain"] = _next_domain(self.domain)
+        data = self._request("POST", "/v0/inboxes", payload=payload)
+        address = str(_payload_value(data, "email", "address") or "").strip()
+        inbox_id = str(_payload_value(data, "inbox_id") or "").strip()
+        if not address or not inbox_id:
+            raise RuntimeError("AgentMail 创建响应缺少 email 或 inbox_id")
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": address,
+            "inbox_id": inbox_id,
+        }
+
+    def _normalize_message(self, mailbox: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+        text_content = _value_as_text(item.get("extracted_text"))
+        html_content = _value_as_text(item.get("extracted_html"))
+        fallback_text, fallback_html = _extract_message_content(item)
+        if not text_content:
+            text_content = fallback_text
+        if not html_content:
+            html_content = fallback_html
+        return {
+            "provider": self.name,
+            "mailbox": mailbox["address"],
+            "message_id": str(item.get("message_id") or item.get("id") or "").strip(),
+            "subject": str(item.get("subject") or ""),
+            "sender": _sender_value(item.get("from") or item.get("sender")),
+            "text_content": text_content,
+            "html_content": html_content,
+            "received_at": _parse_received_at(item.get("timestamp") or item.get("received_at") or item.get("receivedAt")),
+            "raw": item,
+        }
+
+    def fetch_recent_messages(self, mailbox: dict[str, Any]) -> list[dict[str, Any]]:
+        inbox_id = str(mailbox.get("inbox_id") or "").strip()
+        address = str(mailbox.get("address") or "").strip()
+        if not inbox_id:
+            raise RuntimeError("AgentMail mailbox 缺少 inbox_id")
+        if not address:
+            raise RuntimeError("AgentMail mailbox 缺少 address")
+        encoded_inbox_id = quote(inbox_id, safe="")
+        messages: list[dict[str, Any]] = []
+        page_token = ""
+        seen_page_tokens: set[str] = set()
+        for _ in range(10):
+            params: dict[str, Any] = {"limit": 10}
+            if page_token:
+                params["page_token"] = page_token
+            page_data = _unwrap_data(
+                self._request(
+                    "GET",
+                    f"/v0/inboxes/{encoded_inbox_id}/messages",
+                    params=params,
+                    expected=(200,),
+                )
+            )
+            if not isinstance(page_data, dict) or not isinstance(page_data.get("messages"), list):
+                raise RuntimeError("AgentMail 消息列表响应缺少 messages")
+            messages.extend(item for item in page_data["messages"] if isinstance(item, dict))
+            next_page_token = str(page_data.get("next_page_token") or page_data.get("nextPageToken") or "").strip()
+            if not next_page_token or next_page_token in seen_page_tokens:
+                break
+            seen_page_tokens.add(next_page_token)
+            page_token = next_page_token
+        summaries = [
+            item
+            for item in messages
+            if isinstance(item, dict)
+            and self._belongs_to_inbox(item, inbox_id)
+            and _message_matches_email(item, address)
+        ]
+        summaries.sort(key=_message_sort_key, reverse=True)
+        result: list[dict[str, Any]] = []
+        for summary in summaries:
+            message_id = str(summary.get("message_id") or summary.get("id") or "").strip()
+            if not message_id:
+                raise RuntimeError("AgentMail 消息摘要缺少 message_id")
+            detail_data = self._request(
+                "GET",
+                f"/v0/inboxes/{encoded_inbox_id}/messages/{quote(message_id, safe='')}",
+                expected=(200,),
+            )
+            detail = self._message_item(detail_data)
+            if not detail or not self._belongs_to_inbox(detail, inbox_id):
+                raise RuntimeError("AgentMail 消息详情与当前 inbox 不匹配")
+            detail_message_id = str(detail.get("message_id") or detail.get("id") or "").strip()
+            if not detail_message_id:
+                raise RuntimeError("AgentMail 消息详情响应缺少 message_id")
+            result.append(self._normalize_message(mailbox, {**summary, **detail}))
+        return result
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        messages = self.fetch_recent_messages(mailbox)
+        return messages[0] if messages else None
+
+
 def _entries(mail_config: dict) -> list[dict]:
     result: list[dict] = []
     counters: dict[str, int] = {}
     for item in mail_config["providers"]:
+        if not isinstance(item, dict):
+            continue
         idx = len(result) + 1
         t = item.get("type", "")
         cnt = counters.get(t, 0) + 1
         counters[t] = cnt
         label = f"DDG-{cnt}" if t == "ddg_mail" else f"{t}#{idx}"
-        result.append({**item, "provider_ref": f"{item['type']}#{idx}", "label": label})
+        configured_ref = str(item.get("id") or item.get("provider_ref") or "").strip()
+        provider_ref = configured_ref or f"{item['type']}#{idx}"
+        result.append({**item, "provider_ref": provider_ref, "label": str(item.get("label") or label)})
     return result
 
 
@@ -2523,6 +3101,9 @@ def _next_entry(mail_config: dict) -> dict:
 
 
 def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = "") -> BaseMailProvider:
+    requested_type = str(provider or "").strip()
+    if requested_type in {"mohmol", "mailboxtemp"}:
+        raise RuntimeError(f"不支持的 mail.provider: {requested_type}")
     entry = next((dict(item) for item in _entries(mail_config) if provider_ref and item["provider_ref"] == provider_ref), None)
     entry = entry or next((dict(item) for item in _enabled_entries(mail_config) if provider and item["type"] == provider), None) or _next_entry(mail_config)
     conf = _config(mail_config)
@@ -2546,6 +3127,10 @@ def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = 
         return YydsMailProvider(entry, conf)
     if entry["type"] == "outlook_token":
         return OutlookTokenProvider(entry, conf)
+    if entry["type"] == "mailslurp":
+        return MailSlurpProvider(entry, conf)
+    if entry["type"] == "mailosaur":
+        return MailosaurProvider(entry, conf)
     if entry["type"] == "mailnest":
         return MailNestProvider(entry, conf)
     if entry["type"] == "mail_tm":
@@ -2570,6 +3155,14 @@ def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = 
         return MailiskProvider(entry, conf)
     if entry["type"] == "mailsac":
         return MailsacProvider(entry, conf)
+    if entry["type"] == "tempy_email":
+        return TempyEmailProvider(entry, conf)
+    if entry["type"] == "qack":
+        return QackProvider(entry, conf)
+    if entry["type"] == "smails":
+        return SmailsProvider(entry, conf)
+    if entry["type"] == "agentmail":
+        return AgentMailProvider(entry, conf)
     raise RuntimeError(f"不支持的 mail.provider: {entry['type']}")
 
 

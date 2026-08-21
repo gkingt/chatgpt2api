@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import threading
 import time
 import uuid
@@ -15,6 +16,77 @@ from services.register import mail_provider, openai_register
 
 REGISTER_FILE = DATA_DIR / "register.json"
 RUNNING_SAVE_INTERVAL_SECS = 2.0
+SECRET_MASK = "[REDACTED]"
+_SECRET_KEY_NAMES = {
+    "access_token",
+    "api_key",
+    "authorization",
+    "bearer_token",
+    "cf_api_key",
+    "cf_inbox_jwt",
+    "client_secret",
+    "cookie",
+    "cookies",
+    "ddg_token",
+    "jwt",
+    "password",
+    "passphrase",
+    "private_key",
+    "refresh_token",
+    "secret",
+    "secret_access_key",
+    "token",
+}
+
+
+def _secret_key_name(key: object) -> str:
+    return "_".join(str(key or "").lower().replace("-", "_").split())
+
+
+def _is_secret_key(key: object) -> bool:
+    normalized = _secret_key_name(key)
+    return normalized in _SECRET_KEY_NAMES or normalized.endswith(("_api_key", "_token", "_password", "_secret", "_jwt"))
+
+
+def _is_blank_secret(value: object) -> bool:
+    return value is None or (isinstance(value, str) and value.strip() in {"", SECRET_MASK})
+
+
+def _collect_secret_values(value: object, result: set[str] | None = None) -> set[str]:
+    result = result if result is not None else set()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if _is_secret_key(key):
+                if isinstance(item, (str, int, float)):
+                    text = str(item).strip()
+                    if len(text) >= 4 and text != SECRET_MASK:
+                        result.add(text)
+                continue
+            _collect_secret_values(item, result)
+    elif isinstance(value, list):
+        for item in value:
+            _collect_secret_values(item, result)
+    return result
+
+
+def _redact_text(value: object, secret_values: set[str]) -> object:
+    if not isinstance(value, str) or not value:
+        return value
+    redacted = value
+    for secret in sorted(secret_values, key=len, reverse=True):
+        redacted = redacted.replace(secret, SECRET_MASK)
+    return redacted
+
+
+def _redact_value(value: object, secret_values: set[str]) -> object:
+    if isinstance(value, dict):
+        return {
+            key: SECRET_MASK if _is_secret_key(key) and not _is_blank_secret(item) else _redact_value(item, secret_values)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_value(item, secret_values) for item in value]
+    return _redact_text(value, secret_values)
 
 
 def _serialize_outlook_pool(credentials: list[dict]) -> str:
@@ -50,7 +122,7 @@ def _default_config() -> dict:
 
 
 def _normalize(raw: dict) -> dict:
-    cfg = _default_config()
+    cfg = json.loads(json.dumps(_default_config(), ensure_ascii=False))
     cfg.update({k: v for k, v in raw.items() if k not in {"stats", "logs"}})
     cfg["total"] = max(1, int(cfg.get("total") or 1))
     cfg["threads"] = max(1, int(cfg.get("threads") or 1))
@@ -64,6 +136,10 @@ def _normalize(raw: dict) -> dict:
         providers = cfg["mail"].get("providers")
         if isinstance(providers, list):
             for provider in providers:
+                if not isinstance(provider, dict):
+                    continue
+                if not str(provider.get("id") or "").strip():
+                    provider["id"] = f"provider-{secrets.token_hex(8)}"
                 if not isinstance(provider, dict) or provider.get("type") != "cloudflare_temp_email":
                     continue
                 provider.pop("rate_limit_cooldown_seconds", None)
@@ -127,7 +203,9 @@ class RegisterService:
                 snapshot = json.loads(json.dumps(self._last_snapshot_payload, ensure_ascii=False))
             else:
                 snapshot = json.loads(payload)
+                secret_values = _collect_secret_values(source)
                 self._redact_outlook_pools(snapshot)
+                snapshot = _redact_value(snapshot, secret_values)
                 self._last_snapshot = payload
                 self._last_snapshot_payload = json.loads(json.dumps(snapshot, ensure_ascii=False))
                 self._last_snapshot_json = json.dumps(snapshot, ensure_ascii=False)
@@ -169,6 +247,33 @@ class RegisterService:
             provider["mailboxes_preview"] = [self._mask_email(c["email"]) for c in credentials]
             provider["mailboxes_stats"] = mail_provider.outlook_token_pool_stats(credentials)
 
+    def _merge_provider_secrets(self, updates: dict) -> None:
+        """前端回传脱敏快照时保留旧 provider 密钥，避免掩码覆盖真实值。"""
+        mail = updates.get("mail")
+        if not isinstance(mail, dict) or not isinstance(mail.get("providers"), list):
+            return
+        old_mail = self._config.get("mail") if isinstance(self._config.get("mail"), dict) else {}
+        old_providers = old_mail.get("providers") if isinstance(old_mail.get("providers"), list) else []
+        for index, provider in enumerate(mail["providers"]):
+            if not isinstance(provider, dict):
+                continue
+            provider_ref = str(provider.get("id") or provider.get("provider_ref") or "").strip()
+            old_provider = next(
+                (
+                    item
+                    for item in old_providers
+                    if isinstance(item, dict)
+                    and provider_ref
+                    and str(item.get("id") or item.get("provider_ref") or "").strip() == provider_ref
+                ),
+                old_providers[index] if index < len(old_providers) else {},
+            )
+            if not isinstance(old_provider, dict) or old_provider.get("type") != provider.get("type"):
+                continue
+            for key, old_value in old_provider.items():
+                if _is_secret_key(key) and _is_blank_secret(provider.get(key)) and not _is_blank_secret(old_value):
+                    provider[key] = old_value
+
     def _drop_mail_proxy(self) -> None:
         if isinstance(self._config.get("mail"), dict):
             self._config["mail"].pop("proxy", None)
@@ -177,7 +282,7 @@ class RegisterService:
         """对 outlook_token provider：把前端新导入的 mailboxes 与已存池按邮箱合并去重。
 
         前端 mailboxes 是只写导入框，留空表示不改动；填入的新行追加/覆盖已存凭据。
-        按数组下标与已存的同类型 provider 对齐。
+        优先按稳定 id/provider_ref 对齐，旧配置再按数组下标兼容。
         """
         mail = updates.get("mail")
         if not isinstance(mail, dict) or not isinstance(mail.get("providers"), list):
@@ -187,7 +292,17 @@ class RegisterService:
         for index, provider in enumerate(mail["providers"]):
             if not isinstance(provider, dict) or provider.get("type") != "outlook_token":
                 continue
-            old = old_providers[index] if index < len(old_providers) and isinstance(old_providers[index], dict) else {}
+            provider_ref = str(provider.get("id") or provider.get("provider_ref") or "").strip()
+            old = next(
+                (
+                    item
+                    for item in old_providers
+                    if isinstance(item, dict)
+                    and provider_ref
+                    and str(item.get("id") or item.get("provider_ref") or "").strip() == provider_ref
+                ),
+                old_providers[index] if index < len(old_providers) and isinstance(old_providers[index], dict) else {},
+            )
             old_text = str(old.get("mailboxes") or "") if old.get("type") == "outlook_token" else ""
             new_text = str(provider.get("mailboxes") or "")
             provider["mailboxes"] = _merge_outlook_pool(old_text, new_text) if (old_text or new_text) else ""
@@ -216,6 +331,7 @@ class RegisterService:
 
     def update(self, updates: dict) -> dict:
         with self._lock:
+            self._merge_provider_secrets(updates)
             self._merge_outlook_pools(updates)
             self._config = _normalize({**self._config, **updates})
             self._drop_mail_proxy()
@@ -307,11 +423,15 @@ class RegisterService:
 
     def _append_log(self, text: str, color: str = "") -> None:
         with self._lock:
-            self._logs.append({"time": _now(), "text": str(text), "level": str(color or "info")})
+            self._logs.append({"time": _now(), "text": self._redact_log_text(str(text)), "level": str(color or "info")})
             self._logs = self._logs[-300:]
             self._last_snapshot = ""
             self._last_snapshot_payload = None
             self._last_snapshot_json = ""
+
+    def _redact_log_text(self, text: str) -> str:
+        source = self._config if isinstance(self._config, dict) else {}
+        return str(_redact_text(text, _collect_secret_values(source)))
 
     def _pool_metrics(self) -> dict:
         items = account_service.list_accounts()

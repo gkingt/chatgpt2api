@@ -39,12 +39,9 @@ config = {
         "wait_interval": 3,
         "providers": [
             {
-                "type": "mailnest",
+                "type": "tempy_email",
                 "enable": False,
-                "api_base": "https://mailnest.top",
-                "api_key": "",
-                "project_code": "ChatGPT0001",
-                "sale_mode": "temporary",
+                "api_base": "https://tempy.email/api/v1",
             }
         ],
     },
@@ -1357,11 +1354,12 @@ class PlatformRegistrar:
     def register(self, index: int) -> dict:
         step(index, "开始创建邮箱")
         mailbox = create_mailbox()
-        email = str(mailbox.get("address") or "").strip()
-        if not email:
-            raise RuntimeError("邮箱服务未返回 address")
-        step(index, f"邮箱创建完成: {email}")
+        code_received = False
         try:
+            email = str(mailbox.get("address") or "").strip()
+            if not email:
+                raise RuntimeError("邮箱服务未返回 address")
+            step(index, f"邮箱创建完成: {email}")
             password = ""
             first_name, last_name = _random_name()
             code_verifier = self._platform_authorize(email, index)
@@ -1372,6 +1370,7 @@ class PlatformRegistrar:
             code = wait_for_code(mailbox)
             if not code:
                 raise RuntimeError("等待注册验证码超时")
+            code_received = True
             step(index, f"收到注册验证码: {code}")
             continue_url = self._validate_otp(code, index)
             account_continue_url = self._create_account(f"{first_name} {last_name}", _random_birthdate(), index, continue_url or f"{auth_base}/about-you")
@@ -1380,6 +1379,10 @@ class PlatformRegistrar:
                 _record_register_domain_result(mailbox, True)
             except Exception as exc:
                 step(index, f"注册域名统计写入失败: {exc}", "yellow")
+            try:
+                mail_provider.mark_mailbox_result(mailbox, success=True)
+            except Exception as exc:
+                step(index, f"邮箱池成功状态写入失败: {exc}", "yellow")
             return {
                 "email": email,
                 "password": password,
@@ -1388,11 +1391,21 @@ class PlatformRegistrar:
                 "id_token": str(tokens.get("id_token") or "").strip(),
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
-        except Exception:
+        except Exception as exc:
             try:
                 _record_register_domain_result(mailbox, False)
-            except Exception as exc:
-                step(index, f"注册域名统计写入失败: {exc}", "yellow")
+            except Exception as stats_error:
+                step(index, f"注册域名统计写入失败: {stats_error}", "yellow")
+            should_release = isinstance(exc, RegistrationCancelled) and not code_received
+            if not code_received and isinstance(exc, mail_provider.OutlookTokenError):
+                should_release = False
+            try:
+                if should_release:
+                    mail_provider.release_mailbox(mailbox)
+                else:
+                    mail_provider.mark_mailbox_result(mailbox, success=False, error=exc)
+            except Exception as status_error:
+                step(index, f"邮箱池失败状态写入失败: {status_error}", "yellow")
             raise
 
 

@@ -125,7 +125,7 @@ class AdditionalMailProviderTests(TestCase):
 
     def test_json_inbox_providers_normalize_messages(self):
         cases = [
-            (mail_provider.CleanTempMailProvider, {"api_key": "ct-test"}, [{"email": "box@clean.test"}, {"emails": [{"id": "1", "to": "box@clean.test", "subject": "Code", "content": "123456"}]}, {"id": "1", "subject": "Code", "content": "123456"}]),
+            (mail_provider.CleanTempMailProvider, {"api_key": "clean-test-key"}, [{"email": "box@clean.test"}, {"emails": [{"id": "1", "to": "box@clean.test", "subject": "Code", "content": "123456"}]}, {"id": "1", "subject": "Code", "content": "123456"}]),
             (mail_provider.DustMailProvider, {"api_key": "dm-test"}, [{"id": "inbox-1", "address": "box@dust.test"}, {"messages": [{"id": "1", "to": "box@dust.test", "subject": "Code", "text": "123456"}]}]),
             (mail_provider.MailiskProvider, {"api_key": "mk-test", "namespace": "ns"}, [{"data": [{"id": "1", "to": [{"address": "box@ns.mailisk.net"}], "subject": "Code", "text": "123456"}]}]),
             (mail_provider.MailsacProvider, {}, [
@@ -150,7 +150,7 @@ class AdditionalMailProviderTests(TestCase):
     def test_cleantempmail_accepts_plain_text_address(self):
         session = FakeSession([FakeResponse("box@clean.test", text="box@clean.test", json_error=True)])
         with mock.patch.object(mail_provider, "_create_session", return_value=session):
-            provider = mail_provider.CleanTempMailProvider({"provider_ref": "cleantempmail#1"}, CONF)
+            provider = mail_provider.CleanTempMailProvider({"provider_ref": "cleantempmail#1", "api_key": "clean-test-key"}, CONF)
             mailbox = provider.create_mailbox()
         self.assertEqual(mailbox["address"], "box@clean.test")
 
@@ -187,13 +187,155 @@ class AdditionalMailProviderTests(TestCase):
         names = [
             "mail_tm", "mail_gw", "dropmail", "guerrilla_mail", "maildrop", "catchmail",
             "dustmail", "cleantempmail", "testmail_app", "mailisk", "mailsac",
+            "tempy_email", "qack", "smails", "agentmail", "mailslurp", "mailosaur",
         ]
         for name in names:
-            config = {"providers": [{"type": name, "enable": True}]}
+            config = {"providers": [{"type": name, "enable": True, **({"api_key": "account-test-key"} if name in {"agentmail", "mailslurp", "mailosaur"} else {}), **({"server_id": "server-1"} if name == "mailosaur" else {})}]}
             with mock.patch.object(mail_provider, "_create_session", return_value=FakeSession([])):
                 provider = mail_provider._create_provider(config)
             self.assertEqual(provider.name, name)
             provider.close()
+
+    def test_mailslurp_creates_inbox_and_reads_email_detail(self):
+        session = FakeSession([
+            {"id": "inbox-1", "emailAddress": "box@mailslurp.test"},
+            {"content": [{"id": "email-1"}]},
+            {"id": "email-1", "to": [{"emailAddress": "box@mailslurp.test"}], "subject": "Code", "body": "Verification code: 123456", "createdAt": "2026-06-10T12:00:00Z"},
+        ])
+        with mock.patch.object(mail_provider, "_create_session", return_value=session):
+            provider = mail_provider.MailSlurpProvider({"provider_ref": "mailslurp#1", "api_key": "key"}, CONF)
+            mailbox = provider.create_mailbox("box")
+            message = provider.fetch_latest_message(mailbox)
+        self.assertEqual(mailbox["inbox_id"], "inbox-1")
+        self.assertEqual(message["message_id"], "email-1")
+        self.assertEqual(message["text_content"], "Verification code: 123456")
+        self.assertEqual(session.calls[0]["headers"]["Authorization"], "key")
+        self.assertIn("/inboxes/inbox-1/emails", session.calls[1]["url"])
+
+    def test_mailosaur_lists_messages_with_basic_auth(self):
+        session = FakeSession([{
+            "items": [{"id": "message-1", "to": [{"email": "box@server-1.mailosaur.net"}], "subject": "Code", "text": {"body": "Verification code: 123456"}, "received": "2026-06-10T12:00:00Z"}],
+        }])
+        with mock.patch.object(mail_provider, "_create_session", return_value=session):
+            provider = mail_provider.MailosaurProvider({"provider_ref": "mailosaur#1", "api_key": "key", "server_id": "server-1"}, CONF)
+            mailbox = provider.create_mailbox("box")
+            message = provider.fetch_latest_message(mailbox)
+        self.assertEqual(message["message_id"], "message-1")
+        self.assertEqual(message["text_content"], "Verification code: 123456")
+        self.assertTrue(session.calls[0]["headers"]["Authorization"].startswith("Basic "))
+        self.assertEqual(session.calls[0]["params"]["server"], "server-1")
+
+    def test_tempy_email_lifecycle_and_empty_inbox(self):
+        session = FakeSession([
+            {"email": "box@tempy.test", "expiresAt": "2026-06-10T13:00:00Z", "secondsRemaining": 3600},
+            {"messages": []},
+        ])
+        with mock.patch.object(mail_provider, "_create_session", return_value=session):
+            provider = mail_provider.TempyEmailProvider({"provider_ref": "tempy_email#1"}, CONF)
+            mailbox = provider.create_mailbox("ignored")
+            message = provider.fetch_latest_message(mailbox)
+            provider.close()
+        self.assertEqual(mailbox["address"], "box@tempy.test")
+        self.assertEqual(mailbox["seconds_remaining"], 3600)
+        self.assertIsNone(message)
+        self.assertEqual(session.calls[0]["method"], "POST")
+        self.assertEqual(session.calls[0]["url"], "https://tempy.email/api/v1/mailbox")
+        self.assertEqual(session.calls[0]["json"], {})
+        self.assertEqual(session.calls[1]["url"], "https://tempy.email/api/v1/mailbox/box@tempy.test/messages")
+
+    def test_qack_reads_listing_and_details_with_target_filter(self):
+        session = FakeSession([
+            {"address": "box@qack.test"},
+            [
+                {"id": "wrong", "to": "other@qack.test", "subject": "wrong", "received_at": "2026-06-10T12:02:00Z"},
+                {"id": "q1", "to": "box@qack.test", "subject": "Code", "received_at": "2026-06-10T12:01:00Z"},
+            ],
+            {"id": "q1", "from": "sender@example.test", "to": "box@qack.test", "subject": "Code", "body": {"text": "Verification code: 123456"}},
+        ])
+        with mock.patch.object(mail_provider, "_create_session", return_value=session):
+            provider = mail_provider.QackProvider({"provider_ref": "qack#1", "realistic": True}, CONF)
+            mailbox = provider.create_mailbox()
+            message = provider.fetch_latest_message(mailbox)
+        self.assertEqual(message["message_id"], "q1")
+        self.assertEqual(message["text_content"], "Verification code: 123456")
+        self.assertEqual(session.calls[0]["json"], {"realistic": True})
+        self.assertEqual(session.calls[1]["url"], "https://api.qack.dev/v1/inboxes/box@qack.test/messages")
+        self.assertEqual(session.calls[2]["url"], "https://api.qack.dev/v1/inboxes/box@qack.test/messages/q1")
+
+    def test_smails_persists_bearer_token_and_reads_detail(self):
+        session = FakeSession([
+            {"address": "box@smails.test", "token": "mailbox-token"},
+            [{"id": "s1", "to": "box@smails.test", "from_addr": "a@example.test", "subject": "Code", "received_at": "2026-06-10T12:00:00Z"}],
+            {"id": "s1", "from_addr": "a@example.test", "subject": "Code", "text": "123456", "html": "<b>123456</b>"},
+        ])
+        with mock.patch.object(mail_provider, "_create_session", return_value=session):
+            provider = mail_provider.SmailsProvider({"provider_ref": "smails#1"}, CONF)
+            mailbox = provider.create_mailbox()
+            message = provider.fetch_latest_message(mailbox)
+        self.assertEqual(mailbox["token"], "mailbox-token")
+        self.assertEqual(message["text_content"], "123456")
+        self.assertEqual(session.calls[1]["headers"]["Authorization"], "Bearer mailbox-token")
+        self.assertEqual(session.calls[2]["headers"]["Authorization"], "Bearer mailbox-token")
+
+    def test_factory_rejects_unverified_provider_types(self):
+        for name in ("mohmol", "mailboxtemp"):
+            with self.assertRaisesRegex(RuntimeError, "不支持"):
+                mail_provider._create_provider({"providers": [{"type": name, "enable": True}]})
+
+    def test_agentmail_creates_inbox_and_reads_details_with_bearer_auth(self):
+        session = FakeSession([
+            {"inbox_id": "inbox-1", "email": "box@agentmail.test"},
+            {"count": 2, "messages": [
+                {"message_id": "wrong", "to": "other@agentmail.test", "subject": "wrong"},
+            ], "next_page_token": "next-1"},
+            {"messages": [{"message_id": "a1", "to": "box@agentmail.test", "subject": "Code", "timestamp": "2026-06-10T12:00:00Z"}]},
+            {"message_id": "a1", "inbox_id": "inbox-1", "from": "sender@example.test", "to": "box@agentmail.test", "subject": "Code", "extracted_text": "Verification code: 123456", "extracted_html": "<b>123456</b>", "timestamp": "2026-06-10T12:00:00Z"},
+        ])
+        with mock.patch.object(mail_provider, "_create_session", return_value=session):
+            provider = mail_provider.AgentMailProvider({"provider_ref": "agentmail#1", "api_key": "agent-test-key", "domain": ["agentmail.test"]}, CONF)
+            mailbox = provider.create_mailbox("box")
+            message = provider.fetch_latest_message(mailbox)
+            provider.close()
+        self.assertEqual(mailbox["inbox_id"], "inbox-1")
+        self.assertEqual(message["message_id"], "a1")
+        self.assertEqual(message["text_content"], "Verification code: 123456")
+        self.assertEqual(message["html_content"], "<b>123456</b>")
+        self.assertEqual(session.calls[0]["url"], "https://api.agentmail.to/v0/inboxes")
+        self.assertEqual(session.calls[0]["json"], {"username": "box", "domain": "agentmail.test"})
+        self.assertEqual(session.calls[1]["headers"]["Authorization"], "Bearer agent-test-key")
+        self.assertEqual(session.calls[2]["params"]["page_token"], "next-1")
+        self.assertEqual(session.calls[3]["headers"]["Authorization"], "Bearer agent-test-key")
+        self.assertEqual(session.calls[1]["url"], "https://api.agentmail.to/v0/inboxes/inbox-1/messages")
+        self.assertEqual(session.calls[3]["url"], "https://api.agentmail.to/v0/inboxes/inbox-1/messages/a1")
+
+    def test_agentmail_allows_server_generated_username_and_empty_inbox(self):
+        session = FakeSession([
+            {"inbox_id": "inbox-2", "email": "random@agentmail.to"},
+            {"count": 0, "messages": []},
+        ])
+        with mock.patch.object(mail_provider, "_create_session", return_value=session):
+            provider = mail_provider.AgentMailProvider({"provider_ref": "agentmail#1", "api_key": "key"}, CONF)
+            mailbox = provider.create_mailbox()
+            message = provider.fetch_latest_message(mailbox)
+        self.assertEqual(session.calls[0]["json"], {})
+        self.assertIsNone(message)
+
+    def test_agentmail_rejects_missing_key_and_malformed_responses(self):
+        with mock.patch.object(mail_provider, "_create_session", return_value=FakeSession([])):
+            with self.assertRaisesRegex(RuntimeError, "api_key"):
+                mail_provider.AgentMailProvider({"provider_ref": "agentmail#1"}, CONF)
+
+        create_session = FakeSession([{"email": "missing-id@agentmail.to"}])
+        with mock.patch.object(mail_provider, "_create_session", return_value=create_session):
+            provider = mail_provider.AgentMailProvider({"provider_ref": "agentmail#1", "api_key": "key"}, CONF)
+            with self.assertRaisesRegex(RuntimeError, "inbox_id"):
+                provider.create_mailbox()
+
+        error_session = FakeSession([FakeResponse({"detail": "unauthorized"}, status_code=401)])
+        with mock.patch.object(mail_provider, "_create_session", return_value=error_session):
+            provider = mail_provider.AgentMailProvider({"provider_ref": "agentmail#1", "api_key": "key"}, CONF)
+            with self.assertRaisesRegex(RuntimeError, "HTTP 401"):
+                provider.create_mailbox()
 
     def test_base_wait_for_code_scans_recent_messages(self):
         provider = mail_provider.BaseMailProvider({"wait_timeout": 1, "wait_interval": 0.2})
