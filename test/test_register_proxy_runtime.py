@@ -188,7 +188,7 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
             register_service._last_snapshot_payload = original_snapshot_payload
             register_service._last_snapshot_json = original_snapshot_json
 
-    def test_register_snapshot_redacts_provider_secrets_and_log_values(self):
+    def test_register_snapshot_returns_provider_secrets_but_redacts_log_values(self):
         original_config = register_service._config
         original_logs = register_service._logs
         original_snapshot = register_service._last_snapshot
@@ -218,14 +218,17 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
 
             snapshot = register_service.get()
             provider = snapshot["mail"]["providers"][0]
-            self.assertEqual(provider["api_key"], "[REDACTED]")
-            self.assertEqual(provider["token"], "[REDACTED]")
-            self.assertEqual(provider["admin_password"], "[REDACTED]")
+            self.assertEqual(provider["api_key"], "provider-api-secret")
+            self.assertEqual(provider["token"], "runtime-token-secret")
+            self.assertEqual(provider["admin_password"], "admin-password-secret")
             self.assertEqual(provider["project_code"], "safe-project")
-            snapshot_text = json.dumps(snapshot, ensure_ascii=False)
-            self.assertNotIn("provider-api-secret", snapshot_text)
-            self.assertNotIn("runtime-token-secret", snapshot_text)
-            self.assertNotIn("admin-password-secret", register_service.snapshot_json())
+            self.assertEqual(
+                snapshot["logs"][0]["text"],
+                "api_key=[REDACTED] Authorization: Bearer [REDACTED]",
+            )
+            snapshot_json = json.loads(register_service.snapshot_json())
+            self.assertEqual(snapshot_json["mail"]["providers"][0]["api_key"], "provider-api-secret")
+            self.assertNotIn("provider-api-secret", snapshot_json["logs"][0]["text"])
         finally:
             register_service._config = original_config
             register_service._logs = original_logs

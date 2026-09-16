@@ -32,7 +32,7 @@ class FakeSession:
 
 
 class CloudflareTempMailConfigTests(TestCase):
-    def test_normalize_enables_manual_level_suffix_by_default(self):
+    def test_normalize_removes_legacy_subdomain_settings(self):
         config = register_service_module._normalize(
             {
                 "mail": {
@@ -40,7 +40,10 @@ class CloudflareTempMailConfigTests(TestCase):
                         {
                             "type": "cloudflare_temp_email",
                             "enable": True,
+                            "subdomain": ["legacy"],
                             "subdomain_levels": ["sfsfe", "grtwrwe"],
+                            "append_random_suffix": True,
+                            "random_subdomain_depth": 2,
                         }
                     ]
                 }
@@ -48,51 +51,27 @@ class CloudflareTempMailConfigTests(TestCase):
         )
 
         provider = config["mail"]["providers"][0]
-        self.assertIs(provider["append_random_suffix"], True)
-        self.assertEqual(provider["subdomain_levels"], ["sfsfe", "grtwrwe"])
-        self.assertEqual(provider["random_subdomain_depth"], 1)
+        self.assertNotIn("subdomain", provider)
+        self.assertNotIn("subdomain_levels", provider)
+        self.assertNotIn("append_random_suffix", provider)
+        self.assertNotIn("random_subdomain_depth", provider)
 
-        config["mail"]["providers"][0]["append_random_suffix"] = False
-        normalized = register_service_module._normalize(config)
-        self.assertIs(normalized["mail"]["providers"][0]["append_random_suffix"], False)
-
-    def test_manual_levels_are_composed_from_root_outward_with_suffixes(self):
+    def test_create_mailbox_uses_configured_root_domain_directly(self):
         session = FakeSession()
         conf = {"request_timeout": 30, "wait_timeout": 30, "wait_interval": 2, "user_agent": "test", "proxy": ""}
         entry = {
             "api_base": "https://mail.example.test",
             "admin_password": "secret",
             "domain": ["example.test"],
-            "subdomain_levels": ["sfsfe", "grtwrwe"],
-        }
-
-        with (
-            mock.patch.object(mail_provider, "_create_session", return_value=session),
-            mock.patch.object(mail_provider, "_random_subdomain_suffix", side_effect=["a1b2c", "d3e4f"]),
-        ):
-            provider = mail_provider.CloudflareTempMailProvider(entry, conf)
-            provider.create_mailbox("user")
-
-        self.assertEqual(session.calls[0]["json"]["domain"], "grtwrwed3e4f.sfsfea1b2c.example.test")
-
-    def test_random_subdomain_depth_controls_generated_levels(self):
-        session = FakeSession()
-        conf = {"request_timeout": 30, "wait_timeout": 30, "wait_interval": 2, "user_agent": "test", "proxy": ""}
-        entry = {
-            "api_base": "https://mail.example.test",
-            "admin_password": "secret",
-            "domain": ["example.test"],
+            "subdomain_levels": ["legacy"],
             "random_subdomain_depth": 2,
         }
 
-        with (
-            mock.patch.object(mail_provider, "_create_session", return_value=session),
-            mock.patch.object(mail_provider, "_random_subdomain_label", side_effect=["one", "two"]),
-        ):
+        with mock.patch.object(mail_provider, "_create_session", return_value=session):
             provider = mail_provider.CloudflareTempMailProvider(entry, conf)
             provider.create_mailbox("user")
 
-        self.assertEqual(session.calls[0]["json"]["domain"], "one.two.example.test")
+        self.assertEqual(session.calls[0]["json"]["domain"], "example.test")
 
     def test_root_domain_is_selected_randomly_from_all_configured_domains(self):
         session = FakeSession()
@@ -101,19 +80,17 @@ class CloudflareTempMailConfigTests(TestCase):
             "api_base": "https://mail.example.test",
             "admin_password": "secret",
             "domain": ["one.example", "two.example", "three.example"],
-            "random_subdomain_depth": 1,
         }
 
         with (
             mock.patch.object(mail_provider, "_create_session", return_value=session),
-            mock.patch.object(mail_provider, "_random_subdomain_label", return_value="box"),
             mock.patch.object(mail_provider.random, "choice", return_value="two.example") as choose_domain,
         ):
             provider = mail_provider.CloudflareTempMailProvider(entry, conf)
             provider.create_mailbox("user")
 
-        self.assertEqual(session.calls[0]["json"]["domain"], "box.two.example")
-        choose_domain.assert_any_call(["one.example", "two.example", "three.example"])
+        self.assertEqual(session.calls[0]["json"]["domain"], "two.example")
+        choose_domain.assert_called_once_with(["one.example", "two.example", "three.example"])
 
     def test_mailnest_provider_buys_temporary_email_and_reads_code_match(self):
         session = FakeSession(
