@@ -12,6 +12,7 @@ from typing import Any, Iterable, Iterator
 import tiktoken
 
 from services.account_service import account_service
+from services.account_health import ERROR_INVALID_TOKEN, classify_account_error
 from services.config import config
 from services.image_storage_service import image_storage_service
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
@@ -69,13 +70,7 @@ def public_image_error_message(message: str) -> str:
 
 
 def is_token_invalid_error(message: str) -> bool:
-    text = str(message or "").lower()
-    return (
-        "token_invalidated" in text
-        or "token_revoked" in text
-        or "authentication token has been invalidated" in text
-        or "invalidated oauth token" in text
-    )
+    return classify_account_error(message).kind == ERROR_INVALID_TOKEN
 
 
 def _error_text(value: object) -> str:
@@ -125,11 +120,16 @@ def is_tls_connection_error(message: str) -> bool:
     text = str(message or "").lower()
     return (
         "curl: (35)" in text
+        or "curl: (56)" in text
+        or "curl: (92)" in text
         or "tls connect error" in text
         or "openssl_internal" in text
         or "ssl: wrong_version_number" in text
         or "ssl: certificate_verify_failed" in text
         or "connection aborted" in text
+        or "connection closed abruptly" in text
+        or "http/2 stream" in text
+        or "internal_error" in text
         or "remote disconnected" in text
         or "connection reset by peer" in text
     )
@@ -756,7 +756,7 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                 if refreshed_token and refreshed_token != token and refreshed_token not in attempted_tokens:
                     token = refreshed_token
                 else:
-                    account_service.remove_invalid_token(token, "text_stream")
+                    account_service.remove_invalid_token(token, "text_stream", error=error_message)
                     token = account_service.get_text_access_token(attempted_tokens)
                 if token:
                     continue
@@ -1505,7 +1505,7 @@ def _generate_single_image(
                 if refreshed_token and refreshed_token != token:
                     token = refreshed_token
                     continue
-                account_service.remove_invalid_token(token, "image_stream")
+                account_service.remove_invalid_token(token, "image_stream", error=last_error)
                 continue
             # TLS/SSL 连接错误：自动重试
             if not emitted_for_token and is_tls_connection_error(last_error):

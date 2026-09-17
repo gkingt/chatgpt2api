@@ -103,7 +103,7 @@ class AccountCapabilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
             service.add_account_items([
-                {"access_token": "stale-token", "status": "正常", "quota": 8, "image_quota_unknown": True}
+                {"access_token": "stale-token", "status": "正常", "quota": 8, "image_quota_unknown": False}
             ])
 
             def fail_preflight(access_token: str, event: str = "fetch_remote_info") -> dict:
@@ -119,7 +119,7 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertIsNotNone(account)
             self.assertEqual(account["status"], "正常")
             self.assertEqual(account["quota"], 8)
-            self.assertTrue(account["image_quota_unknown"])
+            self.assertFalse(account["image_quota_unknown"])
             self.assertIn("preflight failed", account["last_refresh_error"])
             self.assertEqual(stats["active"], 1)
             self.assertEqual(stats["total_quota"], 8)
@@ -138,7 +138,7 @@ class AccountCapabilityTests(unittest.TestCase):
         self.assertFalse(result["image_quota_unknown"])
         self.assertEqual(result["quota"], 0)
 
-    def test_missing_image_quota_feature_is_refreshed_as_limited(self) -> None:
+    def test_missing_image_quota_feature_is_refreshed_as_unknown(self) -> None:
         api = OpenAIBackendAPI("token")
         with patch.object(api, "_get_me", return_value={"email": "new@example.com", "id": "user-id"}), patch.object(
             api,
@@ -147,8 +147,8 @@ class AccountCapabilityTests(unittest.TestCase):
         ), patch.object(api, "_get_default_account", return_value={"plan_type": "free", "is_deactivated": False}):
             result = api.get_user_info()
 
-        self.assertEqual(result["status"], "限流")
-        self.assertFalse(result["image_quota_unknown"])
+        self.assertEqual(result["status"], "正常")
+        self.assertTrue(result["image_quota_unknown"])
         self.assertEqual(result["quota"], 0)
 
     def test_refresh_accounts_can_remove_invalid_token_without_confirmation_delay(self) -> None:
@@ -193,12 +193,14 @@ class AccountCapabilityTests(unittest.TestCase):
                 self.assertEqual(result["refreshed"], 0)
                 self.assertEqual(len(result["errors"]), 1)
                 self.assertIsNotNone(account)
-                self.assertEqual(account["status"], "异常")
+                self.assertEqual(account["status"], "正常")
                 self.assertEqual(account["quota"], 0)
-                self.assertFalse(account["image_quota_unknown"])
+                self.assertEqual(account["health_state"], "invalid_pending")
+                self.assertIsNotNone(account["health_retry_at"])
+                self.assertFalse(service._remove_confirmed_invalid_token("invalid-token", "test"))
                 self.assertEqual(account["invalid_count"], 1)
                 stats = service.get_stats()
-                self.assertEqual(stats["active"], 0)
+                self.assertEqual(stats["active"], 1)
                 self.assertEqual(stats["total_quota"], 0)
                 self.assertEqual(stats["unlimited_quota_count"], 0)
                 self.assertEqual(service.list_normal_tokens(), [])
@@ -227,7 +229,7 @@ class AccountCapabilityTests(unittest.TestCase):
             stats = service.get_stats()
 
             self.assertEqual(stats["active"], 2)
-            self.assertEqual(stats["total_quota"], 11)
+            self.assertEqual(stats["total_quota"], 2)
             self.assertEqual(stats["unlimited_quota_count"], 0)
             self.assertEqual(service.list_normal_tokens(), ["good-token"])
 
@@ -290,7 +292,7 @@ class AccountCapabilityTests(unittest.TestCase):
         self.assertEqual(fake_account_service.marked, [("good-token", True)])
         self.assertEqual(outputs[0].data, [{"url": "ok"}])
 
-    def test_refresh_accounts_removes_invalid_token_by_default(self) -> None:
+    def test_refresh_accounts_defers_invalid_token_by_default(self) -> None:
         original_value = config.data.get("auto_remove_invalid_accounts")
         config.data["auto_remove_invalid_accounts"] = True
         try:
@@ -306,7 +308,10 @@ class AccountCapabilityTests(unittest.TestCase):
 
                 self.assertEqual(result["refreshed"], 0)
                 self.assertEqual(len(result["errors"]), 1)
-                self.assertIsNone(service.get_account("invalid-token"))
+                account = service.get_account("invalid-token")
+                self.assertIsNotNone(account)
+                self.assertEqual(account["health_state"], "invalid_pending")
+                self.assertEqual(account["status"], "正常")
         finally:
             if original_value is None:
                 config.data.pop("auto_remove_invalid_accounts", None)

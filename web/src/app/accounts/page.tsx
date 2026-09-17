@@ -53,6 +53,7 @@ import {
   testProxy,
   updateAccount,
   type Account,
+  type AccountHealthState,
   type AccountRefreshResponse,
   type AccountStatus,
   type Model,
@@ -101,6 +102,9 @@ function formatCompact(value: number) {
 }
 
 function formatQuota(account: Account) {
+  if (account.image_quota_unknown) {
+    return "未知";
+  }
   return String(Math.max(0, account.quota));
 }
 
@@ -129,8 +133,38 @@ function formatRestoreAt(value?: string | null) {
 }
 
 function formatQuotaSummary(accounts: Account[]) {
-  const availableAccounts = accounts.filter((account) => account.status === "正常");
+  const availableAccounts = accounts.filter((account) => account.status === "正常" && !account.image_quota_unknown);
   return formatCompact(availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0));
+}
+
+const healthStateLabels: Record<string, string> = {
+  healthy: "健康",
+  rate_limited: "上游限流",
+  image_quota_unknown: "图片额度未知",
+  invalid_pending: "Token 待复核",
+  invalid_confirmed: "Token 已确认失效",
+  needs_relogin: "需要重新登录",
+  needs_verification: "需要验证码",
+  disabled: "账号已禁用",
+  transient_error: "临时错误",
+  unknown_error: "未知错误",
+};
+
+function healthStateLabel(state?: AccountHealthState | null) {
+  const normalized = String(state || "healthy");
+  return healthStateLabels[normalized] || normalized;
+}
+
+function formatCheckTime(value?: string | null) {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function maskToken(token?: string) {
@@ -274,6 +308,17 @@ function AccountsPageContent() {
     const quota = formatQuotaSummary(accounts);
 
     return { total, active, limited, abnormal, disabled, quota };
+  }, [accounts]);
+
+  const healthSummary = useMemo(() => {
+    const count = (state: string) => accounts.filter((item) => item.health_state === state).length;
+    return {
+      pending: count("invalid_pending"),
+      relogin: count("needs_relogin"),
+      verification: count("needs_verification"),
+      transient: count("transient_error"),
+      quotaUnknown: accounts.filter((item) => item.image_quota_unknown).length,
+    };
   }, [accounts]);
 
   const accountTypeOptions = useMemo(
@@ -903,6 +948,18 @@ function AccountsPageContent() {
             </div>
           </CardContent>
         </Card>
+        <Card className="rounded-2xl border-white/80 bg-white/90 shadow-sm">
+          <CardContent className="p-4">
+            <div className="mb-3 text-sm font-medium text-stone-700">健康诊断</div>
+            <div className="flex flex-wrap gap-x-5 gap-y-2 text-xs text-stone-500">
+              <span>待复核 {healthSummary.pending}</span>
+              <span>需重新登录 {healthSummary.relogin}</span>
+              <span>需验证码 {healthSummary.verification}</span>
+              <span>临时错误 {healthSummary.transient}</span>
+              <span>图片额度未知 {healthSummary.quotaUnknown}</span>
+            </div>
+          </CardContent>
+        </Card>
       </section>
 
       <section className="space-y-4">
@@ -1035,7 +1092,7 @@ function AccountsPageContent() {
             </div>
 
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[1000px] text-left">
+              <table className="w-full min-w-[1240px] text-left">
                 <thead className="border-b border-stone-100 text-[11px] text-stone-400 uppercase tracking-[0.18em]">
                   <tr>
                     <th className="w-12 px-4 py-3">
@@ -1048,6 +1105,7 @@ function AccountsPageContent() {
                     <th className="w-28 px-4 py-3">类型</th>
                     <th className="w-24 px-4 py-3">来源</th>
                     <th className="w-24 px-4 py-3">状态</th>
+                    <th className="w-64 px-4 py-3">健康诊断</th>
                     <th className="w-56 px-4 py-3">账号信息</th>
                     <th className="w-32 px-4 py-3">创建时间</th>
                     <th className="w-24 px-4 py-3">额度</th>
@@ -1115,6 +1173,42 @@ function AccountsPageContent() {
                             <StatusIcon className="size-3.5" />
                             {account.status}
                           </Badge>
+                        </td>
+                        <td className="px-4 py-3 align-top">
+                          <div className="max-w-[250px] space-y-0.5 text-xs leading-5 text-stone-500">
+                            <div
+                              className={cn(
+                                "font-medium",
+                                account.health_state === "healthy"
+                                  ? "text-emerald-600"
+                                  : account.health_state === "needs_relogin" || account.health_state === "needs_verification"
+                                    ? "text-rose-600"
+                                    : "text-amber-600",
+                              )}
+                              title={account.health_reason ?? undefined}
+                            >
+                              {healthStateLabel(account.health_state)}
+                            </div>
+                            {account.health_error_kind || account.health_error_code ? (
+                              <div className="truncate" title={`${account.health_error_kind ?? ""} ${account.health_error_code ?? ""}`}>
+                                分类：{account.health_error_kind ?? "—"} · 代码：{account.health_error_code ?? "—"}
+                              </div>
+                            ) : null}
+                            {account.health_source ? (
+                              <div className="truncate" title={account.health_source}>
+                                来源：{account.health_source}
+                              </div>
+                            ) : null}
+                            <div>
+                              检查：{formatCheckTime(account.last_check_at)} · 成功：{formatCheckTime(account.last_successful_check_at)}
+                            </div>
+                            {account.health_failure_count ? (
+                              <div>连续失败：{account.health_failure_count}</div>
+                            ) : null}
+                            {account.health_retry_at ? (
+                              <div>下次复核：{formatCheckTime(account.health_retry_at)}</div>
+                            ) : null}
+                          </div>
                         </td>
                         <td className="px-4 py-3">
                           <div className="text-xs leading-5 text-stone-500">{account.email ?? "—"}</div>

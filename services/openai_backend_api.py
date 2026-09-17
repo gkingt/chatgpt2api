@@ -20,6 +20,7 @@ from curl_cffi import requests
 from PIL import Image
 
 from services.account_service import account_service
+from services.account_health import ERROR_TRANSIENT, ERROR_UPSTREAM_RATE_LIMITED, classify_account_error
 from services.config import config
 from services.proxy_service import proxy_settings
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
@@ -28,12 +29,23 @@ from utils.pow import build_legacy_requirements_token, build_proof_token, parse_
 from utils.turnstile import solve_turnstile_token
 
 
-class InvalidAccessTokenError(RuntimeError):
-    pass
+class AccountCheckError(RuntimeError):
+    """账号远程检查失败，携带可用于分类的 HTTP 状态和请求路径。"""
+
+    def __init__(self, message: str, status_code: int | None = None, path: str = "") -> None:
+        self.status_code = status_code
+        self.path = path
+        super().__init__(message)
 
 
-class DisabledAccountError(RuntimeError):
-    pass
+class InvalidAccessTokenError(AccountCheckError):
+    def __init__(self, message: str = "token invalidated", path: str = "") -> None:
+        super().__init__(message, status_code=401, path=path)
+
+
+class DisabledAccountError(AccountCheckError):
+    def __init__(self, message: str = "account is disabled", path: str = "") -> None:
+        super().__init__(message, status_code=403, path=path)
 
 
 class ImagePollTimeoutError(RuntimeError):
@@ -175,6 +187,7 @@ class OpenAIBackendAPI:
             account=self.account,
             impersonate=self.fp["impersonate"],
             verify=True,
+            upstream=True,
         ))
         self.session.headers.update({
             "User-Agent": self.user_agent,
@@ -262,19 +275,29 @@ class OpenAIBackendAPI:
         headers["X-OpenAI-Target-Route"] = path
         if extra:
             headers.update(extra)
-        return headers
+        return proxy_settings.build_headers(
+            headers,
+            target_url=self.base_url + path,
+            account=self.account,
+            upstream=True,
+        )
 
     @staticmethod
-    def _extract_quota_and_restore_at(limits_progress: list[Any]) -> tuple[int, str | None]:
+    def _extract_quota_and_restore_at(limits_progress: list[Any]) -> tuple[int, str | None, bool]:
         for item in limits_progress:
-            if isinstance(item, dict) and item.get("feature_name") == "image_gen":
-                return int(item.get("remaining") or 0), str(item.get("reset_after") or "") or None
-        return 0, None
+            if not isinstance(item, dict) or item.get("feature_name") != "image_gen":
+                continue
+            try:
+                remaining = max(0, int(item.get("remaining")))
+            except (TypeError, ValueError):
+                return 0, None, False
+            return remaining, str(item.get("reset_after") or "") or None, True
+        return 0, None, False
 
     def _raise_on_error(self, response: Any, path: str) -> None:
         if response.status_code == 401:
-            raise InvalidAccessTokenError(f"token invalidated ({path})")
-        raise RuntimeError(f"{path} failed: HTTP {response.status_code}")
+            raise InvalidAccessTokenError(f"token invalidated ({path})", path=path)
+        raise AccountCheckError(f"{path} failed: HTTP {response.status_code}", status_code=response.status_code, path=path)
 
     def _get_me(self) -> Dict[str, Any]:
         path = "/backend-api/me"
@@ -324,11 +347,39 @@ class OpenAIBackendAPI:
         if not self.access_token:
             raise RuntimeError("access_token is required")
         executor = ThreadPoolExecutor(max_workers=3)
+        futures = {
+            "me": executor.submit(self._get_me),
+            "conversation_init": executor.submit(self._get_conversation_init),
+            "default_account": executor.submit(self._get_default_account),
+        }
         try:
-            me_future = executor.submit(self._get_me)
-            init_future = executor.submit(self._get_conversation_init)
-            account_future = executor.submit(self._get_default_account)
-            me_payload, init_payload, default_account = me_future.result(), init_future.result(), account_future.result()
+            # /me 是认证主检查：失败时必须向上抛出，不能用残缺信息把账号误判为健康。
+            me_payload = futures["me"].result()
+
+            # 图片额度属于可选能力。额度接口临时超时、代理失败、5xx 或限流时，
+            # 仍然保留账号认证结果，并显式返回 image_quota_unknown，交给账号服务
+            # 保留旧额度且进入短暂冷却，而不是把账号直接标记为“限流”。
+            image_quota_error = ""
+            try:
+                init_payload = futures["conversation_init"].result()
+            except Exception as exc:
+                classification = classify_account_error(exc)
+                if classification.kind not in {ERROR_TRANSIENT, ERROR_UPSTREAM_RATE_LIMITED}:
+                    raise
+                init_payload = {}
+                image_quota_error = str(exc or "")[:500]
+
+            # 套餐/禁用信息是账号状态的重要来源；临时失败时用空对象降级，
+            # 但认证失败等明确错误仍然抛出，避免把失效 token 当成正常账号。
+            account_info_error = ""
+            try:
+                default_account = futures["default_account"].result()
+            except Exception as exc:
+                classification = classify_account_error(exc)
+                if classification.kind not in {ERROR_TRANSIENT, ERROR_UPSTREAM_RATE_LIMITED}:
+                    raise
+                default_account = {}
+                account_info_error = str(exc or "")[:500]
         except (KeyboardInterrupt, SystemExit):
             executor.shutdown(wait=False, cancel_futures=True)
             raise
@@ -340,23 +391,34 @@ class OpenAIBackendAPI:
 
         plan_type = str(default_account.get("plan_type") or "free")
 
+        if not isinstance(me_payload, dict):
+            me_payload = {}
+        if not isinstance(init_payload, dict):
+            init_payload = {}
+        if not isinstance(default_account, dict):
+            default_account = {}
+
         limits_progress = init_payload.get("limits_progress")
         limits_progress = limits_progress if isinstance(limits_progress, list) else []
-        quota, restore_at = self._extract_quota_and_restore_at(limits_progress)
+        quota, restore_at, image_quota_known = self._extract_quota_and_restore_at(limits_progress)
         is_deactivated = bool(default_account.get("is_deactivated"))
-        status = "禁用" if is_deactivated else ("限流" if quota == 0 else "正常")
+        status = "禁用" if is_deactivated else ("限流" if image_quota_known and quota == 0 else "正常")
         result = {
             "email": me_payload.get("email"),
             "user_id": me_payload.get("id"),
             "type": plan_type,
             "quota": 0 if is_deactivated else quota,
-            "image_quota_unknown": False,
+            "image_quota_unknown": not image_quota_known,
             "limits_progress": limits_progress,
             "default_model_slug": init_payload.get("default_model_slug"),
             "restore_at": restore_at,
             "status": status,
             "is_deactivated": is_deactivated,
         }
+        if image_quota_error:
+            result["image_quota_error"] = image_quota_error
+        if account_info_error:
+            result["account_info_error"] = account_info_error
         logger.debug({
             "event": "backend_user_info_result",
             "email": result.get("email"),

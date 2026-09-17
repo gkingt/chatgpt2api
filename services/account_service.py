@@ -9,9 +9,33 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Condition, Lock, Thread
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlencode
 
+from services.account_health import (
+    ERROR_DISABLED,
+    ERROR_INVALID_CREDENTIALS,
+    ERROR_INVALID_TOKEN,
+    ERROR_NEEDS_RELOGIN,
+    ERROR_NEEDS_VERIFICATION,
+    ERROR_TRANSIENT,
+    ERROR_UNKNOWN,
+    ERROR_UPSTREAM_RATE_LIMITED,
+    HEALTH_STATE_DISABLED,
+    HEALTH_STATE_HEALTHY,
+    HEALTH_STATE_IMAGE_QUOTA_UNKNOWN,
+    HEALTH_STATE_INVALID_CONFIRMED,
+    HEALTH_STATE_INVALID_PENDING,
+    HEALTH_STATE_NEEDS_RELOGIN,
+    HEALTH_STATE_NEEDS_VERIFICATION,
+    HEALTH_STATE_RATE_LIMITED,
+    HEALTH_STATE_TRANSIENT_ERROR,
+    HEALTH_STATE_UNKNOWN_ERROR,
+    HEALTH_STATES,
+    TokenRefreshError,
+    classify_account_error,
+)
 from services.config import config
 from services.log_service import (
     LOG_TYPE_ACCOUNT,
@@ -77,6 +101,7 @@ class AccountService:
         self._accounts = self._load_accounts()
         self._image_inflight: dict[str, int] = {}
         self._token_aliases: dict[str, str] = {}
+        self._relogin_inflight: set[str] = set()
         self._cumulative_total = self._load_cumulative_total()
 
     def _get_cumulative_file(self) -> Path:
@@ -151,30 +176,64 @@ class AccountService:
         self.storage.save_accounts(list(self._accounts.values()))
 
     @staticmethod
-    def _is_image_account_available(account: dict) -> bool:
+    def _health_state_for_status(status: object, image_quota_unknown: bool = False) -> str:
+        normalized = str(status or "正常").strip()
+        if normalized == "禁用":
+            return HEALTH_STATE_DISABLED
+        if normalized == "限流":
+            return HEALTH_STATE_RATE_LIMITED
+        if normalized == "异常":
+            return HEALTH_STATE_INVALID_CONFIRMED
+        if image_quota_unknown:
+            return HEALTH_STATE_IMAGE_QUOTA_UNKNOWN
+        return HEALTH_STATE_HEALTHY
+
+    @staticmethod
+    def _health_state_blocks_requests(account: dict) -> bool:
+        if not isinstance(account, dict):
+            return True
+        return str(account.get("health_state") or "").strip() in {
+            HEALTH_STATE_INVALID_PENDING,
+            HEALTH_STATE_INVALID_CONFIRMED,
+            HEALTH_STATE_NEEDS_RELOGIN,
+            HEALTH_STATE_NEEDS_VERIFICATION,
+            HEALTH_STATE_DISABLED,
+        }
+
+    @classmethod
+    def _health_cooldown_active(cls, account: dict, now: datetime | None = None) -> bool:
+        retry_at = cls._parse_time(account.get("health_retry_at"))
+        return retry_at is not None and retry_at > (now or datetime.now(timezone.utc))
+
+    @classmethod
+    def _is_image_account_available(cls, account: dict) -> bool:
         if not isinstance(account, dict):
             return False
         if account.get("status") in {"禁用", "限流", "异常"}:
             return False
+        if cls._health_state_blocks_requests(account) or cls._health_cooldown_active(account):
+            return False
         if int(account.get("invalid_count") or 0) > 0:
+            return False
+        if account.get("image_quota_unknown"):
             return False
         return int(account.get("quota") or 0) > 0
 
     @staticmethod
     def _is_invalid_token_error(error: object) -> bool:
-        text = str(error or "").lower()
-        return any(marker in text for marker in INVALID_TOKEN_ERROR_MARKERS)
+        return classify_account_error(error).kind == ERROR_INVALID_TOKEN
 
     @staticmethod
     def _is_disabled_account_error(error: object) -> bool:
-        text = str(error or "").lower()
-        return any(marker in text for marker in DISABLED_ACCOUNT_ERROR_MARKERS)
+        return classify_account_error(error).kind == ERROR_DISABLED
 
-    @staticmethod
-    def _is_account_eligible_for_text(account: dict) -> bool:
+    @classmethod
+    def _is_account_eligible_for_text(cls, account: dict) -> bool:
         if not isinstance(account, dict):
             return False
         if account.get("status") in {"禁用", "异常"}:
+            return False
+        if cls._health_state_blocks_requests(account) or cls._health_cooldown_active(account):
             return False
         if int(account.get("invalid_count") or 0) > 0:
             return False
@@ -247,6 +306,19 @@ class AccountService:
                     return plan
         return None
 
+    @staticmethod
+    def _coerce_bool(value: object, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off", ""}:
+            return False
+        return default
+
     def _normalize_account(self, item: dict) -> dict | None:
         if not isinstance(item, dict):
             return None
@@ -268,8 +340,11 @@ class AccountService:
             "绂佺敤": "禁用",
         }
         normalized["status"] = status_aliases.get(status, status if status in {"正常", "禁用", "限流", "异常"} else "正常")
-        normalized["quota"] = max(0, int(normalized.get("quota") if normalized.get("quota") is not None else 0))
-        normalized["image_quota_unknown"] = bool(normalized.get("image_quota_unknown"))
+        try:
+            normalized["quota"] = max(0, int(normalized.get("quota") if normalized.get("quota") is not None else 0))
+        except (TypeError, ValueError, OverflowError):
+            normalized["quota"] = 0
+        normalized["image_quota_unknown"] = self._coerce_bool(normalized.get("image_quota_unknown"), False)
         normalized["email"] = normalized.get("email") or None
         normalized["user_id"] = normalized.get("user_id") or None
         normalized["proxy"] = str(normalized.get("proxy") or "").strip()
@@ -281,9 +356,18 @@ class AccountService:
         normalized["limits_progress"] = limits_progress if isinstance(limits_progress, list) else []
         normalized["default_model_slug"] = normalized.get("default_model_slug") or None
         normalized["restore_at"] = normalized.get("restore_at") or None
-        normalized["success"] = int(normalized.get("success") or 0)
-        normalized["fail"] = int(normalized.get("fail") or 0)
-        normalized["invalid_count"] = int(normalized.get("invalid_count") or 0)
+        try:
+            normalized["success"] = int(normalized.get("success") or 0)
+        except (TypeError, ValueError, OverflowError):
+            normalized["success"] = 0
+        try:
+            normalized["fail"] = int(normalized.get("fail") or 0)
+        except (TypeError, ValueError, OverflowError):
+            normalized["fail"] = 0
+        try:
+            normalized["invalid_count"] = max(0, int(normalized.get("invalid_count") or 0))
+        except (TypeError, ValueError, OverflowError):
+            normalized["invalid_count"] = 0
         normalized["last_used_at"] = normalized.get("last_used_at")
         normalized["last_invalid_at"] = normalized.get("last_invalid_at") or None
         normalized["last_refresh_error"] = normalized.get("last_refresh_error") or None
@@ -291,6 +375,26 @@ class AccountService:
         normalized["last_token_refresh_at"] = normalized.get("last_token_refresh_at") or None
         normalized["last_token_refresh_error"] = normalized.get("last_token_refresh_error") or None
         normalized["last_token_refresh_error_at"] = normalized.get("last_token_refresh_error_at") or None
+        normalized["last_check_at"] = normalized.get("last_check_at") or None
+        normalized["last_successful_check_at"] = normalized.get("last_successful_check_at") or None
+        normalized["image_quota_error"] = self._short_error(normalized.get("image_quota_error"), 500) or None
+        normalized["health_reason"] = str(normalized.get("health_reason") or "").strip() or None
+        normalized["health_source"] = str(normalized.get("health_source") or "").strip() or None
+        normalized["health_error_kind"] = str(normalized.get("health_error_kind") or "").strip() or None
+        normalized["health_error_code"] = str(normalized.get("health_error_code") or "").strip() or None
+        normalized["health_updated_at"] = normalized.get("health_updated_at") or None
+        normalized["health_retry_at"] = normalized.get("health_retry_at") or None
+        try:
+            normalized["health_failure_count"] = max(0, int(normalized.get("health_failure_count") or 0))
+        except (TypeError, ValueError, OverflowError):
+            normalized["health_failure_count"] = 0
+        health_state = str(normalized.get("health_state") or "").strip()
+        if health_state not in HEALTH_STATES:
+            if normalized["invalid_count"] > 0 and normalized["status"] == "正常":
+                health_state = HEALTH_STATE_INVALID_PENDING
+            else:
+                health_state = self._health_state_for_status(normalized["status"], normalized["image_quota_unknown"])
+        normalized["health_state"] = health_state
         normalized["created_at"] = normalized.get("created_at") or AccountService._now()
         return normalized
 
@@ -384,6 +488,197 @@ class AccountService:
             return False
         return (now - last_error_at).total_seconds() < self._REFRESH_TOKEN_KEEPALIVE_ERROR_BACKOFF_SECONDS
 
+    @staticmethod
+    def _short_error(error: object, limit: int = 500) -> str:
+        return str(error or "").strip()[:limit]
+
+    def _record_account_health_failure(
+        self,
+        access_token: str,
+        event: str,
+        error: object,
+        classification=None,
+    ) -> dict | None:
+        classification = classification or classify_account_error(error)
+        now = datetime.now(timezone.utc)
+        reason = self._short_error(classification.message or error)
+        retry_at = None
+        if classification.retry_after_seconds:
+            retry_at = (now + timedelta(seconds=classification.retry_after_seconds)).isoformat()
+
+        with self._lock:
+            resolved = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(resolved)
+            if current is None:
+                return None
+            next_item = dict(current)
+            next_item["last_check_at"] = now.isoformat()
+            next_item["last_refresh_error"] = reason or "account check failed"
+            next_item["last_refresh_error_at"] = now.isoformat()
+            next_item["health_error_kind"] = classification.kind
+            next_item["health_error_code"] = classification.code
+            next_item["health_reason"] = reason or classification.code
+            next_item["health_source"] = event
+            next_item["health_updated_at"] = now.isoformat()
+            next_item["health_retry_at"] = retry_at
+            next_item["health_failure_count"] = int(next_item.get("health_failure_count") or 0) + 1
+            if classification.kind == ERROR_DISABLED:
+                next_item["status"] = "禁用"
+                next_item["health_state"] = HEALTH_STATE_DISABLED
+                next_item["quota"] = 0
+                next_item["image_quota_unknown"] = False
+                next_item["health_retry_at"] = None
+            elif classification.kind == ERROR_NEEDS_RELOGIN:
+                next_item["status"] = "异常"
+                next_item["health_state"] = HEALTH_STATE_NEEDS_RELOGIN
+            elif classification.kind == ERROR_NEEDS_VERIFICATION:
+                next_item["status"] = "异常"
+                next_item["health_state"] = HEALTH_STATE_NEEDS_VERIFICATION
+            elif classification.kind == ERROR_UPSTREAM_RATE_LIMITED:
+                next_item["health_state"] = HEALTH_STATE_RATE_LIMITED
+            elif classification.kind == ERROR_TRANSIENT:
+                next_item["health_state"] = HEALTH_STATE_TRANSIENT_ERROR
+            elif classification.kind == ERROR_INVALID_CREDENTIALS:
+                next_item["status"] = "异常"
+                next_item["health_state"] = HEALTH_STATE_NEEDS_RELOGIN
+            else:
+                next_item["health_state"] = HEALTH_STATE_UNKNOWN_ERROR
+            account = self._normalize_account(next_item)
+            if account is not None:
+                self._accounts[resolved] = account
+                self._save_accounts()
+
+        log_service.add(
+            LOG_TYPE_ACCOUNT,
+            "账号健康检查失败",
+            {
+                "source": event,
+                "token": anonymize_token(access_token),
+                "kind": classification.kind,
+                "code": classification.code,
+                "status_code": classification.status_code,
+                "retry_after_seconds": classification.retry_after_seconds,
+                "error": reason,
+            },
+        )
+        return dict(account) if account is not None else None
+
+    def _record_account_health_success(
+        self,
+        access_token: str,
+        event: str,
+        result: dict[str, Any] | None,
+    ) -> dict | None:
+        """记录一次成功的远程检查，并把图片额度未知与认证成功分开保存。
+
+        远程检查成功只代表 token/账号接口可用；如果图片额度接口没有返回
+        ``image_gen``，不能把旧额度覆盖成 0，也不能把账号误判为限流。
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        payload = dict(result) if isinstance(result, dict) else {}
+
+        remove_limited = False
+        with self._lock:
+            resolved = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(resolved)
+            if current is None:
+                return None
+
+            next_item = {**current, **payload}
+            next_item["health_source"] = event
+            image_quota_unknown = self._coerce_bool(payload.get("image_quota_unknown"), False)
+            incoming_status = str(payload.get("status") or "").strip()
+            is_deactivated = self._coerce_bool(payload.get("is_deactivated"), False)
+
+            if is_deactivated or incoming_status == "禁用":
+                next_item["status"] = "禁用"
+                next_item["quota"] = 0
+                next_item["image_quota_unknown"] = False
+                next_item["health_state"] = HEALTH_STATE_DISABLED
+                next_item["health_error_kind"] = ERROR_DISABLED
+                next_item["health_error_code"] = "account_deactivated"
+                next_item["health_reason"] = "account is disabled"
+                next_item["health_retry_at"] = None
+            elif image_quota_unknown:
+                # 认证已成功，但图片额度当前不可确认。保留上一次已知额度，
+                # 并将主状态恢复为正常，避免把未知当成“额度为 0”。
+                next_item["status"] = "正常"
+                next_item["quota"] = current.get("quota", 0)
+                next_item["image_quota_unknown"] = True
+                next_item["health_state"] = HEALTH_STATE_IMAGE_QUOTA_UNKNOWN
+                next_item["health_error_kind"] = ERROR_TRANSIENT if payload.get("image_quota_error") else None
+                next_item["health_error_code"] = "image_quota_unknown" if payload.get("image_quota_error") else None
+                next_item["health_reason"] = self._short_error(payload.get("image_quota_error"), 500) or "image quota is unavailable"
+                next_item["health_source"] = f"{event}:image_quota"
+                next_item["health_retry_at"] = None
+                next_item["image_quota_error"] = self._short_error(payload.get("image_quota_error"), 500) or None
+            else:
+                if incoming_status not in {"正常", "限流", "异常", "禁用"}:
+                    if "quota" in payload:
+                        incoming_status = "限流" if int(payload.get("quota") or 0) == 0 else "正常"
+                    else:
+                        incoming_status = str(current.get("status") or "正常")
+                next_item["status"] = incoming_status
+                if "quota" in payload:
+                    next_item["quota"] = payload.get("quota")
+                next_item["image_quota_unknown"] = False
+                next_item["image_quota_error"] = None
+                next_item["health_state"] = (
+                    HEALTH_STATE_RATE_LIMITED if incoming_status == "限流" else HEALTH_STATE_HEALTHY
+                )
+                next_item["health_error_kind"] = None
+                next_item["health_error_code"] = None
+                next_item["health_reason"] = None
+                next_item["health_retry_at"] = None
+
+            next_item["last_check_at"] = now
+            next_item["last_successful_check_at"] = now
+            next_item["health_updated_at"] = now
+            next_item["health_failure_count"] = 0
+            next_item["invalid_count"] = 0
+            next_item["last_invalid_at"] = None
+            next_item["last_refresh_error"] = (
+                next_item.get("image_quota_error") if image_quota_unknown else None
+            )
+            next_item["last_refresh_error_at"] = now if image_quota_unknown and next_item.get("image_quota_error") else None
+
+            account = self._normalize_account(next_item)
+            if account is None:
+                return None
+            self._accounts[resolved] = account
+            self._save_accounts()
+            remove_limited = account.get("status") == "限流" and config.auto_remove_rate_limited_accounts
+
+        if remove_limited:
+            self.delete_accounts([access_token])
+            return None
+
+        return dict(account)
+
+    @staticmethod
+    def _classify_password_login_result(result: dict[str, Any]) -> tuple[Any, str]:
+        """把密码登录返回的错误码/响应体转换为统一异常分类。"""
+        detail = result.get("detail")
+        error_code = str(result.get("error") or "").strip()
+        status_code = None
+        message = error_code
+        if isinstance(detail, dict):
+            raw_error = detail.get("error")
+            if isinstance(raw_error, dict):
+                error_code = str(raw_error.get("code") or error_code).strip()
+                message = str(raw_error.get("message") or message).strip()
+            status_value = detail.get("status_code") or detail.get("status")
+            try:
+                status_code = int(status_value) if status_value is not None else None
+            except (TypeError, ValueError):
+                status_code = None
+        error = SimpleNamespace(
+            error_code=error_code,
+            status_code=status_code,
+            detail=message or str(detail or ""),
+        )
+        return classify_account_error(error), message or error_code
+
     def _refresh_token_keepalive_anchor(self, account: dict) -> datetime | None:
         return (
             self._parse_time(account.get("last_token_refresh_at"))
@@ -431,7 +726,12 @@ class AccountService:
                 if isinstance(data, dict):
                     detail = str(data.get("error_description") or data.get("error") or data.get("message") or "")
                 detail = detail or self._safe_response_text(response)
-                raise RuntimeError(f"oauth_refresh_http_{response.status_code}{': ' + detail if detail else ''}")
+                raise TokenRefreshError(
+                    response.status_code,
+                    str(data.get("error") or data.get("code") or "") if isinstance(data, dict) else "",
+                    detail,
+                    getattr(response, "retry_after", None),
+                )
             return {
                 "access_token": str(data.get("access_token") or "").strip(),
                 "refresh_token": str(data.get("refresh_token") or refresh_token).strip(),
@@ -464,6 +764,20 @@ class AccountService:
             next_item["last_invalid_at"] = None
             next_item["last_refresh_error"] = None
             next_item["last_refresh_error_at"] = None
+            next_item["health_failure_count"] = 0
+            next_item["health_error_kind"] = None
+            next_item["health_error_code"] = None
+            next_item["health_reason"] = None
+            next_item["health_source"] = event
+            next_item["health_updated_at"] = now
+            next_item["health_retry_at"] = None
+            if next_item.get("status") in {"异常", "禁用"}:
+                next_item["status"] = "正常"
+            next_item["health_state"] = (
+                HEALTH_STATE_IMAGE_QUOTA_UNKNOWN
+                if next_item.get("image_quota_unknown")
+                else (HEALTH_STATE_RATE_LIMITED if next_item.get("status") == "限流" else HEALTH_STATE_HEALTHY)
+            )
 
             account = self._normalize_account(next_item)
             if account is None:
@@ -506,28 +820,57 @@ class AccountService:
                 token_data = self._request_access_token_refresh(refresh_token, account)
             except Exception as exc:
                 error_str = str(exc or "")
+                classification = classify_account_error(exc)
                 self._record_token_refresh_error(active_token, event, error_str)
-                if self._is_disabled_account_error(error_str):
-                    self.update_account(active_token, {"status": "禁用", "quota": 0, "last_refresh_error": error_str}, quiet=True)
+                if classification.kind == ERROR_DISABLED:
+                    self._record_account_health_failure(active_token, event, exc, classification)
                     return ""
-                if self._is_invalid_token_error(error_str):
-                    self.remove_invalid_token(active_token, event, quiet=True)
+                if classification.kind == ERROR_NEEDS_RELOGIN or classification.kind == ERROR_INVALID_CREDENTIALS:
+                    self._record_account_health_failure(active_token, event, exc, classification)
+                    if config.auto_relogin_after_refresh:
+                        self._start_password_relogin_if_possible(active_token, account, event)
                     return ""
-                # 如果是 app_session_terminated 错误，尝试密码重新登录
-                if "app_session_terminated" in error_str.lower():
-                    # 获取账号信息（email, password）
-                    email = str(account.get("email") or "").strip()
-                    password = str(account.get("password") or "").strip()
-                    if email and password:
-                        # 创建新线程执行密码重新登录
-                        t = Thread(
-                            target=self._password_re_login_thread,
-                            args=(active_token, email, password, event),
-                            daemon=True,
-                        )
-                        t.start()
+                if classification.kind == ERROR_INVALID_TOKEN:
+                    should_remove = self._record_invalid_token_seen(
+                        active_token,
+                        event,
+                        error_str,
+                        defer_invalid_removal=True,
+                    )
+                    if should_remove:
+                        self._remove_confirmed_invalid_token(active_token, event, quiet=True)
+                    return ""
+                self._record_account_health_failure(active_token, event, exc, classification)
                 return active_token
             return self._apply_refreshed_tokens(active_token, token_data, event)
+
+    def _start_password_relogin_if_possible(self, access_token: str, account: dict | None, event: str, progress_id: str | None = None) -> bool:
+        if not isinstance(account, dict):
+            return False
+        email = str(account.get("email") or "").strip()
+        password = str(account.get("password") or "").strip()
+        if not email or not password:
+            return False
+        resolved = self.resolve_access_token(access_token)
+        with self._lock:
+            if resolved in self._relogin_inflight:
+                return False
+            self._relogin_inflight.add(resolved)
+        Thread(
+            target=self._password_re_login_worker,
+            args=(resolved, email, password, event, progress_id),
+            daemon=True,
+            name="account-password-relogin",
+        ).start()
+        return True
+
+    def _password_re_login_worker(self, access_token: str, email: str, password: str, event: str, progress_id: str | None = None) -> None:
+        try:
+            self._password_re_login_thread(access_token, email, password, event, progress_id)
+        finally:
+            with self._lock:
+                self._relogin_inflight.discard(self._resolve_access_token_locked(access_token))
+                self._relogin_inflight.discard(access_token)
 
     def _password_re_login_thread(self, access_token: str, email: str, password: str, event: str, progress_id: str | None = None) -> None:
         """密码重新登录线程入口"""
@@ -554,6 +897,14 @@ class AccountService:
                 self.update_account(new_token, {
                     "source_type": result.get("source_type", "password"),
                     "status": "正常",
+                    "health_state": HEALTH_STATE_HEALTHY,
+                    "health_reason": None,
+                    "health_source": f"{event}:password_relogin",
+                    "health_error_kind": None,
+                    "health_error_code": None,
+                    "health_retry_at": None,
+                    "health_failure_count": 0,
+                    "last_successful_check_at": datetime.now(timezone.utc).isoformat(),
                 }, quiet=True)
 
                 log_service.add(
@@ -572,59 +923,41 @@ class AccountService:
             else:
                 # 登录失败
                 error_type = result.get("error", "")
-                if error_type == "password_verify_failed_403" and isinstance(result.get("detail"), dict):
-                    log_service.add(
-                        LOG_TYPE_ACCOUNT,
-                        "更新账号",
-                        {
-                            "source": event,
-                            "token": anonymize_token(access_token),
-                            "email": email,
-                            "status": "失败",
-                            "error": error_type,
-                            "detail": result.get("detail", {}),
-                        },
-                    )
-                    detail_error = result["detail"].get("error", {})
-                    if isinstance(detail_error, dict) and detail_error.get("code") == "account_deactivated":
-                        # 账号已删除/停用 → 标记为禁用
-                        self.update_account(access_token, {"status": "禁用", "quota": 0}, quiet=True)
-                        account = self.get_account(access_token) or {}
-                        log_service.add(
-                            LOG_TYPE_ACCOUNT,
-                            "账号已停用-标记禁用",
-                            {
-                                "source": event,
-                                "token": anonymize_token(access_token),
-                                "email": email,
-                                "detail": result.get("detail", {}),
-                            },
-                        )
-                        if progress_id:
-                            self.update_relogin_progress(progress_id, access_token, "禁用")
-                    else:
-                        # 永久故障：将账号标记为异常（或自动移除）
-                        self.remove_invalid_token(access_token, f"{event}:password_relogin_failed", quiet=True)
-                        if progress_id:
-                            self.update_relogin_progress(progress_id, access_token, "异常", error_type)
-                else:
-                    log_service.add(
-                        LOG_TYPE_ACCOUNT,
-                        "更新账号",
-                        {
-                            "source": event,
-                            "token": anonymize_token(access_token),
-                            "email": email,
-                            "status": "失败",
-                            "error": error_type,
-                            "detail": result.get("detail", {}),
-                        },
-                    )
-                    # 永久故障：将账号标记为异常（或自动移除）
-                    self.remove_invalid_token(access_token, f"{event}:password_relogin_failed", quiet=True)
-                    if progress_id:
-                        self.update_relogin_progress(progress_id, access_token, "异常", error_type)
+                classification, message = self._classify_password_login_result(result)
+                login_error = SimpleNamespace(
+                    error_code=classification.code,
+                    status_code=classification.status_code,
+                    detail=message or error_type,
+                )
+                self._record_account_health_failure(
+                    access_token,
+                    f"{event}:password_relogin_failed",
+                    login_error,
+                    classification,
+                )
+                log_service.add(
+                    LOG_TYPE_ACCOUNT,
+                    "密码重新登录失败",
+                    {
+                        "source": event,
+                        "token": anonymize_token(access_token),
+                        "email": email,
+                        "error": error_type,
+                        "kind": classification.kind,
+                        "code": classification.code,
+                    },
+                )
+                if progress_id:
+                    progress_status = {
+                        ERROR_DISABLED: "禁用",
+                        ERROR_NEEDS_VERIFICATION: "需验证码",
+                        ERROR_NEEDS_RELOGIN: "需重新登录",
+                        ERROR_INVALID_CREDENTIALS: "凭据错误",
+                        ERROR_TRANSIENT: "临时错误",
+                    }.get(classification.kind, "异常")
+                    self.update_relogin_progress(progress_id, access_token, progress_status, message or error_type)
         except Exception as exc:
+            classification = classify_account_error(exc)
             log_service.add(
                 LOG_TYPE_ACCOUNT,
                 "更新账号",
@@ -632,14 +965,21 @@ class AccountService:
                     "source": event,
                     "token": anonymize_token(access_token),
                     "email": email,
-                    "status": "异常",
-                    "error": str(exc),
+                    "status": "失败",
+                    "kind": classification.kind,
+                    "code": classification.code,
+                    "error": self._short_error(exc),
                 },
             )
-            # 将账号标记为异常（或自动移除）
-            self.remove_invalid_token(access_token, f"{event}:password_relogin_exception", quiet=True)
+            self._record_account_health_failure(
+                access_token,
+                f"{event}:password_relogin_exception",
+                exc,
+                classification,
+            )
             if progress_id:
-                self.update_relogin_progress(progress_id, access_token, "异常", str(exc))
+                progress_status = "临时错误" if classification.kind == ERROR_TRANSIENT else "异常"
+                self.update_relogin_progress(progress_id, access_token, progress_status, self._short_error(exc))
 
     def _login_with_password(self, email: str, password: str) -> dict:
         """通过邮箱+密码登录，返回 {access_token, refresh_token, id_token, ...}"""
@@ -1126,7 +1466,13 @@ class AccountService:
                 return ""
             access_token = candidates[self._index % len(candidates)]
             self._index += 1
-        return self.refresh_access_token(access_token, event="get_text_access_token") or access_token
+        refreshed_token = self.refresh_access_token(access_token, event="get_text_access_token")
+        if refreshed_token:
+            return refreshed_token
+        account = self.get_account(access_token)
+        if account and self._health_state_blocks_requests(account):
+            return ""
+        return access_token
 
     def mark_text_used(self, access_token: str) -> None:
         if not access_token:
@@ -1144,17 +1490,49 @@ class AccountService:
             self._accounts[access_token] = account
             self._save_accounts()
 
-    def remove_invalid_token(self, access_token: str, event: str, quiet: bool = False) -> bool:
+    def _remove_confirmed_invalid_token(self, access_token: str, event: str, quiet: bool = False) -> bool:
+        """仅移除已经经过复核确认的失效 token。"""
+        account = self.get_account(access_token)
+        if not account or account.get("health_state") != HEALTH_STATE_INVALID_CONFIRMED:
+            return False
         if not config.auto_remove_invalid_accounts:
-            self.update_account(access_token, {"status": "异常", "quota": 0}, quiet=quiet)
             return False
         removed = bool(self.delete_accounts([access_token])["removed"])
         if removed:
-            log_service.add(LOG_TYPE_ACCOUNT, "自动移除异常账号",
-                            {"source": event, "token": anonymize_token(access_token)})
-        elif access_token:
-            self.update_account(access_token, {"status": "异常", "quota": 0}, quiet=quiet)
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "自动移除已确认失效账号",
+                {"source": event, "token": anonymize_token(access_token)},
+            )
         return removed
+
+    def remove_invalid_token(
+        self,
+        access_token: str,
+        event: str,
+        quiet: bool = False,
+        defer_confirmation: bool = True,
+        error: str = "invalid access token",
+    ) -> bool:
+        """记录 token 失效并按统一复核策略决定是否移除。
+
+        文字请求、图片请求、刷新任务和手动检查都走同一条路径；首次 401
+        只会进入 ``invalid_pending``，不会因为一次网络抖动或上游误报直接删号。
+        """
+        current = self.get_account(access_token)
+        if current and current.get("health_state") in {
+            HEALTH_STATE_NEEDS_RELOGIN,
+            HEALTH_STATE_NEEDS_VERIFICATION,
+            HEALTH_STATE_DISABLED,
+        }:
+            return False
+        should_remove = self._record_invalid_token_seen(
+            access_token,
+            event,
+            error,
+            defer_invalid_removal=defer_confirmation,
+        )
+        return self._remove_confirmed_invalid_token(access_token, event, quiet=quiet) if should_remove else False
 
     def mark_image_quota_exhausted_token(self, access_token: str, event: str, error: str = "") -> dict | None:
         if not access_token:
@@ -1211,12 +1589,15 @@ class AccountService:
             ]
 
     def list_normal_tokens(self) -> list[str]:
+        now = datetime.now(timezone.utc)
         with self._lock:
             return [
                 token
                 for item in self._accounts.values()
                 if item.get("status") == "正常"
                    and int(item.get("invalid_count") or 0) == 0
+                   and not self._health_state_blocks_requests(item)
+                   and not self._health_cooldown_active(item, now)
                    and (token := item.get("access_token") or "")
             ]
 
@@ -1373,15 +1754,17 @@ class AccountService:
     def _should_defer_invalid_token(self, account: dict | None, now: datetime) -> bool:
         if not isinstance(account, dict):
             return False
-        created_at = self._parse_time(account.get("created_at"))
-        if created_at is not None and (now - created_at).total_seconds() < self._NEW_ACCOUNT_INVALID_GRACE_SECONDS:
+        invalid_count = int(account.get("invalid_count") or 0)
+        if invalid_count <= 0:
             return True
         last_invalid_at = self._parse_time(account.get("last_invalid_at"))
-        invalid_count = int(account.get("invalid_count") or 0)
-        if invalid_count <= 1:
-            return True
         if last_invalid_at is not None and (now - last_invalid_at).total_seconds() < self._INVALID_CONFIRM_SECONDS:
             return True
+        # 新导入账号的首次失效信号给出更长的观察窗口；第二次、间隔足够的
+        # 失效信号仍然可以在窗口内完成确认，避免新账号永远无法被清理。
+        created_at = self._parse_time(account.get("created_at"))
+        if invalid_count == 1 and created_at is not None:
+            return (now - created_at).total_seconds() < self._NEW_ACCOUNT_INVALID_GRACE_SECONDS
         return False
 
     def _record_invalid_token_seen(
@@ -1403,9 +1786,22 @@ class AccountService:
             next_item["last_invalid_at"] = now.isoformat()
             next_item["last_refresh_error"] = str(error or "invalid access token")
             next_item["last_refresh_error_at"] = now.isoformat()
-            next_item["status"] = "异常"
-            next_item["quota"] = 0
-            next_item["image_quota_unknown"] = False
+            next_item["last_check_at"] = now.isoformat()
+            next_item["health_failure_count"] = int(next_item.get("health_failure_count") or 0) + 1
+            next_item["health_error_kind"] = ERROR_INVALID_TOKEN
+            next_item["health_error_code"] = "invalid_token"
+            next_item["health_reason"] = str(error or "invalid access token")[:500]
+            next_item["health_source"] = event
+            next_item["health_updated_at"] = now.isoformat()
+            if should_defer:
+                next_item["health_state"] = HEALTH_STATE_INVALID_PENDING
+                next_item["health_retry_at"] = (now + timedelta(seconds=self._INVALID_CONFIRM_SECONDS)).isoformat()
+            else:
+                next_item["status"] = "异常"
+                next_item["quota"] = 0
+                next_item["image_quota_unknown"] = False
+                next_item["health_state"] = HEALTH_STATE_INVALID_CONFIRMED
+                next_item["health_retry_at"] = None
             account = self._normalize_account(next_item)
             if account is not None:
                 self._accounts[access_token] = account
@@ -1417,31 +1813,39 @@ class AccountService:
                     {"source": event, "token": anonymize_token(access_token), "error": str(error or "")},
                 )
                 return False
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "确认账号 token 已失效",
+                {"source": event, "token": anonymize_token(access_token), "error": str(error or "")},
+            )
         return True
 
     def _record_image_preflight_error(self, access_token: str, event: str, error: str) -> dict | None:
         if not access_token:
             return None
-        now = datetime.now(timezone.utc).isoformat()
-        with self._lock:
-            access_token = self._resolve_access_token_locked(access_token)
-            current = self._accounts.get(access_token)
-            if current is None:
-                return None
-            next_item = dict(current)
-            next_item["last_refresh_error"] = str(error or "image preflight failed")[:500]
-            next_item["last_refresh_error_at"] = now
-            account = self._normalize_account(next_item)
-            if account is None:
-                return None
-            self._accounts[access_token] = account
-            self._save_accounts()
+        classification = classify_account_error(error)
+        if classification.kind == ERROR_INVALID_TOKEN:
+            should_remove = self._record_invalid_token_seen(
+                access_token,
+                event,
+                str(error or "invalid access token"),
+                defer_invalid_removal=True,
+            )
+            if should_remove:
+                self._remove_confirmed_invalid_token(access_token, event, quiet=True)
+            return self.get_account(access_token)
+        account = self._record_account_health_failure(
+            access_token,
+            event,
+            error,
+            classification,
+        )
         log_service.add(
             LOG_TYPE_ACCOUNT,
             "图片账号预检失败",
             {"source": event, "token": anonymize_token(access_token), "error": str(error or "")[:500]},
         )
-        return dict(account)
+        return account
 
     def mark_image_result(self, access_token: str, success: bool) -> dict | None:
         if not access_token:
@@ -1490,7 +1894,20 @@ class AccountService:
         if not access_token:
             raise ValueError("access_token is required")
 
-        active_token = access_token if skip_token_refresh else self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
+        active_token = access_token
+        if not skip_token_refresh:
+            refreshed_token = self.refresh_access_token(access_token, event=f"{event}:preflight")
+            if refreshed_token:
+                active_token = refreshed_token
+            else:
+                account_after_refresh = self.get_account(access_token)
+                if account_after_refresh and account_after_refresh.get("health_state") in {
+                    HEALTH_STATE_NEEDS_RELOGIN,
+                    HEALTH_STATE_NEEDS_VERIFICATION,
+                    HEALTH_STATE_DISABLED,
+                }:
+                    reason = str(account_after_refresh.get("health_reason") or "account health check requires attention")
+                    raise RuntimeError(reason)
         from services import openai_backend_api
 
         try:
@@ -1499,9 +1916,6 @@ class AccountService:
                 result = backend.get_user_info()
             finally:
                 backend.close()
-        except openai_backend_api.DisabledAccountError as exc:
-            self.update_account(active_token, {"status": "禁用", "quota": 0, "last_refresh_error": str(exc)}, quiet=True)
-            raise
         except openai_backend_api.InvalidAccessTokenError as exc:
             refreshed_token = self.refresh_access_token(active_token, force=True, event=f"{event}:invalid_access_token")
             if refreshed_token and refreshed_token != active_token:
@@ -1518,20 +1932,61 @@ class AccountService:
                         str(retry_exc),
                         defer_invalid_removal=defer_invalid_removal,
                     ):
-                        self.remove_invalid_token(refreshed_token, event)
+                        self._remove_confirmed_invalid_token(refreshed_token, event)
+                    raise
+                except Exception as retry_exc:
+                    classification = classify_account_error(retry_exc)
+                    if classification.kind == ERROR_INVALID_TOKEN:
+                        should_remove = self._record_invalid_token_seen(
+                            refreshed_token,
+                            event,
+                            str(retry_exc),
+                            defer_invalid_removal=defer_invalid_removal,
+                        )
+                        if should_remove:
+                            self._remove_confirmed_invalid_token(refreshed_token, event)
+                    else:
+                        self._record_account_health_failure(
+                            refreshed_token,
+                            event,
+                            retry_exc,
+                            classification,
+                        )
                     raise
                 active_token = refreshed_token
             else:
+                current = self.get_account(active_token)
+                if current and current.get("health_state") in {
+                    HEALTH_STATE_NEEDS_RELOGIN,
+                    HEALTH_STATE_NEEDS_VERIFICATION,
+                    HEALTH_STATE_DISABLED,
+                }:
+                    raise
                 if self._record_invalid_token_seen(
                     active_token,
                     event,
                     str(exc),
                     defer_invalid_removal=defer_invalid_removal,
                 ):
-                    self.remove_invalid_token(active_token, event)
+                    self._remove_confirmed_invalid_token(active_token, event)
                 raise
+        except Exception as exc:
+            classification = classify_account_error(exc)
+            if classification.kind == ERROR_INVALID_TOKEN:
+                should_remove = self._record_invalid_token_seen(
+                    active_token,
+                    event,
+                    str(exc),
+                    defer_invalid_removal=defer_invalid_removal,
+                )
+                if should_remove:
+                    self._remove_confirmed_invalid_token(active_token, event)
+            else:
+                self._record_account_health_failure(active_token, event, exc, classification)
+            raise
+
         self._record_refresh_success(active_token)
-        return self.update_account(active_token, result)
+        return self._record_account_health_success(active_token, event, result)
 
     # ---- 刷新进度追踪 ----
 
@@ -1551,7 +2006,11 @@ class AccountService:
         """刷新单个账号后，更新进度计数。"""
         account = self.get_account(token)
         status = str(account.get("status") or "正常").strip() if account else "正常"
-        quota = max(0, int(account.get("quota") or 0)) if account else 0
+        quota = (
+            max(0, int(account.get("quota") or 0))
+            if account and not account.get("image_quota_unknown")
+            else 0
+        )
 
         with self._refresh_progress_lock:
             progress = self._refresh_progress.get(progress_id)
@@ -1637,7 +2096,7 @@ class AccountService:
         self,
         access_tokens: list[str],
         progress_id: str | None = None,
-        defer_invalid_removal: bool = False,
+        defer_invalid_removal: bool = True,
     ) -> dict[str, Any]:
         access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
         if not access_tokens:
@@ -1669,10 +2128,16 @@ class AccountService:
                     raise
                 except Exception as exc:
                     error_str = str(exc)
-                    # TLS/代理连接错误是网络问题，不计入账号失败
-                    from services.protocol.conversation import is_tls_connection_error
-                    if not is_tls_connection_error(error_str):
-                        errors.append({"token": anonymize_token(token), "error": error_str})
+                    classification = classify_account_error(exc)
+                    errors.append(
+                        {
+                            "token": anonymize_token(token),
+                            "error": error_str,
+                            "kind": classification.kind,
+                            "code": classification.code,
+                            "retry_after_seconds": classification.retry_after_seconds,
+                        }
+                    )
                 else:
                     if account is not None:
                         refreshed += 1
@@ -1694,20 +2159,18 @@ class AccountService:
                 account = self.get_account(token)
                 if not account:
                     continue
-                status = str(account.get("status") or "").strip()
-                if status != "异常":
+                if account.get("health_state") != HEALTH_STATE_NEEDS_RELOGIN:
                     continue
                 email = str(account.get("email") or "").strip()
                 password = str(account.get("password") or "").strip()
                 if not email or not password:
                     continue
-                t = Thread(
-                    target=self._password_re_login_thread,
-                    args=(token, email, password, "auto_relogin_after_refresh"),
-                    daemon=True,
-                )
-                t.start()
-                relogined += 1
+                if self._start_password_relogin_if_possible(
+                    token,
+                    account,
+                    "auto_relogin_after_refresh",
+                ):
+                    relogined += 1
         result = {
             "refreshed": refreshed,
             "errors": errors,
@@ -1847,10 +2310,22 @@ class AccountService:
         limited = sum(1 for a in items if a.get("status") == "限流")
         abnormal = sum(1 for a in items if a.get("status") == "异常")
         disabled = sum(1 for a in items if a.get("status") == "禁用")
-        total_quota = sum(max(0, int(a.get("quota") or 0)) for a in items if a.get("status") == "正常")
-        unlimited = 0
+        total_quota = sum(
+            max(0, int(a.get("quota") or 0))
+            for a in items
+            if a.get("status") == "正常" and not a.get("image_quota_unknown")
+        )
+        unlimited = sum(1 for a in items if self._coerce_bool(a.get("unlimited_quota"), False))
         total_success = sum(int(a.get("success") or 0) for a in items)
         total_fail = sum(int(a.get("fail") or 0) for a in items)
+        image_quota_unknown_count = sum(1 for a in items if a.get("image_quota_unknown"))
+        pending_invalid_count = sum(1 for a in items if a.get("health_state") == HEALTH_STATE_INVALID_PENDING)
+        needs_relogin_count = sum(1 for a in items if a.get("health_state") == HEALTH_STATE_NEEDS_RELOGIN)
+        needs_verification_count = sum(1 for a in items if a.get("health_state") == HEALTH_STATE_NEEDS_VERIFICATION)
+        transient_error_count = sum(1 for a in items if a.get("health_state") == HEALTH_STATE_TRANSIENT_ERROR)
+        unknown_error_count = sum(1 for a in items if a.get("health_state") == HEALTH_STATE_UNKNOWN_ERROR)
+        rate_limited_health_count = sum(1 for a in items if a.get("health_state") == HEALTH_STATE_RATE_LIMITED)
+        available_text_count = sum(1 for a in items if self._is_account_eligible_for_text(a))
         by_type = {}
         for a in items:
             t = a.get("type", "unknown")
@@ -1867,13 +2342,21 @@ class AccountService:
             "total_success": total_success,
             "total_fail": total_fail,
             "by_type": by_type,
+            "available_text_count": available_text_count,
+            "image_quota_unknown_count": image_quota_unknown_count,
+            "pending_invalid_count": pending_invalid_count,
+            "needs_relogin_count": needs_relogin_count,
+            "needs_verification_count": needs_verification_count,
+            "transient_error_count": transient_error_count,
+            "unknown_error_count": unknown_error_count,
+            "rate_limited_health_count": rate_limited_health_count,
         }
 
     def account_health(self) -> dict:
         stats = self.get_stats()
-        return {
-            "healthy": stats["active"] > 0 or stats["unlimited_quota_count"] > 0,
-            "status": "ok" if stats["active"] > 0 else "degraded",
+        result = {
+            "healthy": stats["available_text_count"] > 0 or stats["unlimited_quota_count"] > 0,
+            "status": "ok" if stats["available_text_count"] > 0 else "degraded",
             **stats,
         }
         if config.auto_start_register_enabled:

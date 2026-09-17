@@ -2,6 +2,18 @@ import { httpRequest, request } from "@/lib/request";
 
 export type AccountType = string;
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
+export type AccountHealthState =
+  | "healthy"
+  | "rate_limited"
+  | "image_quota_unknown"
+  | "invalid_pending"
+  | "invalid_confirmed"
+  | "needs_relogin"
+  | "needs_verification"
+  | "disabled"
+  | "transient_error"
+  | "unknown_error"
+  | string;
 export type ImageModel = string;
 export type AuthRole = "admin" | "user";
 export type ImageStorageMode = "local" | "webdav" | "both";
@@ -23,6 +35,17 @@ export type Account = {
   status: AccountStatus;
   quota: number;
   image_quota_unknown?: boolean;
+  image_quota_error?: string | null;
+  health_state?: AccountHealthState | null;
+  health_reason?: string | null;
+  health_source?: string | null;
+  health_error_kind?: string | null;
+  health_error_code?: string | null;
+  health_updated_at?: string | null;
+  health_retry_at?: string | null;
+  health_failure_count?: number;
+  last_check_at?: string | null;
+  last_successful_check_at?: string | null;
   email?: string | null;
   user_id?: string | null;
   limits_progress?: Array<{
@@ -75,14 +98,26 @@ type AccountMutationResponse = {
   removed?: number;
   refreshed?: number;
   relogined?: number;
-  errors?: Array<{ access_token: string; error: string }>;
+  errors?: Array<{
+    access_token: string;
+    error: string;
+    kind?: string;
+    code?: string;
+    retry_after_seconds?: number | null;
+  }>;
 };
 
 export type AccountRefreshResponse = {
   items: Account[];
   refreshed: number;
   relogined?: number;
-  errors: Array<{ access_token: string; error: string }>;
+  errors: Array<{
+    access_token: string;
+    error: string;
+    kind?: string;
+    code?: string;
+    retry_after_seconds?: number | null;
+  }>;
 };
 
 export type RefreshProgressResponse = {
