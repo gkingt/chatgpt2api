@@ -83,6 +83,7 @@ def start_account_health_watcher(stop_event: Event) -> Thread:
     def worker() -> None:
         while not stop_event.is_set():
             try:
+                account_service.cleanup_confirmed_invalid_accounts()
                 tokens = account_service.list_due_health_tokens()
                 if tokens:
                     account_service.refresh_accounts(tokens)

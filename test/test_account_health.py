@@ -247,6 +247,114 @@ class AccountHealthClassificationTests(unittest.TestCase):
             self.assertEqual(classification.retry_after_seconds, 120)
 
 
+    def test_nested_refresh_error_is_parsed(self):
+        from unittest.mock import MagicMock
+        response = MagicMock(status_code=400, text="json", headers={})
+        response.json.return_value = {"error": {"message": "Your session has ended. Please log in again.",
+                                                "code": "refresh_token_invalidated", "type": "invalid_request_error"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            service = AccountService(JSONStorageBackend(Path(tmp) / "accounts.json"))
+            with patch("curl_cffi.requests.Session") as session:
+                session.return_value.post.return_value = response
+                with self.assertRaises(TokenRefreshError) as error:
+                    service._request_access_token_refresh("refresh")
+            self.assertEqual(error.exception.error_code, "refresh_token_invalidated")
+            self.assertEqual(classify_account_error(error.exception).kind, ERROR_NEEDS_RELOGIN)
+            self.assertNotIn("{'message'", str(error.exception))
+
+    def test_invalid_refresh_is_confirmed_then_deleted(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(config.data, {"auto_remove_invalid_accounts": True, "auto_relogin_after_refresh": False}):
+            service = AccountService(JSONStorageBackend(Path(tmp) / "accounts.json"))
+            service.add_account_items([{"access_token": "token", "refresh_token": "refresh", "created_at": "2020-01-01"}])
+            with patch.object(service, "_request_access_token_refresh", side_effect=TokenRefreshError(400, "refresh_token_invalidated")):
+                service.refresh_access_token("token", force=True)
+                current = service.get_account("token")
+                self.assertEqual(current["health_state"], HEALTH_STATE_NEEDS_RELOGIN)
+                self.assertEqual(current["health_error_code"], "refresh_token_invalidated")
+                self.assertIsNotNone(current["health_retry_at"])
+                service.update_account("token", {"credential_invalid_at": "2020-01-01", "health_retry_at": "2020-01-01"}, quiet=True)
+                self.assertIn("token", service.list_due_health_tokens())
+                service.fetch_remote_info("token")
+                self.assertIsNone(service.get_account("token"))
+
+    def test_invalid_refresh_attempts_password_recovery_before_confirmation(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(config.data, {"auto_remove_invalid_accounts": True, "auto_relogin_after_refresh": True}):
+            service = AccountService(JSONStorageBackend(Path(tmp) / "accounts.json"))
+            service.add_account_items([{"access_token": "token", "refresh_token": "refresh", "email": "test@example.com", "password": "test", "created_at": "2020-01-01"}])
+            with patch.object(service, "_request_access_token_refresh", side_effect=TokenRefreshError(400, "refresh_token_invalidated")), patch.object(service, "_start_password_relogin_if_possible", return_value=True) as login:
+                service.refresh_access_token("token", force=True)
+                login.assert_called_once()
+            self.assertEqual(service.get_account("token").get("credential_invalid_count", 0), 0)
+            with patch.object(service, "_login_with_password", return_value={"ok": True, "access_token": "new", "refresh_token": "new-refresh"}):
+                service._password_re_login_thread("token", "test@example.com", "test", "test")
+            self.assertFalse(service.get_account("new")["refresh_credentials_invalid"])
+            self.assertEqual(service.get_account("new")["health_state"], HEALTH_STATE_HEALTHY)
+
+    def test_cleanup_only_removes_confirmed_when_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(config.data, {"auto_remove_invalid_accounts": False}):
+            service = AccountService(JSONStorageBackend(Path(tmp) / "accounts.json"))
+            for state in [HEALTH_STATE_INVALID_CONFIRMED, HEALTH_STATE_NEEDS_RELOGIN, HEALTH_STATE_NEEDS_VERIFICATION, HEALTH_STATE_TRANSIENT_ERROR]:
+                service.add_account_items([{"access_token": state, "health_state": state}])
+            service.cleanup_confirmed_invalid_accounts()
+            self.assertEqual(len(service.list_accounts()), 4)
+            config.data["auto_remove_invalid_accounts"] = True
+            service.cleanup_confirmed_invalid_accounts()
+            self.assertIsNone(service.get_account(HEALTH_STATE_INVALID_CONFIRMED))
+            self.assertEqual(len(service.list_accounts()), 3)
+
+    def test_legacy_relogin_record_is_scheduled_for_live_recheck(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = AccountService(JSONStorageBackend(Path(tmp) / "accounts.json"))
+            service.add_account_items([{"access_token": "token", "refresh_token": "refresh", "health_state": HEALTH_STATE_NEEDS_RELOGIN, "health_updated_at": "2020-01-01", "health_error_code": "{'message': 'old error'}"}])
+            self.assertEqual(service.list_due_health_tokens(), ["token"])
+
+
+    def test_password_verification_and_network_errors_never_confirm_deletion(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(config.data, {"auto_remove_invalid_accounts": True}):
+            service = AccountService(JSONStorageBackend(Path(tmp) / "accounts.json"))
+            for error in ["need_verification_code", "connection timeout"]:
+                service.add_account_items([{"access_token": error, "refresh_credentials_invalid": True, "credential_invalid_count": 1, "credential_invalid_at": "2020-01-01", "created_at": "2020-01-01"}])
+                with patch.object(service, "_login_with_password", return_value={"ok": False, "error": error}):
+                    service._password_re_login_thread(error, "test@example.com", "test", "test")
+                self.assertIsNotNone(service.get_account(error))
+                self.assertNotEqual(service.get_account(error)["health_state"], HEALTH_STATE_INVALID_CONFIRMED)
+
+    def test_wrong_password_confirms_only_after_explicit_refresh_failure(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(config.data, {"auto_remove_invalid_accounts": True}):
+            service = AccountService(JSONStorageBackend(Path(tmp) / "accounts.json"))
+            service.add_account_items([{"access_token": "token", "refresh_credentials_invalid": True, "created_at": "2020-01-01"}])
+            with patch.object(service, "_login_with_password", return_value={"ok": False, "error": "invalid_password"}):
+                service._password_re_login_thread("token", "email", "password", "test")
+                self.assertIsNotNone(service.get_account("token"))
+                service.update_account("token", {"credential_invalid_at": "2020-01-01"}, quiet=True)
+                service._password_re_login_thread("token", "email", "password", "test")
+                self.assertIsNone(service.get_account("token"))
+
+    def test_refresh_credential_confirmation_obeys_new_account_grace(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(config.data, {"auto_remove_invalid_accounts": True}):
+            service = AccountService(JSONStorageBackend(Path(tmp) / "accounts.json"))
+            service.add_account_items([{"access_token": "token", "refresh_credentials_invalid": True, "credential_invalid_count": 3, "credential_invalid_at": "2020-01-01"}])
+            service._confirm_unrecoverable_credentials("token", "test")
+            self.assertEqual(service.get_account("token")["health_state"], HEALTH_STATE_NEEDS_RELOGIN)
+            self.assertIsNotNone(service.get_account("token")["health_retry_at"])
+
+
+    def test_generic_oauth_401_is_not_terminal_credential_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(config.data, {"auto_remove_invalid_accounts": True, "auto_relogin_after_refresh": False}):
+            service = AccountService(JSONStorageBackend(Path(tmp) / "accounts.json"))
+            service.add_account_items([{"access_token": "token", "refresh_token": "refresh", "created_at": "2020-01-01"}])
+            with patch.object(service, "_request_access_token_refresh", side_effect=TokenRefreshError(401)):
+                service.refresh_access_token("token", force=True)
+            self.assertFalse(service.get_account("token").get("refresh_credentials_invalid"))
+
+    def test_access_token_error_cannot_bypass_refresh_credential_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(config.data, {"auto_remove_invalid_accounts": True}):
+            service = AccountService(JSONStorageBackend(Path(tmp) / "accounts.json"))
+            service.add_account_items([{"access_token": "token", "refresh_credentials_invalid": True, "invalid_count": 3, "last_invalid_at": "2020-01-01", "created_at": "2020-01-01"}])
+            self.assertFalse(service._record_invalid_token_seen("token", "test", "401"))
+            self.assertIsNotNone(service.get_account("token"))
+
+
 
 if __name__ == "__main__":
     unittest.main()

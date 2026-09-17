@@ -534,6 +534,7 @@ class AccountService:
             elif classification.kind == ERROR_NEEDS_RELOGIN:
                 next_item["status"] = "异常"
                 next_item["health_state"] = HEALTH_STATE_NEEDS_RELOGIN
+                next_item["health_retry_at"] = (now + timedelta(seconds=60)).isoformat()
             elif classification.kind == ERROR_NEEDS_VERIFICATION:
                 next_item["status"] = "异常"
                 next_item["health_state"] = HEALTH_STATE_NEEDS_VERIFICATION
@@ -729,12 +730,19 @@ class AccountService:
                 data = {}
             if response.status_code != 200 or not isinstance(data, dict) or not data.get("access_token"):
                 detail = ""
+                error_code = ""
                 if isinstance(data, dict):
-                    detail = str(data.get("error_description") or data.get("error") or data.get("message") or "")
+                    error = data.get("error")
+                    if isinstance(error, dict):
+                        error_code = str(error.get("code") or "")
+                        detail = str(error.get("message") or data.get("error_description") or "")
+                    else:
+                        error_code = str(error or data.get("code") or "")
+                        detail = str(data.get("error_description") or data.get("message") or error_code)
                 detail = detail or self._safe_response_text(response)
                 raise TokenRefreshError(
                     response.status_code,
-                    str(data.get("error") or data.get("code") or "") if isinstance(data, dict) else "",
+                    error_code,
                     detail,
                     getattr(response, "headers", {}).get("Retry-After"),
                 )
@@ -763,6 +771,9 @@ class AccountService:
                 next_item["refresh_token"] = str(token_data.get("refresh_token") or "").strip()
             if token_data.get("id_token"):
                 next_item["id_token"] = str(token_data.get("id_token") or "").strip()
+            next_item["refresh_credentials_invalid"] = False
+            next_item["credential_invalid_count"] = 0
+            next_item["credential_invalid_at"] = None
             next_item["last_token_refresh_at"] = now
             next_item["last_token_refresh_error"] = None
             next_item["last_token_refresh_error_at"] = None
@@ -835,8 +846,18 @@ class AccountService:
                     return ""
                 if classification.kind == ERROR_NEEDS_RELOGIN or classification.kind == ERROR_INVALID_CREDENTIALS:
                     self._record_account_health_failure(active_token, event, exc, classification)
-                    if config.auto_relogin_after_refresh:
+                    # Only explicit invalid refresh credentials justify eventual deletion;
+                    # generic 401/client configuration/session errors remain recoverable.
+                    terminal = str(getattr(exc, "error_code", "") or "").lower() in {
+                        "refresh_token_invalidated", "refresh_token_invalid",
+                        "invalid_refresh_token", "invalid_grant",
+                    }
+                    if terminal:
+                        self.update_account(active_token, {"refresh_credentials_invalid": True}, quiet=True)
+                    if config.auto_relogin_after_refresh and account.get("email") and account.get("password"):
                         self._start_password_relogin_if_possible(active_token, account, event)
+                    elif terminal:
+                        self._confirm_unrecoverable_credentials(active_token, event)
                     return ""
                 if classification.kind == ERROR_INVALID_TOKEN:
                     should_remove = self._record_invalid_token_seen(
@@ -851,6 +872,44 @@ class AccountService:
                 self._record_account_health_failure(active_token, event, exc, classification)
                 return active_token
             return self._apply_refreshed_tokens(active_token, token_data, event)
+
+    def _confirm_unrecoverable_credentials(self, access_token: str, event: str) -> None:
+        """Two spaced terminal failures, after the new-account grace period."""
+        now = datetime.now(timezone.utc)
+        confirmed = False
+        with self._lock:
+            token = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(token)
+            if not current or not current.get("refresh_credentials_invalid"):
+                return
+            item = dict(current)
+            previous = self._parse_time(item.get("credential_invalid_at"))
+            count = int(item.get("credential_invalid_count") or 0)
+            created = self._parse_time(item.get("created_at"))
+            grace_end = (created + timedelta(seconds=self._NEW_ACCOUNT_INVALID_GRACE_SECONDS)) if created else now
+            if previous is None or (now - previous).total_seconds() >= self._INVALID_CONFIRM_SECONDS:
+                confirmed = count >= 1 and now >= grace_end
+                item["credential_invalid_count"] = count + 1
+                item["credential_invalid_at"] = now.isoformat()
+                previous = now
+            item["health_state"] = HEALTH_STATE_INVALID_CONFIRMED if confirmed else HEALTH_STATE_NEEDS_RELOGIN
+            item["status"] = "异常"
+            item["health_retry_at"] = None if confirmed else max(
+                grace_end, previous + timedelta(seconds=self._INVALID_CONFIRM_SECONDS)
+            ).isoformat()
+            self._accounts[token] = self._normalize_account(item)
+            self._save_accounts()
+        if confirmed:
+            self._remove_confirmed_invalid_token(access_token, event)
+
+    def cleanup_confirmed_invalid_accounts(self) -> None:
+        if not config.auto_remove_invalid_accounts:
+            return
+        with self._lock:
+            tokens = [token for token, account in self._accounts.items()
+                      if account.get("health_state") == HEALTH_STATE_INVALID_CONFIRMED]
+        for token in tokens:
+            self._remove_confirmed_invalid_token(token, "confirmed_invalid_cleanup")
 
     def _start_password_relogin_if_possible(self, access_token: str, account: dict | None, event: str, progress_id: str | None = None) -> bool:
         if not isinstance(account, dict):
@@ -943,6 +1002,8 @@ class AccountService:
                     login_error,
                     classification,
                 )
+                if classification.kind == ERROR_INVALID_CREDENTIALS:
+                    self._confirm_unrecoverable_credentials(access_token, event)
                 log_service.add(
                     LOG_TYPE_ACCOUNT,
                     "密码重新登录失败",
@@ -1507,6 +1568,8 @@ class AccountService:
         with self._image_slot_condition:
             token = self._resolve_access_token_locked(access_token)
             account = self._accounts.get(token)
+            if token in self._relogin_inflight:
+                return False
             if not account or account.get("health_state") != HEALTH_STATE_INVALID_CONFIRMED:
                 return False
             self._accounts.pop(token)
@@ -1603,13 +1666,19 @@ class AccountService:
         now = datetime.now(timezone.utc)
         retryable = {HEALTH_STATE_INVALID_PENDING, HEALTH_STATE_TRANSIENT_ERROR,
                      HEALTH_STATE_UNKNOWN_ERROR, HEALTH_STATE_RATE_LIMITED,
-                     HEALTH_STATE_IMAGE_QUOTA_UNKNOWN}
+                     HEALTH_STATE_IMAGE_QUOTA_UNKNOWN, HEALTH_STATE_NEEDS_RELOGIN}
         with self._lock:
             due = []
             for token, account in self._accounts.items():
                 if account.get("health_state") not in retryable:
                     continue
                 retry_at = self._parse_time(account.get("health_retry_at"))
+                if account.get("health_state") == HEALTH_STATE_NEEDS_RELOGIN:
+                    if not account.get("refresh_token") or token in self._relogin_inflight:
+                        continue
+                    # Old persisted needs_relogin records must also be rechecked.
+                    updated_at = self._parse_time(account.get("health_updated_at"))
+                    retry_at = retry_at or (updated_at + timedelta(seconds=30) if updated_at else now)
                 if retry_at is None and account.get("health_state") != HEALTH_STATE_INVALID_PENDING:
                     continue
                 if retry_at is None or retry_at <= now:
@@ -1815,6 +1884,10 @@ class AccountService:
             current = self._accounts.get(access_token)
             if current is None:
                 return True
+            # Invalid refresh credentials have their own recovery/confirmation
+            # path. An access-token 401 must not bypass password recovery.
+            if current.get("refresh_credentials_invalid"):
+                return False
             # Concurrent/rapid reports are not independent confirmations and must
             # not move the deadline indefinitely into the future.
             last_invalid = self._parse_time(current.get("last_invalid_at"))
@@ -1960,15 +2033,20 @@ class AccountService:
 
         active_token = access_token
         if not skip_token_refresh:
-            refreshed_token = self.refresh_access_token(access_token, event=f"{event}:preflight")
+            current = self.get_account(access_token) or {}
+            retry_credentials = bool(current.get("refresh_credentials_invalid")) or current.get("health_state") == HEALTH_STATE_NEEDS_RELOGIN
+            refreshed_token = self.refresh_access_token(access_token, force=retry_credentials, event=f"{event}:preflight")
             if refreshed_token:
                 active_token = refreshed_token
             else:
                 account_after_refresh = self.get_account(access_token)
+                if account_after_refresh is None:
+                    return None
                 if account_after_refresh and account_after_refresh.get("health_state") in {
                     HEALTH_STATE_NEEDS_RELOGIN,
                     HEALTH_STATE_NEEDS_VERIFICATION,
                     HEALTH_STATE_DISABLED,
+                    HEALTH_STATE_INVALID_CONFIRMED,
                 }:
                     reason = str(account_after_refresh.get("health_reason") or "account health check requires attention")
                     raise RuntimeError(reason)
@@ -2222,6 +2300,8 @@ class AccountService:
             for token in access_tokens:
                 account = self.get_account(token)
                 if not account:
+                    continue
+                if account.get("refresh_credentials_invalid"):
                     continue
                 if account.get("health_state") != HEALTH_STATE_NEEDS_RELOGIN:
                     continue

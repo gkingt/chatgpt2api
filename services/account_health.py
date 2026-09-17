@@ -117,13 +117,14 @@ def classify_account_error(error: object) -> ErrorClassification:
     lower = text.lower()
 
     if isinstance(error, TokenRefreshError):
-        if error_code in {
+        if (error_code in {
             "invalid_grant",
             "invalid_refresh_token",
             "refresh_token_invalid",
+            "refresh_token_invalidated",
             "invalid_token",
             "unauthorized_client",
-        } or status_code == 401 or "app_session_terminated" in lower:
+        } and status_code != 429 and not (status_code and status_code >= 500)) or status_code == 401 or "app_session_terminated" in lower:
             return ErrorClassification(
                 ERROR_NEEDS_RELOGIN,
                 error_code or "refresh_token_invalid",

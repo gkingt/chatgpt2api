@@ -183,9 +183,9 @@ export function ConfigCard() {
                 checked={Boolean(config?.auto_remove_invalid_accounts)}
                 onCheckedChange={(checked) => setAutoRemoveInvalidAccounts(Boolean(checked))}
               />
-              自动移除异常账号
+              自动移除已确认失效账号
             </label>
-            <p className="text-xs text-stone-500">刷新时检测并移除</p>
+            <p className="text-xs text-stone-500">Token 或刷新凭据明确失效，经复核后移除；开启自动重新登录时先尝试恢复。网络错误、限流和需要验证码不会因此删除。开启后也会清理历史已确认失效账号。</p>
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3">
