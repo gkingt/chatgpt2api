@@ -102,6 +102,7 @@ class AccountService:
         self._image_inflight: dict[str, int] = {}
         self._token_aliases: dict[str, str] = {}
         self._relogin_inflight: set[str] = set()
+        self._health_check_inflight: set[str] = set()
         self._cumulative_total = self._load_cumulative_total()
 
     def _get_cumulative_file(self) -> Path:
@@ -202,6 +203,8 @@ class AccountService:
 
     @classmethod
     def _health_cooldown_active(cls, account: dict, now: datetime | None = None) -> bool:
+        if account.get("health_state") == HEALTH_STATE_IMAGE_QUOTA_UNKNOWN:
+            return False
         retry_at = cls._parse_time(account.get("health_retry_at"))
         return retry_at is not None and retry_at > (now or datetime.now(timezone.utc))
 
@@ -610,7 +613,7 @@ class AccountService:
                 next_item["health_error_code"] = "image_quota_unknown" if payload.get("image_quota_error") else None
                 next_item["health_reason"] = self._short_error(payload.get("image_quota_error"), 500) or "image quota is unavailable"
                 next_item["health_source"] = f"{event}:image_quota"
-                next_item["health_retry_at"] = None
+                next_item["health_retry_at"] = (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat()
                 next_item["image_quota_error"] = self._short_error(payload.get("image_quota_error"), 500) or None
             else:
                 if incoming_status not in {"正常", "限流", "异常", "禁用"}:
@@ -720,7 +723,10 @@ class AccountService:
                 },
                 timeout=60,
             )
-            data = response.json() if response.text else {}
+            try:
+                data = response.json() if response.text else {}
+            except (ValueError, TypeError):
+                data = {}
             if response.status_code != 200 or not isinstance(data, dict) or not data.get("access_token"):
                 detail = ""
                 if isinstance(data, dict):
@@ -730,7 +736,7 @@ class AccountService:
                     response.status_code,
                     str(data.get("error") or data.get("code") or "") if isinstance(data, dict) else "",
                     detail,
-                    getattr(response, "retry_after", None),
+                    getattr(response, "headers", {}).get("Retry-After"),
                 )
             return {
                 "access_token": str(data.get("access_token") or "").strip(),
@@ -787,6 +793,8 @@ class AccountService:
             if rotated:
                 self._accounts.pop(old_token, None)
                 self._token_aliases[old_token] = new_token
+                if old_token in self._health_check_inflight:
+                    self._health_check_inflight.add(new_token)
                 old_inflight = int(self._image_inflight.pop(old_token, 0))
                 if old_inflight:
                     self._image_inflight[new_token] = int(self._image_inflight.get(new_token, 0)) + old_inflight
@@ -1416,7 +1424,7 @@ class AccountService:
                 account = self.fetch_remote_info(access_token, "get_available_access_token")
             except Exception as exc:
                 self.release_image_slot(access_token)
-                self._record_image_preflight_error(access_token, "get_available_access_token", str(exc))
+                # fetch_remote_info already records the structured failure once.
                 continue
             # fetch_remote_info 内部可能因 token rotation 导致 access_token 变化，
             # 把新 token 也加入排除列表，防止重复尝试
@@ -1492,12 +1500,23 @@ class AccountService:
 
     def _remove_confirmed_invalid_token(self, access_token: str, event: str, quiet: bool = False) -> bool:
         """仅移除已经经过复核确认的失效 token。"""
-        account = self.get_account(access_token)
-        if not account or account.get("health_state") != HEALTH_STATE_INVALID_CONFIRMED:
-            return False
         if not config.auto_remove_invalid_accounts:
             return False
-        removed = bool(self.delete_accounts([access_token])["removed"])
+        # Recheck and delete under one lock so a concurrent successful refresh
+        # cannot recover this account between the check and deletion.
+        with self._image_slot_condition:
+            token = self._resolve_access_token_locked(access_token)
+            account = self._accounts.get(token)
+            if not account or account.get("health_state") != HEALTH_STATE_INVALID_CONFIRMED:
+                return False
+            self._accounts.pop(token)
+            self._image_inflight.pop(token, None)
+            self._token_aliases = {old: new for old, new in self._token_aliases.items()
+                                   if old != token and new != token}
+            self._index = self._index % len(self._accounts) if self._accounts else 0
+            self._save_accounts()
+            self._image_slot_condition.notify_all()
+            removed = True
         if removed:
             log_service.add(
                 LOG_TYPE_ACCOUNT,
@@ -1578,6 +1597,24 @@ class AccountService:
                 account["image_inflight"] = int(self._image_inflight.get(token, 0))
                 result.append(account)
             return result
+
+    def list_due_health_tokens(self) -> list[str]:
+        """Retry pending checks independently of the normal pool refresh interval."""
+        now = datetime.now(timezone.utc)
+        retryable = {HEALTH_STATE_INVALID_PENDING, HEALTH_STATE_TRANSIENT_ERROR,
+                     HEALTH_STATE_UNKNOWN_ERROR, HEALTH_STATE_RATE_LIMITED,
+                     HEALTH_STATE_IMAGE_QUOTA_UNKNOWN}
+        with self._lock:
+            due = []
+            for token, account in self._accounts.items():
+                if account.get("health_state") not in retryable:
+                    continue
+                retry_at = self._parse_time(account.get("health_retry_at"))
+                if retry_at is None and account.get("health_state") != HEALTH_STATE_INVALID_PENDING:
+                    continue
+                if retry_at is None or retry_at <= now:
+                    due.append((retry_at or datetime.min.replace(tzinfo=timezone.utc), token))
+            return [token for _, token in sorted(due)[:10]]
 
     def list_limited_tokens(self) -> list[str]:
         with self._lock:
@@ -1760,10 +1797,8 @@ class AccountService:
         last_invalid_at = self._parse_time(account.get("last_invalid_at"))
         if last_invalid_at is not None and (now - last_invalid_at).total_seconds() < self._INVALID_CONFIRM_SECONDS:
             return True
-        # 新导入账号的首次失效信号给出更长的观察窗口；第二次、间隔足够的
-        # 失效信号仍然可以在窗口内完成确认，避免新账号永远无法被清理。
         created_at = self._parse_time(account.get("created_at"))
-        if invalid_count == 1 and created_at is not None:
+        if created_at is not None:
             return (now - created_at).total_seconds() < self._NEW_ACCOUNT_INVALID_GRACE_SECONDS
         return False
 
@@ -1780,6 +1815,13 @@ class AccountService:
             current = self._accounts.get(access_token)
             if current is None:
                 return True
+            # Concurrent/rapid reports are not independent confirmations and must
+            # not move the deadline indefinitely into the future.
+            last_invalid = self._parse_time(current.get("last_invalid_at"))
+            if (defer_invalid_removal and int(current.get("invalid_count") or 0) > 0
+                    and last_invalid is not None
+                    and (now - last_invalid).total_seconds() < self._INVALID_CONFIRM_SECONDS):
+                return False
             should_defer = defer_invalid_removal and self._should_defer_invalid_token(current, now)
             next_item = dict(current)
             next_item["invalid_count"] = int(next_item.get("invalid_count") or 0) + 1
@@ -1795,7 +1837,11 @@ class AccountService:
             next_item["health_updated_at"] = now.isoformat()
             if should_defer:
                 next_item["health_state"] = HEALTH_STATE_INVALID_PENDING
-                next_item["health_retry_at"] = (now + timedelta(seconds=self._INVALID_CONFIRM_SECONDS)).isoformat()
+                retry_at = now + timedelta(seconds=self._INVALID_CONFIRM_SECONDS)
+                created_at = self._parse_time(current.get("created_at"))
+                if created_at is not None:
+                    retry_at = max(retry_at, created_at + timedelta(seconds=self._NEW_ACCOUNT_INVALID_GRACE_SECONDS))
+                next_item["health_retry_at"] = retry_at.isoformat()
             else:
                 next_item["status"] = "异常"
                 next_item["quota"] = 0
@@ -1885,6 +1931,24 @@ class AccountService:
         return None
 
     def fetch_remote_info(
+        self, access_token: str, event: str = "fetch_remote_info",
+        defer_invalid_removal: bool = True, skip_token_refresh: bool = False,
+    ) -> dict[str, Any] | None:
+        # Background and manual checks may overlap. A duplicate must not create
+        # a second confirmation or overwrite the result of an in-flight check.
+        with self._lock:
+            token = self._resolve_access_token_locked(access_token)
+            if token in self._health_check_inflight:
+                return None
+            self._health_check_inflight.add(token)
+        try:
+            return self._fetch_remote_info(token, event, defer_invalid_removal, skip_token_refresh)
+        finally:
+            with self._lock:
+                self._health_check_inflight.discard(token)
+                self._health_check_inflight.discard(self._resolve_access_token_locked(token))
+
+    def _fetch_remote_info(
         self,
         access_token: str,
         event: str = "fetch_remote_info",

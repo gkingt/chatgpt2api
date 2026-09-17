@@ -85,6 +85,17 @@ class OpenAIBackendProxyRuntimeTests(unittest.TestCase):
         self.assertTrue(result["image_quota_unknown"])
         self.assertIn("Connection timed out", result["image_quota_error"])
 
+    def test_plan_lookup_timeout_does_not_fabricate_free_plan(self):
+        with patch.object(openai_backend_api.requests, "Session", side_effect=lambda **kwargs: FakeSession(**kwargs)):
+            api = openai_backend_api.OpenAIBackendAPI("token")
+        with patch.object(api, "_get_me", return_value={}), patch.object(
+            api, "_get_conversation_init", return_value={}
+        ), patch.object(api, "_get_default_account", side_effect=TimeoutError("timeout")):
+            result = api.get_user_info()
+        self.assertNotIn("type", result)
+        self.assertIn("account_info_error", result)
+
+
 
 if __name__ == "__main__":
     unittest.main()

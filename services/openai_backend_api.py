@@ -389,8 +389,6 @@ class OpenAIBackendAPI:
         else:
             executor.shutdown(wait=True, cancel_futures=True)
 
-        plan_type = str(default_account.get("plan_type") or "free")
-
         if not isinstance(me_payload, dict):
             me_payload = {}
         if not isinstance(init_payload, dict):
@@ -398,6 +396,7 @@ class OpenAIBackendAPI:
         if not isinstance(default_account, dict):
             default_account = {}
 
+        plan_type = str(default_account.get("plan_type") or "free")
         limits_progress = init_payload.get("limits_progress")
         limits_progress = limits_progress if isinstance(limits_progress, list) else []
         quota, restore_at, image_quota_known = self._extract_quota_and_restore_at(limits_progress)
@@ -419,6 +418,7 @@ class OpenAIBackendAPI:
             result["image_quota_error"] = image_quota_error
         if account_info_error:
             result["account_info_error"] = account_info_error
+            result.pop("type", None)
         logger.debug({
             "event": "backend_user_info_result",
             "email": result.get("email"),

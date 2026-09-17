@@ -164,6 +164,7 @@ function formatCheckTime(value?: string | null) {
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
+    second: "2-digit",
   });
 }
 
@@ -201,6 +202,25 @@ function displayAccountSource(account: Account) {
 
 function AccountsPageContent() {
   const didLoadRef = useRef(false);
+  const [clock, setClock] = useState(() => Date.now());
+  useEffect(() => {
+    let disposed = false;
+    let pending = false;
+    const timer = setInterval(async () => {
+      setClock(Date.now());
+      if (pending || document.visibilityState !== "visible") return;
+      pending = true;
+      try {
+        const data = await fetchAccounts();
+        if (!disposed) setAccounts(data.items);
+      } catch {
+        // Retain the last known state; do not flood the page with polling toasts.
+      } finally {
+        pending = false;
+      }
+    }, 5000);
+    return () => { disposed = true; clearInterval(timer); };
+  }, []);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [availableModels, setAvailableModels] = useState<Model[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -1206,7 +1226,11 @@ function AccountsPageContent() {
                               <div>连续失败：{account.health_failure_count}</div>
                             ) : null}
                             {account.health_retry_at ? (
-                              <div>下次复核：{formatCheckTime(account.health_retry_at)}</div>
+                              <div>
+                                {new Date(account.health_retry_at).getTime() <= clock
+                                  ? "复核已到期，等待后台处理：" : "预计复核："}
+                                {formatCheckTime(account.health_retry_at)}
+                              </div>
                             ) : null}
                           </div>
                         </td>

@@ -79,6 +79,22 @@ def sanitize_sub2api_servers(servers: list[dict]) -> list[dict]:
     return [sanitized for server in servers if (sanitized := sanitize_sub2api_server(server)) is not None]
 
 
+def start_account_health_watcher(stop_event: Event) -> Thread:
+    def worker() -> None:
+        while not stop_event.is_set():
+            try:
+                tokens = account_service.list_due_health_tokens()
+                if tokens:
+                    account_service.refresh_accounts(tokens)
+            except Exception as exc:
+                print(f"[account-health-watcher] fail {exc}")
+            stop_event.wait(5)
+
+    thread = Thread(target=worker, name="account-health-watcher", daemon=True)
+    thread.start()
+    return thread
+
+
 def start_limited_account_watcher(stop_event: Event) -> Thread:
     interval_seconds = config.refresh_account_interval_minute * 60
 

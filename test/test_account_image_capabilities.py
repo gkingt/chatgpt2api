@@ -106,13 +106,10 @@ class AccountCapabilityTests(unittest.TestCase):
                 {"access_token": "stale-token", "status": "正常", "quota": 8, "image_quota_unknown": False}
             ])
 
-            def fail_preflight(access_token: str, event: str = "fetch_remote_info") -> dict:
-                raise RuntimeError("upstream auth preflight failed")
-
-            service.fetch_remote_info = fail_preflight
-
-            with self.assertRaisesRegex(RuntimeError, "no available image quota"):
-                service.get_available_access_token()
+            with patch.object(OpenAIBackendAPI, "get_user_info", side_effect=RuntimeError("upstream auth preflight failed")):
+                with self.assertRaisesRegex(RuntimeError, "no available image quota"):
+                    service.get_available_access_token()
+            self.assertEqual(service.get_account("stale-token")["health_failure_count"], 1)
 
             account = service.get_account("stale-token")
             stats = service.get_stats()

@@ -204,6 +204,7 @@ def classify_account_error(error: object) -> ErrorClassification:
 
     invalid_markers = (
         "token invalidated",
+        "authentication token has been invalidated",
         "token_invalidated",
         "token_revoked",
         "invalidated oauth token",
