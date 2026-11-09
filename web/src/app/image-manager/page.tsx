@@ -149,6 +149,7 @@ function ImageManagerContent() {
       setItems((prev) => prev.filter((item) => item.rel !== deleteTarget.rel));
       setSelectedPaths((prev) => prev.filter((p) => p !== imageKey(deleteTarget)));
       toast.success("图片已删除");
+      await Promise.all([loadImages(), loadStorage()]);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "删除失败");
     } finally {
@@ -242,7 +243,7 @@ function ImageManagerContent() {
       toast.success(`已删除 ${data.removed} 张图片`);
       setDeleteMode(null);
       setSelectedPaths([]);
-      await loadImages();
+      await Promise.all([loadImages(), loadStorage()]);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "删除图片失败");
     } finally {
@@ -380,13 +381,18 @@ function ImageManagerContent() {
                 🗑️ 按日期删除
               </Button>
               <form onSubmit={async (e) => { e.preventDefault();
+                if (isDeleting) return;
+                setIsDeleting(true);
                 try {
                   const r = await deleteToTarget(targetFreeMb);
-                  toast.success(`已删除 ${r.removed} 张图片，释放 ${r.freed_mb ?? 0}MB`);
-                  void loadStorage();
-                } catch { toast.error("清理失败"); }
+                  const message = `已删除 ${r.removed} 张图片，释放 ${r.freed_mb ?? 0}MB`;
+                  if (r.done) toast.success(message);
+                  else toast.warning(`${message}，剩余空间仍未达到目标，请检查其他文件占用`);
+                  await Promise.all([loadImages(), loadStorage()]);
+                } catch (error) { toast.error(error instanceof Error ? error.message : "清理失败"); }
+                finally { setIsDeleting(false); }
               }} className="flex items-center gap-1">
-                <Button size="sm" variant="outline" className="h-7 text-xs border-amber-200 text-amber-700" type="submit">
+                <Button size="sm" variant="outline" className="h-7 text-xs border-amber-200 text-amber-700" type="submit" disabled={isDeleting}>
                   🧹 清理至
                 </Button>
                 <Input className="h-7 w-14 text-xs text-center px-1" type="number" min={50} value={targetFreeMb}
@@ -411,7 +417,7 @@ function ImageManagerContent() {
             <div className="flex items-center gap-2">
               <label className="text-sm text-stone-600 shrink-0">删除</label>
               <Input className="h-9 text-sm" type="date" value={deleteStartDate} onChange={(e) => setDeleteStartDate(e.target.value)} />
-              <span className="text-sm text-stone-400">之前的图片</span>
+              <span className="text-sm text-stone-400">及之前的图片</span>
             </div>
             <p className="text-xs text-stone-500">此操作不可撤销，将永久删除所有匹配日期的图片及其缩略图。</p>
           </div>

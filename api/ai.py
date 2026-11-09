@@ -30,6 +30,12 @@ class ImageGenerationRequest(BaseModel):
     response_format: str = "b64_json"
     history_disabled: bool = True
     stream: bool | None = None
+    output_format: str = "png"
+    frame_count: int | None = None
+    frame_duration_ms: int | None = None
+    complexity: str | None = None
+    output_compression: int | None = None
+    partial_images: int | None = None
 
 
 class ChatCompletionRequest(BaseModel):

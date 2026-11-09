@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import secrets
 import threading
 import time
@@ -12,10 +13,13 @@ from pathlib import Path
 from services.account_service import account_service
 from services.config import DATA_DIR
 from services.register import mail_provider, openai_register
+from utils.json_store import ConfigFileError, load_json_config, save_json_config
 
 
 REGISTER_FILE = DATA_DIR / "register.json"
 RUNNING_SAVE_INTERVAL_SECS = 2.0
+MAX_CONSECUTIVE_FAILURES = 10
+AUTO_RESTART_COOLDOWN_SECS = 60.0
 SECRET_MASK = "[REDACTED]"
 _SECRET_KEY_NAMES = {
     "access_token",
@@ -110,19 +114,27 @@ def _now() -> str:
 
 
 def _default_config() -> dict:
-    return {**openai_register.config, "mode": "total", "target_quota": 100, "target_available": 10, "check_interval": 5, "enabled": False, "stats": {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": openai_register.config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "current_quota": 0, "current_available": 0}}
+    return {**copy.deepcopy(openai_register.DEFAULT_CONFIG), "mode": "total", "target_quota": 100, "target_available": 10, "check_interval": 5, "enabled": False, "stats": {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": openai_register.DEFAULT_CONFIG["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "current_quota": 0, "current_available": 0}}
 
 
 def _normalize(raw: dict) -> dict:
+    raw = copy.deepcopy(raw)
     cfg = json.loads(json.dumps(_default_config(), ensure_ascii=False))
     cfg.update({k: v for k, v in raw.items() if k not in {"stats", "logs"}})
     cfg["total"] = max(1, int(cfg.get("total") or 1))
     cfg["threads"] = max(1, int(cfg.get("threads") or 1))
+    if cfg["threads"] > 32:
+        raise ValueError("注册线程数不能超过 32")
     cfg["mode"] = str(cfg.get("mode") or "total").strip() if str(cfg.get("mode") or "total").strip() in {"total", "quota", "available"} else "total"
     cfg["target_quota"] = max(1, int(cfg.get("target_quota") or 1))
     cfg["target_available"] = max(1, int(cfg.get("target_available") or 1))
     cfg["check_interval"] = max(1, int(cfg.get("check_interval") or 5))
     cfg["proxy"] = str(cfg.get("proxy") or "").strip()
+    if not isinstance(cfg.get("mail"), dict):
+        raise ValueError("mail 必须是邮箱配置对象")
+    cfg["mail"] = {**openai_register.DEFAULT_CONFIG["mail"], **cfg["mail"]}
+    if not isinstance(cfg["mail"].get("providers"), list):
+        raise ValueError("mail.providers 必须是邮箱提供商列表")
     if isinstance(cfg.get("mail"), dict):
         cfg["mail"].pop("proxy", None)
         providers = cfg["mail"].get("providers")
@@ -130,13 +142,16 @@ def _normalize(raw: dict) -> dict:
             for provider in providers:
                 if not isinstance(provider, dict):
                     continue
+                if isinstance(provider.get("enable"), str):
+                    provider["enable"] = provider["enable"].strip().lower() in {"true", "1", "yes", "on"}
                 if not str(provider.get("id") or "").strip():
                     provider["id"] = f"provider-{secrets.token_hex(8)}"
                 if provider.get("type") != "cloudflare_temp_email":
                     continue
                 for legacy_key in ("subdomain", "subdomain_levels", "append_random_suffix", "random_subdomain_depth", "rate_limit_cooldown_seconds"):
                     provider.pop(legacy_key, None)
-    cfg["enabled"] = bool(cfg.get("enabled"))
+    enabled = cfg.get("enabled")
+    cfg["enabled"] = enabled.strip().lower() in {"true", "1", "yes", "on"} if isinstance(enabled, str) else bool(enabled)
     stats = {**_default_config()["stats"], **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
              "threads": cfg["threads"]}
     cfg["stats"] = stats
@@ -147,6 +162,9 @@ class RegisterService:
     def __init__(self, store_file: Path):
         self._store_file = store_file
         self._lock = threading.RLock()
+        self._stop_event = threading.Event()
+        self._load_error = ""
+        self._auto_restart_at = 0.0
         self._runner: threading.Thread | None = None
         self._auto_stop_when_target_reached = False
         self._logs: list[dict] = []
@@ -156,18 +174,35 @@ class RegisterService:
         self._last_snapshot_json = ""
         openai_register.register_log_sink = self._append_log
         self._config = self._load()
+        if not self._load_error:
+            openai_register.config.update({key: copy.deepcopy(self._config[key]) for key in ("mail", "proxy", "total", "threads")})
         if self._config["enabled"]:
-            self.start()
+            try:
+                self.start()
+            except (ValueError, OSError) as exc:
+                self._config["enabled"] = False
+                self._config["stats"]["last_error"] = str(exc)
+                self._append_log(f"自动恢复注册已取消: {exc}", "red")
 
     def _load(self) -> dict:
         try:
-            return _normalize(json.loads(self._store_file.read_text(encoding="utf-8")))
-        except Exception:
-            return _normalize({})
+            raw, recovered = load_json_config(self._store_file, self._store_file.with_name(self._store_file.name + ".bak"))
+            cfg = _normalize(raw)
+            cfg["stats"].update(running=0, stopping=False)
+            if recovered:
+                cfg["enabled"] = False
+                cfg["stats"]["last_error"] = "注册配置损坏，已从备份恢复；请检查配置后手动启动"
+            return cfg
+        except (ConfigFileError, ValueError, TypeError) as exc:
+            self._load_error = str(exc)
+            cfg = _normalize({})
+            cfg["stats"]["last_error"] = f"注册配置读取失败，已禁止启动和覆盖保存: {exc}"
+            return cfg
 
     def _save(self) -> None:
-        self._store_file.parent.mkdir(parents=True, exist_ok=True)
-        self._store_file.write_text(json.dumps(self._config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        if self._load_error:
+            raise ValueError(f"注册配置读取失败，请先恢复 {self._store_file}；原文件未覆盖: {self._load_error}")
+        save_json_config(self._store_file, self._config, self._store_file.with_name(self._store_file.name + ".bak"))
 
     def _save_running_throttled(self, *, force: bool = False) -> None:
         now = time.monotonic()
@@ -188,6 +223,7 @@ class RegisterService:
                 self._redact_outlook_pools(snapshot)
                 if isinstance(snapshot.get("logs"), list):
                     snapshot["logs"] = [_redact_value(item, secret_values) for item in snapshot["logs"]]
+                snapshot["stats"] = _redact_value(snapshot.get("stats", {}), secret_values)
                 self._last_snapshot = payload
                 self._last_snapshot_payload = json.loads(json.dumps(snapshot, ensure_ascii=False))
                 self._last_snapshot_json = json.dumps(snapshot, ensure_ascii=False)
@@ -313,20 +349,38 @@ class RegisterService:
 
     def update(self, updates: dict) -> dict:
         with self._lock:
+            if self._runner and self._runner.is_alive():
+                raise ValueError("注册任务运行或停止中，请等待结束后修改配置")
+            updates = copy.deepcopy(updates)
+            expected_revision = updates.pop("config_revision", None)
+            if expected_revision is not None and int(expected_revision) != int(self._config.get("config_revision") or 0):
+                raise ValueError("注册配置已在其他页面更新，请刷新核对后再保存，避免覆盖新配置")
+            if isinstance(updates.get("mail"), dict):
+                updates["mail"] = {**self._config["mail"], **updates["mail"]}
             self._merge_provider_secrets(updates)
             self._merge_outlook_pools(updates)
+            previous = self._config
             self._config = _normalize({**self._config, **updates})
-            self._drop_mail_proxy()
-            openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
-            self._save()
+            self._config["config_revision"] = int(previous.get("config_revision") or 0) + 1
+            try:
+                self._drop_mail_proxy()
+                self._save()
+            except Exception:
+                self._config = previous
+                raise
+            openai_register.config.update({k: copy.deepcopy(self._config[k]) for k in ("mail", "proxy", "total", "threads")})
+            self._auto_restart_at = 0.0
             return self.get()
 
     def start(self, auto_stop_when_target_reached: bool = False) -> dict:
         with self._lock:
             if self._runner and self._runner.is_alive():
-                self._config["enabled"] = True
-                self._save()
+                if self._stop_event.is_set():
+                    raise ValueError("上一个注册任务仍在停止，请等待结束后重试")
                 return self.get()
+            if self._load_error:
+                raise ValueError(f"注册配置读取失败，请恢复 {self._store_file} 后重启服务")
+            mail_provider.validate_config(self._config.get("mail"))
             self._auto_stop_when_target_reached = bool(auto_stop_when_target_reached)
             self._config["enabled"] = True
             self._drop_mail_proxy()
@@ -335,25 +389,41 @@ class RegisterService:
             self._last_snapshot_payload = None
             self._last_snapshot_json = ""
             self._last_running_save_at = 0.0
+            self._stop_event.clear()
             openai_register.reset_cancel()
             mail_provider.set_cancel_checker(openai_register.ensure_not_cancelled)
             metrics = self._pool_metrics()
             self._config["stats"] = {"job_id": uuid.uuid4().hex, "success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], **metrics, "started_at": _now(), "updated_at": _now()}
-            openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+            openai_register.config.update({k: copy.deepcopy(self._config[k]) for k in ("mail", "proxy", "total", "threads")})
             with openai_register.stats_lock:
                 openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": time.time()})
-            self._save()
+            try:
+                self._save()
+            except Exception:
+                self._config["enabled"] = False
+                self._stop_event.set()
+                raise
             self._runner = threading.Thread(target=self._run, daemon=True, name="openai-register")
             self._runner.start()
             self._append_log(f"注册任务启动，模式={self._config['mode']}，线程数={self._config['threads']}", "yellow")
             return self.get()
 
     def stop(self) -> dict:
+        self._stop_event.set()
+        openai_register.cancel_event.set()
+        openai_register.request_cancel()
         with self._lock:
+            # A concurrent start may have reset cancellation while holding this lock.
+            self._stop_event.set()
+            openai_register.cancel_event.set()
+            self._auto_restart_at = time.monotonic() + AUTO_RESTART_COOLDOWN_SECS
             self._config["enabled"] = False
+            self._config["stats"]["stopping"] = bool(self._runner and self._runner.is_alive())
             self._config["stats"]["updated_at"] = _now()
-            self._save()
-            openai_register.request_cancel()
+            try:
+                self._save()
+            except Exception as exc:
+                self._append_log(f"停止状态保存失败，但任务已取消: {exc}", "red")
             self._append_log("已请求停止注册任务，正在取消当前远端请求", "yellow")
             return self.get()
 
@@ -361,15 +431,24 @@ class RegisterService:
         threshold = max(1, int(min_quota or 1))
         metrics = self._pool_metrics()
         with self._lock:
+            if time.monotonic() < self._auto_restart_at:
+                return {"started": False, "reason": "failure_cooldown", **metrics}
             running = bool(self._runner and self._runner.is_alive())
             if running:
                 self._auto_stop_when_target_reached = True
-                self._bump(**metrics)
+                self._bump(save=False, **metrics)
                 return {"started": False, "reason": "running", **metrics}
             if metrics["current_quota"] >= threshold:
-                self._bump(**metrics)
+                # A health/refresh check must not rewrite mailbox configuration.
+                self._bump(save=False, **metrics)
                 return {"started": False, "reason": "quota_enough", **metrics}
-        self.start(auto_stop_when_target_reached=True)
+        try:
+            self.start(auto_stop_when_target_reached=True)
+        except ValueError as exc:
+            with self._lock:
+                self._auto_restart_at = time.monotonic() + AUTO_RESTART_COOLDOWN_SECS
+                self._bump(save=False, last_error=str(exc))
+            return {"started": False, "reason": "invalid_config", **metrics}
         self._append_log(
             f"自动启动注册：当前剩余额度={metrics['current_quota']}，最低额度={threshold}",
             "yellow",
@@ -378,6 +457,8 @@ class RegisterService:
 
     def reset(self) -> dict:
         with self._lock:
+            if self._runner and self._runner.is_alive():
+                raise ValueError("注册任务运行或停止中，不能重置")
             self._logs = []
             self._config["stats"] = {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, **self._pool_metrics(), "updated_at": _now()}
             with openai_register.stats_lock:
@@ -386,6 +467,9 @@ class RegisterService:
             return self.get()
 
     def reset_outlook_pool(self, scope: str = "all") -> dict:
+        with self._lock:
+            if self._runner and self._runner.is_alive():
+                raise ValueError("注册任务运行或停止中，不能重置邮箱池")
         scope = str(scope or "all").strip().lower()
         if scope == "unused":
             with self._lock:
@@ -473,16 +557,27 @@ class RegisterService:
             cfg = json.loads(json.dumps(self._config, ensure_ascii=False))
         threads = int(cfg["threads"])
         submitted, done, success, fail = 0, 0, 0, 0
+        consecutive_failures = 0
+        next_submit_at = 0.0
+        next_metrics_at = 0.0
+        metrics = {"current_quota": 0, "current_available": 0}
+        last_error = ""
         executor = ThreadPoolExecutor(max_workers=threads)
         try:
             futures = set()
             while True:
                 with self._lock:
-                    cfg = json.loads(json.dumps(self._config, ensure_ascii=False))
-                metrics = self._pool_metrics()
-                target_reached = self._target_reached(cfg, success, metrics=metrics)
+                    cfg = copy.deepcopy(self._config)
+                now = time.monotonic()
+                refresh_metrics = now >= next_metrics_at
+                if refresh_metrics:
+                    metrics = self._pool_metrics()
+                    next_metrics_at = now + max(1, int(cfg.get("check_interval") or 5))
+                target_reached = self._target_reached(cfg, success, metrics=metrics, log_result=refresh_metrics)
                 while (
                     cfg["enabled"]
+                    and not self._stop_event.is_set()
+                    and now >= next_submit_at
                     and not target_reached
                     and len(futures) < threads
                     and self._can_submit_more(cfg, success, len(futures))
@@ -493,38 +588,62 @@ class RegisterService:
                         continue
                     target_reached = self._target_reached(cfg, success, metrics=metrics, log_result=False)
                 self._bump(running=len(futures), done=done, success=success, fail=fail)
-                if not cfg["enabled"]:
+                stopping = not cfg["enabled"] or self._stop_event.is_set()
+                if stopping:
                     for future in futures:
                         future.cancel()
-                if not futures and (
-                    not cfg["enabled"]
-                    or target_reached
-                    or (target_reached and self._auto_stop_when_target_reached)
-                ):
+                if not futures and (stopping or target_reached):
                     if target_reached:
                         self._append_log("注册目标已满足，停止注册任务", "yellow")
                     break
                 if not futures:
-                    time.sleep(max(1, int(cfg.get("check_interval") or 5)))
+                    self._stop_event.wait(min(0.5, max(0.05, next_submit_at - time.monotonic())))
                     continue
                 finished, futures = wait(futures, timeout=0.5, return_when=FIRST_COMPLETED)
                 if not finished:
                     continue
                 for future in finished:
+                    if future.cancelled():
+                        continue
                     done += 1
                     try:
                         result = future.result()
-                        success += 1 if result.get("ok") else 0
-                        fail += 0 if result.get("ok") else 1
-                    except Exception:
+                    except Exception as exc:
+                        result = {"ok": False, "error": str(exc)}
+                    if result.get("ok"):
+                        success += 1
+                        consecutive_failures = 0
+                    else:
                         fail += 1
+                        consecutive_failures += 1
+                        last_error = str(result.get("error") or "注册失败")
+                        delay = min(60.0, 2.0 ** min(consecutive_failures, 6))
+                        next_submit_at = max(next_submit_at, time.monotonic() + delay)
+                        self._bump(save=False, last_error=last_error, retry_delay_seconds=delay)
+                        if result.get("fatal") or consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                            last_error = f"连续失败已触发保护停止，请检查配置及网络后手动重试: {last_error}"
+                            self._append_log(last_error, "red")
+                            self._auto_restart_at = time.monotonic() + AUTO_RESTART_COOLDOWN_SECS
+                            self._stop_event.set()
+                            openai_register.request_cancel()
+                        elif not self._stop_event.is_set():
+                            self._append_log(f"注册失败，等待 {delay:g} 秒后重试（连续失败 {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}）", "yellow")
+        except Exception as exc:
+            last_error = str(exc)
+            self._auto_restart_at = time.monotonic() + AUTO_RESTART_COOLDOWN_SECS
+            self._stop_event.set()
+            openai_register.request_cancel()
+            self._append_log(f"注册任务异常，已停止: {exc}", "red")
         finally:
-            executor.shutdown(wait=False, cancel_futures=True)
-        self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now())
-        with self._lock:
-            self._config["enabled"] = False
-            self._save()
-        self._append_log(f"注册任务结束，成功{success}，失败{fail}", "yellow")
+            executor.shutdown(wait=True, cancel_futures=True)
+            with self._lock:
+                self._config["enabled"] = False
+                self._bump(save=False, running=0, done=done, success=success, fail=fail, last_error=last_error, retry_delay_seconds=0, stopping=False, finished_at=_now())
+                try:
+                    self._save()
+                except Exception as exc:
+                    self._append_log(f"注册结束状态保存失败，原配置或备份仍保留: {exc}", "red")
+            self._append_log(f"注册任务结束，成功{success}，失败{fail}", "yellow")
 
 
 register_service = RegisterService(REGISTER_FILE)

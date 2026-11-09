@@ -18,6 +18,7 @@ from services.image_storage_service import image_storage_service
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
 from utils.helper import (
     IMAGE_MODELS,
+    IMAGE_26_MODELS,
     UpstreamHTTPError,
     extract_image_from_message_content,
     is_codex_image_model,
@@ -25,6 +26,7 @@ from utils.helper import (
     split_image_model,
 )
 from utils.image_tokens import count_image_content_tokens
+from utils.image_formats import IMAGE_MIME_TYPES, image_format, normalize_image_options, prepare_image_output
 from utils.log import logger
 
 
@@ -188,7 +190,18 @@ def is_model_text_reply_instead_of_image(message: str) -> bool:
 
 
 def encode_images(images: Iterable[tuple[bytes, str, str]]) -> list[str]:
-    return [base64.b64encode(data).decode("ascii") for data, _, _ in images if data]
+    encoded = []
+    for data, _, mime_type in images:
+        if not data:
+            continue
+        try:
+            actual_format = image_format(data)
+        except ValueError as exc:
+            raise ImageGenerationError("Invalid reference image; upload a PNG, JPEG or WebP instead", status_code=400, error_type="invalid_request_error") from exc
+        if mime_type == "image/svg+xml" or actual_format == "svg":
+            raise ImageGenerationError("SVG reference images are not supported; upload a PNG, JPEG or WebP instead", status_code=400, error_type="invalid_request_error")
+        encoded.append(base64.b64encode(data).decode("ascii"))
+    return encoded
 
 
 def save_image_bytes(image_data: bytes, base_url: str | None = None) -> str:
@@ -257,12 +270,23 @@ def assistant_history_messages(messages: list[dict[str, Any]]) -> list[str]:
     return [str(item.get("content") or "") for item in messages if item.get("role") == "assistant" and item.get("content")]
 
 
-def build_image_prompt(prompt: str, size: str | None, quality: str = "auto") -> str:
+def build_image_prompt(
+    prompt: str,
+    size: str | None,
+    quality: str = "auto",
+    output_format: str = "png",
+    frame_count: int | None = None,
+    frame_duration_ms: int | None = None,
+) -> str:
     hints = []
     if size:
         hints.append(f"输出图片尺寸为 {size}。")
     if quality:
         hints.append(f"输出图片质量为 {quality}。")
+    # picture_v2 has no captured format selector; request GIF through the prompt.
+    if output_format == "gif":
+        options = normalize_image_options({"output_format": "gif", "frame_count": frame_count, "frame_duration_ms": frame_duration_ms})
+        hints.append(f"输出动画 GIF，{options['frame_count']} 帧，每帧 {options['frame_duration_ms']} 毫秒。")
     return f"{prompt.strip()}\n\n{''.join(hints)}" if hints else prompt
 
 
@@ -312,6 +336,7 @@ def format_image_result(
     base_url: str | None = None,
     created: int | None = None,
     message: str = "",
+    output_format: str | None = None,
 ) -> dict[str, Any]:
     data: list[dict[str, Any]] = []
     for item in items:
@@ -319,15 +344,23 @@ def format_image_result(
         if not b64_json:
             continue
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
+        try:
+            payload, actual_format = prepare_image_output(base64.b64decode(b64_json), output_format)
+        except ValueError as exc:
+            raise ImageGenerationError(str(exc), code="upstream_image_format_error") from exc
+        b64_json = base64.b64encode(payload).decode("ascii")
+        metadata = {"output_format": actual_format, "mime_type": IMAGE_MIME_TYPES[actual_format]}
         if response_format == "b64_json":
             data.append({
+                **metadata,
                 "b64_json": b64_json,
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
+                "url": save_image_bytes(payload, base_url),
                 "revised_prompt": revised_prompt,
             })
         else:
             data.append({
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
+                **metadata,
+                "url": save_image_bytes(payload, base_url),
                 "revised_prompt": revised_prompt,
             })
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
@@ -350,6 +383,10 @@ class ConversationRequest:
     base_url: str | None = None
     message_as_error: bool = False
     progress_callback: Any = None  # Callable[[str], None] | None
+    output_format: str = "png"
+    frame_count: int | None = None
+    frame_duration_ms: int | None = None
+    complexity: str | None = None
 
 
 @dataclass
@@ -701,12 +738,15 @@ def conversation_events(
     size: str | None = None,
     quality: str = "auto",
     thinking_effort: str = "",
+    output_format: str = "png",
+    frame_count: int | None = None,
+    frame_duration_ms: int | None = None,
 ) -> Iterator[dict[str, Any]]:
     normalized = normalize_messages(messages or ([{"role": "user", "content": prompt}] if prompt else []))
     image_model = is_supported_image_model(model)
     history_text = "" if image_model else assistant_history_text(normalized)
     history_messages = [] if image_model else assistant_history_messages(normalized)
-    final_prompt = prompt_with_global_system(build_image_prompt(prompt, size, quality)) if image_model else prompt
+    final_prompt = prompt_with_global_system(build_image_prompt(prompt, size, quality, output_format, frame_count, frame_duration_ms)) if image_model else prompt
     payloads = backend.stream_conversation(
         messages=normalized,
         model=model,
@@ -851,6 +891,9 @@ def stream_image_outputs(
             images=request.images or [],
             size=request.size,
             quality=request.quality,
+            output_format=request.output_format,
+            frame_count=request.frame_count,
+            frame_duration_ms=request.frame_duration_ms,
     ):
         last = event
         if event.get("type") == "conversation.delta":
@@ -1011,6 +1054,7 @@ def stream_image_outputs(
             request.response_format,
             request.base_url,
             int(time.time()),
+            output_format=request.output_format if request.model in IMAGE_26_MODELS else None,
         )["data"]
         if data:
             _remove_image_conversation_later(backend, conversation_id)
@@ -1109,6 +1153,7 @@ def stream_image_outputs(
                         request.response_format,
                         request.base_url,
                         int(time.time()),
+                        output_format=request.output_format if request.model in IMAGE_26_MODELS else None,
                     )["data"]
                     if data:
                         _remove_image_conversation_later(backend, conversation_id)
@@ -1222,6 +1267,7 @@ def stream_image_outputs(
                     request.response_format,
                     request.base_url,
                     int(time.time()),
+                    output_format=request.output_format if request.model in IMAGE_26_MODELS else None,
                 )["data"]
                 if data:
                     _remove_image_conversation_later(backend, conversation_id)
@@ -1269,12 +1315,29 @@ def stream_codex_image_outputs(
         index: int = 1,
         total: int = 1,
 ) -> Iterator[ImageOutput]:
-    images = _codex_response_images(list(backend.iter_codex_image_response_events(
-        prompt=request.prompt,
-        images=request.images or [],
-        size=request.size,
-        quality=request.quality,
-    )))
+    _, base_model = split_image_model(request.model)
+    options = {}
+    if request.output_format == "gif":
+        options.update(frame_count=request.frame_count or 9, frame_duration_ms=request.frame_duration_ms or 200)
+    if base_model != "codex-gpt-image-2" or request.output_format != "png" or request.complexity:
+        options.update(image_model=str(base_model).removeprefix("codex-"), output_format=request.output_format,
+                       complexity=request.complexity)
+    try:
+        events = list(backend.iter_codex_image_response_events(
+            prompt=request.prompt,
+            images=request.images or [],
+            size=request.size,
+            quality=request.quality,
+            **options,
+        ))
+    except UpstreamHTTPError as exc:
+        if "2.6-" in request.model and exc.status_code in {400, 404, 422} and not is_image_quota_exhausted_error(exc):
+            raise ImageGenerationError("Codex upstream rejected the experimental Image 2.6 model or options. This account/endpoint may not support them yet; no model or format fallback was applied.", status_code=400, error_type="invalid_request_error", code="upstream_image_capability_error") from exc
+        raise
+    if any(event.get("type") in {"error", "response.failed", "response.incomplete"} for event in events):
+        raise ImageGenerationError("Codex upstream rejected or could not complete the requested image model/format. Account support for Image 2.6 GIF/SVG is not guaranteed; no fallback was applied.", code="upstream_image_capability_error")
+    # Completion events can repeat the same image from output_item.done.
+    images = list(dict.fromkeys(_codex_response_images(events)))
     if not images:
         raise ImageGenerationError("No image result found in response")
     data = format_image_result(
@@ -1283,6 +1346,7 @@ def stream_codex_image_outputs(
         request.response_format,
         request.base_url,
         int(time.time()),
+        output_format=request.output_format,
     )["data"]
     if data:
         yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data)
@@ -1323,7 +1387,7 @@ def _generate_single_image(
             codex_model = is_codex_image_model(request.model)
             token = account_service.get_available_access_token(
                 plan_type=plan_type,
-                source_type="codex" if codex_model else None,
+                source_type="codex" if codex_model else ("chatgpt_web" if request.model in IMAGE_26_MODELS else None),
                 plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
             )
         except RuntimeError as exc:
@@ -1492,6 +1556,8 @@ def _generate_single_image(
                 })
                 continue
             account_service.mark_image_result(token, False)
+            if request.model in IMAGE_26_MODELS and isinstance(exc, UpstreamHTTPError) and exc.status_code in {400, 404, 422}:
+                raise ImageGenerationError("ChatGPT web upstream rejected the experimental Image 2.6 model. This account/endpoint may not support it yet; no model fallback was applied.", status_code=400, error_type="invalid_request_error", code="upstream_image_capability_error", account_email=account_email) from exc
             last_error = str(exc)
             logger.warning({
                 "event": "image_stream_fail",
@@ -1546,7 +1612,16 @@ def _generate_single_image(
 def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:
     """并行生成多张图片，每张图片使用独立线程和账号，互不阻塞。"""
     if not is_supported_image_model(request.model):
-        raise ImageGenerationError("unsupported image model,supported models: " + ", ".join(sorted(IMAGE_MODELS)))
+        raise ImageGenerationError("unsupported image model,supported models: " + ", ".join(sorted(IMAGE_MODELS)), status_code=400, error_type="invalid_request_error")
+    for key, value in normalize_image_options(vars(request), edit=bool(request.images)).items():
+        setattr(request, key, value)
+    if not is_codex_image_model(request.model):
+        if request.output_format not in {"png", "gif"} or request.complexity:
+            raise ImageGenerationError("ChatGPT web Image 2.6 supports experimental PNG/GIF requests only; SVG, JPEG/WebP selection and complexity require a Codex model. No fallback was applied.", status_code=400, error_type="invalid_request_error")
+        if request.output_format == "gif" and request.images:
+            raise ImageGenerationError("ChatGPT web GIF output supports text-to-image generation only, not image edits", status_code=400, error_type="invalid_request_error")
+    if (request.output_format in {"svg", "gif"} or request.complexity) and "2.6-" not in request.model:
+        raise ImageGenerationError("GIF requires an Image 2.6 model; SVG and complexity require a Codex Image 2.6 model", status_code=400, error_type="invalid_request_error")
 
     if request.n <= 1:
         # 单张图片，直接执行（无需线程池开销）
@@ -1624,6 +1699,11 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
                 })
 
     if not emitted:
+        if errors:
+            # Keep structured model/format failures (and HTTP status) for multi-image requests.
+            for error in errors.values():
+                if isinstance(error, ImageGenerationError):
+                    raise error
         if not last_error:
             last_error = "no account in the pool could generate images — check account quota and rate-limit status"
         raise ImageGenerationError(image_stream_error_message(last_error), conversation_id="")

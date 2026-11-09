@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import type { ImageModel } from "@/lib/api";
+import type { ImageModel, ImageOutputOptions } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 type ImageComposerProps = {
@@ -20,6 +20,8 @@ type ImageComposerProps = {
   imageQuality: string;
   imageModel: ImageModel;
   imageModels: ImageModel[];
+  outputOptions: ImageOutputOptions;
+  onOutputOptionsChange: (value: ImageOutputOptions) => void;
   availableQuota: string;
   activeTaskCount: number;
   referenceImages: Array<{ name: string; dataUrl: string }>;
@@ -90,6 +92,8 @@ export function ImageComposer({
   imageQuality,
   imageModel,
   imageModels,
+  outputOptions,
+  onOutputOptionsChange,
   availableQuota,
   activeTaskCount,
   referenceImages,
@@ -120,14 +124,16 @@ export function ImageComposer({
     [referenceImages],
   );
   const modelOptions = useMemo(
-    () => imageModels.map((model) => ({ value: model, label: model })),
+    () => imageModels.map((model) => ({ value: model, label: model.includes("2.6-") ? `${model} (实验)` : model })),
     [imageModels],
   );
-  const qualityLabel = qualityOptions.find((option) => option.value === imageQuality)?.label || "自动";
+  const isCodexModel = imageModel.toLowerCase().includes("codex");
+  const isImage26 = imageModel.includes("2.6-");
+  const availableQualities = [...qualityOptions, ...(isImage26 ? [{ value: "xhigh", label: "超高" }, { value: "max", label: "最高" }] : [])];
+  const qualityLabel = availableQualities.find((option) => option.value === imageQuality)?.label || "自动";
   const ratioLabel = imageRatio === "auto" ? "auto" : `${imageRatio}(${imageTier})`;
   const imageSizeLabel = `${qualityLabel} · ${ratioLabel} · ${imageCount || 1} 张`;
   const selectedModelLabel = modelOptions.find((option) => option.value === imageModel)?.label || imageModel;
-  const isCodexModel = imageModel.toLowerCase().includes("codex");
 
   useEffect(() => {
     if (!isSizeMenuOpen) {
@@ -141,7 +147,7 @@ export function ImageComposer({
       ) {
         return;
       }
-      if (!sizeMenuRef.current?.contains(target as Node)) {
+      if (!sizeMenuRef.current?.contains(target as Node) && !sizeMenuBtnRef.current?.contains(target as Node)) {
         setIsSizeMenuOpen(false);
       }
     };
@@ -346,12 +352,13 @@ export function ImageComposer({
                     {isSizeMenuOpen ? (
                       <div
                         ref={sizeMenuRef}
-                        className="fixed z-[80] max-h-[62dvh] overflow-y-auto rounded-[24px] border border-stone-200/70 bg-white p-4 shadow-[0_30px_90px_-34px_rgba(15,23,42,0.42)] sm:max-h-none sm:overflow-visible"
+                        className="fixed z-[80] overflow-y-auto rounded-[24px] border border-stone-200/70 bg-white p-4 shadow-[0_30px_90px_-34px_rgba(15,23,42,0.42)]"
                         style={{
                           top: sizeMenuPos.top,
                           left: sizeMenuPos.left,
                           transform: "translateY(-100%)",
                           width: "min(460px, calc(100vw - 2rem))",
+                          maxHeight: Math.max(180, sizeMenuPos.top - 16),
                         }}
                       >
                         <h3 className="mb-3 text-base font-semibold text-stone-950">图像设置</h3>
@@ -393,10 +400,33 @@ export function ImageComposer({
                             </SelectContent>
                           </Select>
                         </div>
+                        {isImage26 ? (
+                          <div className="mb-3 space-y-3">
+                            <p className="text-xs leading-5 text-amber-800">{isCodexModel ? "实验性 Codex 透传，是否可用取决于账号和上游；不支持时返回错误，不自动换模型或格式。" : "实验性 ChatGPT 网页链路：直传 2.6 模型名，GIF 帧数和时长通过提示词请求；实际生成取决于上游，不把 PNG 当作 GIF。"}</p>
+                            <label className="block text-sm font-medium text-stone-900" htmlFor="image-output-format">输出格式</label>
+                            <select id="image-output-format" className="h-10 w-full rounded-xl border border-stone-200 bg-white px-3 text-sm" value={outputOptions.output_format || "png"}
+                              onChange={(event) => onOutputOptionsChange({ complexity: outputOptions.complexity, output_format: event.target.value as ImageOutputOptions["output_format"], ...(event.target.value === "gif" ? { frame_count: 9, frame_duration_ms: 200 } : {}) })}>
+                              <option value="png">PNG</option>{isCodexModel ? <><option value="jpeg">JPEG</option><option value="webp">WebP</option></> : null}<option value="gif" disabled={!isCodexModel && referenceImages.length > 0}>GIF 动画{!isCodexModel ? "（仅文生图）" : ""}</option>{isCodexModel ? <option value="svg" disabled={referenceImages.length > 0}>SVG 矢量（仅文生图）</option> : null}
+                            </select>
+                            {outputOptions.output_format === "gif" ? (
+                              <div className="grid grid-cols-2 gap-3">
+                                <label className="space-y-1 text-sm text-stone-700">帧数（2–16）<Input aria-label="GIF 帧数" type="number" min={2} max={16} value={outputOptions.frame_count ?? 9} onChange={(event) => onOutputOptionsChange({ ...outputOptions, frame_count: Number(event.target.value) })} /></label>
+                                <label className="space-y-1 text-sm text-stone-700">每帧毫秒（20–2000）<Input aria-label="GIF 每帧毫秒" type="number" min={20} max={2000} step={10} value={outputOptions.frame_duration_ms ?? 200} onChange={(event) => onOutputOptionsChange({ ...outputOptions, frame_duration_ms: Number(event.target.value) })} /></label>
+                                <p className="col-span-2 text-xs text-stone-600">GIF 使用自动尺寸，避免多帧超出上游像素限制。</p>
+                              </div>
+                            ) : null}
+                            {outputOptions.output_format === "svg" ? <p className="text-xs text-stone-600">SVG 仅支持生成 1 张，不支持参考图和流式输出。</p> : null}
+                            {isCodexModel ? <><label htmlFor="image-complexity" className="block text-sm font-medium text-stone-900">构图复杂度</label>
+                            <select id="image-complexity" className="h-10 w-full rounded-xl border border-stone-200 bg-white px-3 text-sm" value={outputOptions.complexity || "high"}
+                              onChange={(event) => onOutputOptionsChange({ ...outputOptions, complexity: event.target.value as ImageOutputOptions["complexity"] })}>
+                              <option value="low">低</option><option value="medium">中</option><option value="high">高（默认）</option>
+                            </select></> : null}
+                          </div>
+                        ) : null}
                         <div className="mb-3">
                           <div className="mb-2 text-sm font-medium text-stone-900">质量</div>
                           <div className="grid grid-cols-4 gap-2">
-                            {qualityOptions.map((option) => {
+                            {availableQualities.map((option) => {
                               const active = option.value === imageQuality;
                               return (
                                 <button

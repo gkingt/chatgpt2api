@@ -2,7 +2,7 @@
 
 import localforage from "localforage";
 
-import type { ImageModel } from "@/lib/api";
+import type { ImageModel, ImageOutputOptions } from "@/lib/api";
 
 export type ImageConversationMode = "generate" | "edit";
 
@@ -21,6 +21,8 @@ export type StoredImage = {
   b64_json?: string;
   url?: string;
   revised_prompt?: string;
+  mime_type?: string;
+  output_format?: string;
   error?: string;
   startTime?: number;
   elapsedSecs?: number;
@@ -41,6 +43,7 @@ export type ImageTurn = {
   ratio: string;
   tier: string;
   quality: string;
+  outputOptions?: ImageOutputOptions;
   images: StoredImage[];
   createdAt: string;
   status: ImageTurnStatus;
@@ -153,6 +156,7 @@ function normalizeTurn(turn: ImageTurn & Record<string, unknown>): ImageTurn {
     ratio: typeof turn.ratio === "string" && turn.ratio ? turn.ratio : "1:1",
     tier: typeof turn.tier === "string" && turn.tier ? turn.tier : "1k",
     quality: typeof turn.quality === "string" && turn.quality ? turn.quality : "auto",
+    outputOptions: turn.outputOptions,
     images: normalizedImages,
     createdAt: String(turn.createdAt || new Date().toISOString()),
     status:

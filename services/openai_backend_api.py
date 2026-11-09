@@ -23,7 +23,8 @@ from services.account_service import account_service
 from services.account_health import ERROR_TRANSIENT, ERROR_UPSTREAM_RATE_LIMITED, classify_account_error
 from services.config import config
 from services.proxy_service import proxy_settings
-from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
+from utils.helper import IMAGE_26_MODELS, UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
+from utils.image_formats import IMAGE_MIME_TYPES, image_format
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
 from utils.turnstile import solve_turnstile_token
@@ -624,6 +625,8 @@ class OpenAIBackendAPI:
             return "auto"
         if base_model == "gpt-image-2":
             return "gpt-5-3"
+        if base_model in IMAGE_26_MODELS:
+            return base_model
         if base_model == CODEX_IMAGE_MODEL:
             return base_model
         return "auto"
@@ -660,7 +663,11 @@ class OpenAIBackendAPI:
     def _codex_image_input(prompt: str, images: list[str]) -> list[Dict[str, Any]]:
         content: list[Dict[str, Any]] = [{"type": "input_text", "text": prompt}]
         for image in images:
-            payload = image if image.startswith("data:image/") else f"data:image/png;base64,{image}"
+            if image.startswith("data:image/"):
+                payload = image
+            else:
+                mime_type = IMAGE_MIME_TYPES[image_format(base64.b64decode(image))]
+                payload = f"data:{mime_type};base64,{image}"
             content.append({"type": "input_image", "image_url": payload})
         return [{"role": "user", "content": content}]
 
@@ -829,6 +836,11 @@ class OpenAIBackendAPI:
             images: list[str] | None = None,
             size: str | None = None,
             quality: str = "auto",
+            image_model: str = "gpt-image-2",
+            output_format: str = "png",
+            frame_count: int | None = None,
+            frame_duration_ms: int | None = None,
+            complexity: str | None = None,
     ) -> Iterator[Dict[str, Any]]:
         if not self.access_token:
             raise RuntimeError("access_token is required for codex image endpoints")
@@ -841,15 +853,19 @@ class OpenAIBackendAPI:
             "input": self._codex_image_input(prompt, images or []),
             "tools": [{
                 "type": "image_generation",
-                "model": "gpt-image-2",
+                "model": image_model,
                 "action": "edit" if images else "generate",
                 "size": str(size or "1024x1024"),
                 "quality": str(quality or "auto"),
-                "output_format": "png",
+                "output_format": output_format,
             }],
             "tool_choice": {"type": "image_generation"},
             "stream": True,
         }
+        tool = payload["tools"][0]
+        for key, value in {"frame_count": frame_count, "frame_duration_ms": frame_duration_ms, "complexity": complexity}.items():
+            if value is not None:
+                tool[key] = value
         request = urllib.request.Request(
             self.base_url + path,
             json.dumps(payload).encode(),

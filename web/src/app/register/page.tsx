@@ -30,7 +30,11 @@ function RegisterDataController() {
       const baseUrl = webConfig.apiUrl.replace(/\/$/, "");
       source = new EventSource(`${baseUrl}/api/register/events?token=${encodeURIComponent(token)}`);
       source.onmessage = (event) => {
-        setRegisterConfig(JSON.parse(event.data) as RegisterConfig);
+        try {
+          setRegisterConfig(JSON.parse(event.data) as RegisterConfig);
+        } catch {
+          // A truncated SSE message must not reset the editable configuration.
+        }
       };
     });
     return () => {

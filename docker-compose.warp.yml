@@ -6,6 +6,8 @@ services:
     volumes:
       - ./config.json:/app/config.json
       - ./scripts:/app/scripts:ro
+      - ./utils:/app/utils:ro
+      - ./data:/app/data
     environment:
       CHATGPT2API_CONFIG_FILE: /app/config.json
       CHATGPT2API_PROXY_RUNTIME_ENABLED: ${CHATGPT2API_PROXY_RUNTIME_ENABLED:-true}

@@ -23,7 +23,7 @@ class FakeWebDAVClient:
     def __init__(self, _settings):
         pass
 
-    def put(self, rel: str, payload: bytes) -> str:
+    def put(self, rel: str, payload: bytes, content_type: str = "image/png") -> str:
         self.uploaded[rel] = payload
         return f"https://dav.example.test/{rel}"
 
@@ -75,6 +75,18 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.assertEqual(stored.storage, "local")
         self.assertTrue((self.images_dir / stored.rel).is_file())
         self.assertEqual(stored.url, f"http://app.test/images/{stored.rel}")
+
+    def test_gif_and_svg_use_native_extensions_and_webdav_mime_types(self):
+        from test.test_image26 import SVG, raster
+        self.settings.update(enabled=True, mode="both", webdav_url="https://dav.example.test")
+        service = self.service()
+        with mock.patch("services.image_storage_service.WebDAVClient") as client:
+            client.return_value.put.return_value = "https://dav.example.test/image"
+            for payload, extension, mime in [(SVG, "svg", "image/svg+xml"), (raster("GIF", True), "gif", "image/gif")]:
+                stored = service.save(payload, "http://app.test")
+                self.assertTrue(stored.rel.endswith(f".{extension}"))
+                self.assertEqual((self.images_dir / stored.rel).read_bytes(), payload)
+                client.return_value.put.assert_called_with(stored.rel, payload, mime)
 
     def test_webdav_mode_uploads_without_local_file(self):
         self.settings.update({

@@ -270,6 +270,9 @@ type SettingsStore = {
   registerConfig: RegisterConfig | null;
   isLoadingRegister: boolean;
   isSavingRegister: boolean;
+  isStoppingRegister: boolean;
+  isRegisterDirty: boolean;
+  registerEditVersion: number;
 
   pools: CPAPool[];
   isLoadingPools: boolean;
@@ -385,6 +388,9 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   registerConfig: null,
   isLoadingRegister: true,
   isSavingRegister: false,
+  isStoppingRegister: false,
+  isRegisterDirty: false,
+  registerEditVersion: 0,
 
   pools: [],
   isLoadingPools: true,
@@ -898,7 +904,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     if (!silent) set({ isLoadingRegister: true });
     try {
       const data = await fetchRegisterConfig();
-      set({ registerConfig: data.register });
+      get().setRegisterConfig(data.register);
     } catch (error) {
       if (!silent) toast.error(error instanceof Error ? error.message : "加载注册配置失败");
     } finally {
@@ -907,39 +913,49 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   },
 
   setRegisterConfig: (config) => {
-    set({ registerConfig: config, isLoadingRegister: false });
+    set((state) => {
+      const current = state.registerConfig;
+      if (current && (config.config_revision || 0) < (current.config_revision || 0)) return {};
+      return {
+        registerConfig: current && (state.isRegisterDirty || state.isSavingRegister)
+          ? { ...current, enabled: config.enabled, stats: config.stats, logs: config.logs }
+          : config,
+        isLoadingRegister: false,
+      };
+    });
   },
 
   setRegisterProxy: (value) => {
-    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy: value } } : {});
+    set((state) => state.registerConfig ? { isRegisterDirty: true, registerEditVersion: state.registerEditVersion + 1, registerConfig: { ...state.registerConfig, proxy: value } } : {});
   },
 
   setRegisterTotal: (value) => {
-    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, total: Number(value) || 0 } } : {});
+    set((state) => state.registerConfig ? { isRegisterDirty: true, registerEditVersion: state.registerEditVersion + 1, registerConfig: { ...state.registerConfig, total: Number(value) || 0 } } : {});
   },
 
   setRegisterThreads: (value) => {
-    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, threads: Number(value) || 0 } } : {});
+    set((state) => state.registerConfig ? { isRegisterDirty: true, registerEditVersion: state.registerEditVersion + 1, registerConfig: { ...state.registerConfig, threads: Number(value) || 0 } } : {});
   },
 
   setRegisterMode: (value) => {
-    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, mode: value } } : {});
+    set((state) => state.registerConfig ? { isRegisterDirty: true, registerEditVersion: state.registerEditVersion + 1, registerConfig: { ...state.registerConfig, mode: value } } : {});
   },
 
   setRegisterTargetQuota: (value) => {
-    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, target_quota: Number(value) || 0 } } : {});
+    set((state) => state.registerConfig ? { isRegisterDirty: true, registerEditVersion: state.registerEditVersion + 1, registerConfig: { ...state.registerConfig, target_quota: Number(value) || 0 } } : {});
   },
 
   setRegisterTargetAvailable: (value) => {
-    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, target_available: Number(value) || 0 } } : {});
+    set((state) => state.registerConfig ? { isRegisterDirty: true, registerEditVersion: state.registerEditVersion + 1, registerConfig: { ...state.registerConfig, target_available: Number(value) || 0 } } : {});
   },
 
   setRegisterCheckInterval: (value) => {
-    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, check_interval: Number(value) || 0 } } : {});
+    set((state) => state.registerConfig ? { isRegisterDirty: true, registerEditVersion: state.registerEditVersion + 1, registerConfig: { ...state.registerConfig, check_interval: Number(value) || 0 } } : {});
   },
 
   setRegisterMailField: (key, value) => {
     set((state) => state.registerConfig ? {
+      isRegisterDirty: true, registerEditVersion: state.registerEditVersion + 1,
       registerConfig: {
         ...state.registerConfig,
         mail: { ...state.registerConfig.mail, [key]: Number(value) || 0 },
@@ -949,6 +965,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   addRegisterProvider: () => {
     set((state) => state.registerConfig ? {
+      isRegisterDirty: true, registerEditVersion: state.registerEditVersion + 1,
       registerConfig: {
         ...state.registerConfig,
         mail: {
@@ -967,7 +984,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       if (!state.registerConfig) return {};
       const providers = [...(state.registerConfig.mail.providers || [])];
       providers[index] = { ...(providers[index] || {}), ...updates };
-      return { registerConfig: { ...state.registerConfig, mail: { ...state.registerConfig.mail, providers } } };
+      return { isRegisterDirty: true, registerEditVersion: state.registerEditVersion + 1, registerConfig: { ...state.registerConfig, mail: { ...state.registerConfig.mail, providers } } };
     });
   },
 
@@ -976,12 +993,13 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       if (!state.registerConfig) return {};
       const providers = [...(state.registerConfig.mail.providers || [])];
       providers[index] = provider;
-      return { registerConfig: { ...state.registerConfig, mail: { ...state.registerConfig.mail, providers } } };
+      return { isRegisterDirty: true, registerEditVersion: state.registerEditVersion + 1, registerConfig: { ...state.registerConfig, mail: { ...state.registerConfig.mail, providers } } };
     });
   },
 
   deleteRegisterProvider: (index) => {
     set((state) => state.registerConfig ? {
+      isRegisterDirty: true, registerEditVersion: state.registerEditVersion + 1,
       registerConfig: {
         ...state.registerConfig,
         mail: {
@@ -993,11 +1011,12 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   },
 
   saveRegister: async () => {
-    const { registerConfig } = get();
-    if (!registerConfig) return;
+    const { registerConfig, registerEditVersion, isSavingRegister } = get();
+    if (!registerConfig || isSavingRegister) return;
     try {
       set({ isSavingRegister: true });
       const data = await updateRegisterConfig({
+        config_revision: registerConfig.config_revision || 0,
         mail: registerConfig.mail,
         proxy: registerConfig.proxy.trim(),
         total: Math.max(1, Number(registerConfig.total) || 1),
@@ -1007,7 +1026,12 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         target_available: Math.max(1, Number(registerConfig.target_available) || 1),
         check_interval: Math.max(1, Number(registerConfig.check_interval) || 5),
       });
-      set({ registerConfig: data.register });
+      if (get().registerEditVersion === registerEditVersion) {
+        set({ registerConfig: data.register, isRegisterDirty: false });
+      } else {
+        get().setRegisterConfig(data.register);
+        set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, config_revision: data.register.config_revision } } : {});
+      }
       toast.success("注册配置已保存");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "保存注册配置失败");
@@ -1019,10 +1043,27 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   toggleRegister: async () => {
     const { registerConfig } = get();
     if (!registerConfig) return;
+    if (registerConfig.enabled) {
+      if (get().isStoppingRegister) return;
+      set({ isStoppingRegister: true });
+      try {
+        const data = await stopRegister();
+        get().setRegisterConfig(data.register);
+        toast.success("已请求停止注册任务");
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "停止注册任务失败");
+      } finally {
+        set({ isStoppingRegister: false });
+      }
+      return;
+    }
+    if (get().isSavingRegister) return;
+    const editVersion = get().registerEditVersion;
     set({ isSavingRegister: true });
     try {
       if (!registerConfig.enabled) {
-        await updateRegisterConfig({
+        const saved = await updateRegisterConfig({
+          config_revision: registerConfig.config_revision || 0,
           mail: registerConfig.mail,
           proxy: registerConfig.proxy.trim(),
           total: Math.max(1, Number(registerConfig.total) || 1),
@@ -1032,10 +1073,16 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           target_available: Math.max(1, Number(registerConfig.target_available) || 1),
           check_interval: Math.max(1, Number(registerConfig.check_interval) || 5),
         });
+        if (get().registerEditVersion !== editVersion) {
+          set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, config_revision: saved.register.config_revision } } : {});
+          toast.warning("配置在保存期间发生变化，请确认后重新启动");
+          return;
+        }
+        set({ registerConfig: saved.register, isRegisterDirty: false });
       }
-      const data = registerConfig.enabled ? await stopRegister() : await startRegister();
-      set({ registerConfig: data.register });
-      toast.success(registerConfig.enabled ? "注册任务已停止" : "注册任务已启动");
+      const data = await startRegister();
+      get().setRegisterConfig(data.register);
+      toast.success("注册任务已启动");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "切换注册状态失败");
     } finally {
@@ -1047,7 +1094,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set({ isSavingRegister: true });
     try {
       const data = await resetRegisterApi();
-      set({ registerConfig: data.register });
+      get().setRegisterConfig(data.register);
       toast.success("注册统计已重置");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "重置注册统计失败");
@@ -1060,7 +1107,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set({ isSavingRegister: true });
     try {
       const data = await resetOutlookPoolApi(scope);
-      set({ registerConfig: data.register });
+      get().setRegisterConfig(data.register);
       toast.success(scope === "unused" ? "已清空未使用邮箱" : scope === "failed" ? "已清除失败/占用的邮箱状态" : "Outlook 邮箱池状态已全部重置");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "重置邮箱池状态失败");

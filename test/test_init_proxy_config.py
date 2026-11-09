@@ -96,21 +96,51 @@ class InitProxyConfigTests(unittest.TestCase):
         module = load_script_module()
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
-            path.write_text(json.dumps({"auth-key": "secret", "proxy": ""}), encoding="utf-8")
-            original_replace = Path.replace
+            original = {"auth-key": "secret", "proxy": ""}
+            path.write_text(json.dumps(original), encoding="utf-8")
+            original_replace = os.replace
+            busy_calls = []
 
-            def replace_with_ebusy(self: Path, target: Path) -> Path:
-                if self.name == "config.json.tmp":
+            def replace_with_ebusy(source: Path, target: Path) -> None:
+                if target == path:
+                    busy_calls.append(target)
                     raise OSError(errno.EBUSY, "Device or resource busy")
-                return original_replace(self, target)
+                return original_replace(source, target)
 
             with patch.dict(os.environ, {"CHATGPT2API_CONFIG_FILE": str(path)}, clear=False):
-                with patch.object(Path, "replace", replace_with_ebusy):
+                with patch.object(os, "replace", replace_with_ebusy):
                     self.assertEqual(module.main(), 0)
 
             data = json.loads(path.read_text(encoding="utf-8"))
             self.assertTrue(data["proxy_runtime"]["enabled"])
-            self.assertFalse(path.with_suffix(".json.tmp").exists())
+            self.assertEqual(busy_calls, [path])
+            self.assertEqual(json.loads((path.parent / "data" / "config.json.bak").read_text(encoding="utf-8")), original)
+            self.assertEqual({item.name for item in path.parent.iterdir()}, {"config.json", "data"})
+
+    def test_invalid_primary_is_recovered_from_persistent_backup(self) -> None:
+        module = load_script_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text('{"auth-key":', encoding="utf-8")
+            backup = path.parent / "data" / "config.json.bak"
+            backup.parent.mkdir()
+            original = {"auth-key": "secret", "custom": "keep"}
+            backup.write_text(json.dumps(original), encoding="utf-8")
+            with patch.dict(os.environ, {"CHATGPT2API_CONFIG_FILE": str(path)}, clear=False):
+                self.assertEqual(module.main(), 0)
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(data["auth-key"], "secret")
+            self.assertEqual(data["custom"], "keep")
+            self.assertEqual(json.loads(backup.read_text(encoding="utf-8")), original)
+
+    def test_invalid_config_without_backup_is_never_overwritten(self) -> None:
+        module = load_script_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text('{"auth-key":', encoding="utf-8")
+            with patch.dict(os.environ, {"CHATGPT2API_CONFIG_FILE": str(path)}, clear=False):
+                self.assertEqual(module.main(), 1)
+            self.assertEqual(path.read_text(encoding="utf-8"), '{"auth-key":')
 
 
 if __name__ == "__main__":

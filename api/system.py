@@ -6,6 +6,7 @@ from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict
+from starlette.background import BackgroundTask
 
 from api.support import require_admin, require_identity, resolve_image_base_url
 from services.backup_service import BackupError, backup_service
@@ -18,6 +19,7 @@ from services.image_service import (
     get_image_download_response,
     get_image_response,
     get_thumbnail_response,
+    iter_zip_chunks,
     list_images,
     storage_stats,
 )
@@ -78,64 +80,68 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.get("/api/settings")
     async def get_settings(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return {"config": config.get()}
+        await run_in_threadpool(require_admin, authorization)
+        return {"config": await run_in_threadpool(config.get)}
 
     @router.get("/api/third-party-apps")
     async def get_third_party_apps(authorization: str | None = Header(default=None)):
-        require_identity(authorization)
+        await run_in_threadpool(require_identity, authorization)
         return {"third_party_apps": config.get_third_party_apps_settings()}
 
     @router.post("/api/settings")
     async def save_settings(body: SettingsUpdateRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         try:
-            return {"config": config.update(body.model_dump(mode="python"))}
+            return {"config": await run_in_threadpool(config.update, body.model_dump(mode="python"))}
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
     @router.get("/api/images")
     async def get_images(request: Request, start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return list_images(resolve_image_base_url(request), start_date=start_date.strip(), end_date=end_date.strip())
+        await run_in_threadpool(require_admin, authorization)
+        return await run_in_threadpool(list_images, resolve_image_base_url(request), start_date=start_date.strip(), end_date=end_date.strip())
 
     @router.get("/images/{image_path:path}", include_in_schema=False)
     async def get_image(image_path: str):
-        return get_image_response(image_path)
+        return await run_in_threadpool(get_image_response, image_path)
 
     @router.get("/image-thumbnails/{image_path:path}", include_in_schema=False)
     async def get_image_thumbnail(image_path: str):
-        return get_thumbnail_response(image_path)
+        return await run_in_threadpool(get_thumbnail_response, image_path)
 
     @router.post("/api/images/delete")
     async def delete_images_endpoint(body: ImageDeleteRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return delete_images(body.paths, start_date=body.start_date.strip(), end_date=body.end_date.strip(), all_matching=body.all_matching)
+        await run_in_threadpool(require_admin, authorization)
+        try:
+            return await run_in_threadpool(delete_images, body.paths, start_date=body.start_date.strip(), end_date=body.end_date.strip(), all_matching=body.all_matching)
+        except ImageStorageError as exc:
+            raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
 
     @router.post("/api/images/download")
     async def download_images_endpoint(body: ImageDownloadRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        buf = download_images_zip(body.paths)
+        await run_in_threadpool(require_admin, authorization)
+        buf = await run_in_threadpool(download_images_zip, body.paths)
         return StreamingResponse(
-            buf,
+            iter_zip_chunks(buf),
             media_type="application/zip",
             headers={"Content-Disposition": 'attachment; filename="images.zip"'},
+            background=BackgroundTask(buf.close),
         )
 
     @router.get("/api/images/download/{image_path:path}")
     async def download_single_image_endpoint(image_path: str, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return get_image_download_response(image_path)
+        await run_in_threadpool(require_admin, authorization)
+        return await run_in_threadpool(get_image_download_response, image_path)
 
     @router.get("/api/logs")
     async def get_logs(type: str = "", start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return {"items": log_service.list(type=type.strip(), start_date=start_date.strip(), end_date=end_date.strip())}
+        await run_in_threadpool(require_admin, authorization)
+        return {"items": await run_in_threadpool(log_service.list, type=type.strip(), start_date=start_date.strip(), end_date=end_date.strip())}
 
     @router.post("/api/logs/delete")
     async def delete_logs(body: LogDeleteRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return log_service.delete(body.ids)
+        await run_in_threadpool(require_admin, authorization)
+        return await run_in_threadpool(log_service.delete, body.ids)
 
     @router.post("/api/proxy/test")
     async def test_proxy_endpoint(body: ProxyTestRequest, authorization: str | None = Header(default=None)):
@@ -256,41 +262,41 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.get("/api/images/tags")
     async def list_image_tags(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return {"tags": get_all_tags()}
+        await run_in_threadpool(require_admin, authorization)
+        return {"tags": await run_in_threadpool(get_all_tags)}
 
     @router.post("/api/images/tags")
     async def update_image_tags(body: ImageTagsRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         rel = body.path.strip().lstrip("/")
         if not rel:
             raise HTTPException(status_code=400, detail={"error": "path is required"})
-        tags = set_tags(rel, body.tags)
+        tags = await run_in_threadpool(set_tags, rel, body.tags)
         return {"ok": True, "tags": tags}
 
     @router.delete("/api/images/tags/{tag}")
     async def delete_image_tag(tag: str, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        count = delete_tag(tag)
+        await run_in_threadpool(require_admin, authorization)
+        count = await run_in_threadpool(delete_tag, tag)
         return {"ok": True, "removed_from": count}
 
     @router.get("/api/images/storage")
     async def get_image_storage(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return storage_stats()
+        await run_in_threadpool(require_admin, authorization)
+        return await run_in_threadpool(storage_stats)
 
     @router.post("/api/images/storage/compress")
     async def compress_all_images(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         return await run_in_threadpool(compress_images)
 
     @router.post("/api/images/storage/cleanup-to-target")
     async def cleanup_to_target(
-        target_free_mb: int = 500,
+        target_free_mb: int = Query(default=500, ge=0),
         dry_run: bool = False,
         authorization: str | None = Header(default=None),
     ):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         return await run_in_threadpool(delete_to_target, target_free_mb, dry_run)
 
     @router.get("/health", response_model=None)

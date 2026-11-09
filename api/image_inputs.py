@@ -15,6 +15,7 @@ from fastapi.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
 from services.proxy_service import proxy_settings
+from utils.image_formats import normalize_image_options
 
 ImageInput = tuple[bytes, str, str]
 ImageSource = str | UploadFile | ImageInput
@@ -76,6 +77,7 @@ def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
     }
     if "client_task_id" in fields:
         payload["client_task_id"] = _clean(fields.get("client_task_id"))
+    payload.update(normalize_image_options({**fields, **payload}, edit=True))
     return payload
 
 
@@ -183,7 +185,7 @@ async def parse_image_edit_request(request: Request) -> tuple[dict[str, Any], li
 
     form = await request.form()
     fields: dict[str, Any] = {}
-    for key in ("client_task_id", "prompt", "model", "n", "size", "quality", "response_format", "stream"):
+    for key in ("client_task_id", "prompt", "model", "n", "size", "quality", "response_format", "stream", "output_format", "frame_count", "frame_duration_ms", "complexity", "output_compression", "partial_images"):
         value = form.get(key)
         if isinstance(value, str):
             fields[key] = value
@@ -194,7 +196,12 @@ async def parse_image_edit_request(request: Request) -> tuple[dict[str, Any], li
             sources.extend(_sources_from_value(value))
         elif key in MASK_REFERENCE_FIELDS:
             mask_sources.extend(_sources_from_value(value))
-    return _payload_from_fields(fields), sources, mask_sources
+    try:
+        payload = _payload_from_fields(fields)
+    except Exception:
+        await form.close()
+        raise
+    return payload, sources, mask_sources
 
 
 def _extension_from_mime(mime_type: str) -> str:

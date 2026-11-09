@@ -99,6 +99,52 @@ environment:
 
 ## 功能
 
+### Image 2.6 / GIF / SVG（ChatGPT / Codex 账号池实验适配）
+
+继续使用本项目的 ChatGPT/Codex 账号池，不需要 OpenAI API Key，不调用付费 Image API。
+保留原有 `gpt-image-2` / `codex-gpt-image-2` 链路，新增：
+
+- 网页账号：`gpt-image-2.6-sunburst`、`gpt-image-2.6-flare`，从现有非 Codex 号池取账号（含网页 Token、密码和 OAuth 导入），无需转为 Codex 凭据。
+- Codex 账号：`codex-gpt-image-2.6-sunburst`、`codex-gpt-image-2.6-flare`，以及对应的 `plus-`、`team-`、`pro-` 前缀别名。
+- `/v1/models` 根据号池来源和 Codex 套餐展示新模型，标记 `experimental: true` 和 `upstream`。
+
+**这是请求协议的实验适配，不代表全部账号已开放以上模型。** 官方 Image API 文档确认的能力，不等于 ChatGPT/Codex 账号具有同样的访问权限。上游不支持时明确报错，不偷偷切回旧模型或把 PNG 伪装成 GIF/SVG；不要手动把网页账号的来源改成 Codex。
+
+ChatGPT 网页链路参考 [b3346c9](https://github.com/FatalErrorR/chatgpt2api/commit/b3346c928595eb6e3abc346c6413994d66000005)：在网页会话准备和生成请求中直传完整 2.6 模型名，保留 `picture_v2`。网页协议尚无已抓取的格式参数，GIF 通过提示词请求动画、帧数和时长，实际格式仍校验为多帧 GIF；这不保证上游严格遵守帧数/时长。暂仅开放 PNG 和文生图 GIF，不开放网页 SVG、复杂度或 GIF 编辑。
+
+普通 ChatGPT 网页账号请求示例：
+
+```bash
+curl http://localhost:8000/v1/images/generations \
+  -H "Authorization: Bearer <auth-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-image-2.6-sunburst","prompt":"一只挥手的小猫循环动画","size":"auto","n":1,"output_format":"gif","frame_count":9,"frame_duration_ms":200,"response_format":"url"}'
+```
+
+Codex 链路将模型和参数传给现有 `/backend-api/codex/responses` 的图片工具：
+
+```bash
+curl http://localhost:8000/v1/images/generations \
+  -H "Authorization: Bearer <auth-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"codex-gpt-image-2.6-sunburst","prompt":"一只挥手的小猫循环动画","size":"auto","n":1,"output_format":"gif","frame_count":9,"frame_duration_ms":200,"response_format":"url"}'
+```
+
+| 选项 | 限制 |
+|:--|:--|
+| `output_format` | 网页 2.6 可请求 `png` / `gif`；Codex 2.6 可请求 `png` / `jpeg` / `webp` / `gif` / `svg`；默认 `png` |
+| `complexity` | 仅 Codex：`low` / `medium` / `high`，不传则使用上游默认值 |
+| GIF | 帧数 `frame_count` 为 2–16，默认 9；每帧 `frame_duration_ms` 为 20–2000，默认 200，四舍五入到 10ms；网页只支持文生图，Codex 可请求生成和编辑 |
+| GIF 尺寸 | `auto` 或宽高均为 16 正整数倍的 `宽x高`；网页选择 GIF 时使用 `auto` |
+| SVG | 仅 Codex 文生图，`n=1`，不接受 SVG 参考图；仅静态矢量内容，禁止脚本、外部资源和嵌入位图 |
+| 流式和压缩 | GIF/SVG 不接受 `stream`、`partial_images`、`output_compression`；账号池链路暂不支持自定义 `output_compression` |
+
+结果包含 `output_format` 和 `mime_type`。本地/WebDAV 保存、下载、打包及过期/按日期清理支持 GIF/SVG；GIF 原图保留动画，列表缩略图为第一帧；SVG 使用受限预览。网页历史及重试会保留所选格式和动画参数。
+
+官方能力与参数参考：[Sunburst](https://developers.openai.com/api/docs/models/gpt-image-2.6-sunburst)、[Flare](https://developers.openai.com/api/docs/models/gpt-image-2.6-flare)、[Image generation](https://developers.openai.com/api/docs/guides/image-generation)。这些是 Image API 文档，不是 Codex 订阅端点支持证明。
+
+参考 commit 的帧数辅助函数允许到 64；本项目保留当前官方指南的 2–16 帧校验，不复制静默截断参数的行为。
+
 ### API 兼容能力
 
 - 兼容 `POST /v1/images/generations` 图片生成接口

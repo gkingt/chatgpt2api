@@ -28,7 +28,9 @@ import {
   type ImageModel,
   type Model,
   type ImageTask,
+  type ImageOutputOptions,
 } from "@/lib/api";
+import { imageMimeType, imageOptionsForModel } from "@/lib/image-format";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 import { useSettingsStore } from "@/app/settings/store";
 import {
@@ -165,8 +167,8 @@ function buildReferenceImageFromResult(image: StoredImage, fileName: string): St
 
   return {
     name: fileName,
-    type: "image/png",
-    dataUrl: `data:image/png;base64,${image.b64_json}`,
+    type: imageMimeType(image),
+    dataUrl: `data:${imageMimeType(image)};base64,${image.b64_json}`,
   };
 }
 
@@ -224,6 +226,8 @@ function taskDataToStoredImage(image: StoredImage, task: ImageTask): StoredImage
       b64_json: first.b64_json,
       url: first.url,
       revised_prompt: first.revised_prompt,
+      mime_type: first.mime_type,
+      output_format: first.output_format,
       error: undefined,
       durationMs: task.duration_ms,
     };
@@ -451,6 +455,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   const [imageWidth, setImageWidth] = useState("1024");
   const [imageHeight, setImageHeight] = useState("1024");
   const [imageQuality, setImageQuality] = useState("auto");
+  const [outputOptions, setOutputOptions] = useState<ImageOutputOptions>({ output_format: "png" });
   const [imageModel, setImageModel] = useState<ImageModel>("gpt-image-2");
   const [imageModels, setImageModels] = useState<ImageModel[]>(["gpt-image-2"]);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
@@ -1034,6 +1039,10 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     if (files.length === 0) {
       return;
     }
+    if (files.some((file) => file.type === "image/svg+xml" || /\.svg$/i.test(file.name))) {
+      toast.error("SVG 仅支持生成，不支持作为参考图；请先转为 PNG、JPEG 或 WebP");
+      return;
+    }
 
     try {
       const previews = await Promise.all(
@@ -1079,6 +1088,10 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
   const handleContinueEdit = useCallback(
     async (conversationId: string, image: StoredImage | StoredReferenceImage) => {
+      if (("dataUrl" in image ? image.type : imageMimeType(image)) === "image/svg+xml") {
+        toast.error("SVG 不支持继续编辑；请先转为 PNG、JPEG 或 WebP");
+        return;
+      }
       try {
         const nextReference =
           "dataUrl" in image
@@ -1123,6 +1136,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     setImageHeight(parsedSize.height);
     setImageQuality(turn.quality);
     setImageModel(turn.model);
+    setOutputOptions(imageOptionsForModel(turn.model, turn.outputOptions || { output_format: "png" }));
     setReferenceImages(turn.referenceImages);
     setReferenceImageFiles(
       turn.referenceImages.map((image) => dataUrlToFile(image.dataUrl, image.name, image.type)),
@@ -1214,8 +1228,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
           pendingImages.map((image) => {
             const taskId = image.taskId || image.id;
             return activeTurn.mode === "edit"
-              ? createImageEditTask(taskId, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality)
-              : createImageGenerationTask(taskId, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality);
+              ? createImageEditTask(taskId, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality, activeTurn.outputOptions)
+              : createImageGenerationTask(taskId, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality, activeTurn.outputOptions);
           }),
         );
         await applyTasks(submitted);
@@ -1266,8 +1280,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
               const resubmitted = await Promise.all(
                 missingImages.map((image) =>
                   activeTurn.mode === "edit"
-                    ? createImageEditTask(image.taskId || image.id, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality)
-                    : createImageGenerationTask(image.taskId || image.id, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality),
+                    ? createImageEditTask(image.taskId || image.id, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality, activeTurn.outputOptions)
+                    : createImageGenerationTask(image.taskId || image.id, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality, activeTurn.outputOptions),
                 ),
               );
               if (resubmitted.length > 0) {
@@ -1347,6 +1361,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         ratio: sourceTurn.ratio,
         tier: sourceTurn.tier,
         quality: sourceTurn.quality,
+        outputOptions: sourceTurn.outputOptions,
         images: createLoadingImages(nextTurnId, count),
         createdAt: now,
         status: "queued",
@@ -1525,6 +1540,18 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     }
 
     const effectiveImageMode: ImageConversationMode = referenceImageFiles.length > 0 ? "edit" : "generate";
+    if (outputOptions.output_format === "gif" && !imageModel.includes("codex") && effectiveImageMode === "edit") {
+      toast.error("ChatGPT 网页 GIF 暂只支持文生图；请移除参考图或改选 PNG");
+      return;
+    }
+    if (outputOptions.output_format === "gif" && (!Number.isInteger(outputOptions.frame_count) || Number(outputOptions.frame_count) < 2 || Number(outputOptions.frame_count) > 16 || !Number.isInteger(outputOptions.frame_duration_ms) || Number(outputOptions.frame_duration_ms) < 20 || Number(outputOptions.frame_duration_ms) > 2000)) {
+      toast.error("GIF 帧数必须为 2–16，每帧时长必须为 20–2000 毫秒");
+      return;
+    }
+    if (outputOptions.output_format === "svg" && (effectiveImageMode === "edit" || parsedCount !== 1)) {
+      toast.error("SVG 仅支持文生图，且生成数量必须为 1");
+      return;
+    }
 
     const targetConversation = selectedConversationId
       ? conversationsRef.current.find((conversation) => conversation.id === selectedConversationId) ?? null
@@ -1532,7 +1559,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     const now = new Date().toISOString();
     const conversationId = targetConversation?.id ?? createId();
     const turnId = createId();
-    const imageSize = `${imageWidth || 1024}x${imageHeight || 1024}`;
+    const imageSize = imageRatio === "auto" || outputOptions.output_format === "gif" ? "auto" : `${imageWidth || 1024}x${imageHeight || 1024}`;
     const draftTurn: ImageTurn = {
       id: turnId,
       prompt,
@@ -1544,6 +1571,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       ratio: imageRatio,
       tier: imageTier,
       quality: imageQuality,
+      outputOptions: imageModel.includes("2.6-") ? outputOptions : { output_format: "png" },
       images: createLoadingImages(turnId, parsedCount),
       createdAt: now,
       status: "queued",
@@ -1702,6 +1730,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
             imageQuality={imageQuality}
             imageModel={imageModel}
             imageModels={imageModels}
+            outputOptions={outputOptions}
+            onOutputOptionsChange={setOutputOptions}
             availableQuota={availableQuota}
             activeTaskCount={activeTaskCount}
             referenceImages={referenceImages}
@@ -1714,7 +1744,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
             onImageWidthChange={setImageWidth}
             onImageHeightChange={setImageHeight}
             onImageQualityChange={setImageQuality}
-            onImageModelChange={setImageModel}
+            onImageModelChange={(model) => { setImageModel(model); setOutputOptions((current) => imageOptionsForModel(model, current)); if (!model.includes("2.6-") && ["xhigh", "max"].includes(imageQuality)) setImageQuality("auto"); }}
             onSubmit={handleSubmit}
             onPickReferenceImage={() => fileInputRef.current?.click()}
             onReferenceImageChange={handleReferenceImageChange}

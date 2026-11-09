@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import copy
-import json
 import os
 import re
 import sys
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from utils.json_store import ConfigFileError, file_lock, load_json_config, save_json_config
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -124,20 +126,10 @@ def _mask_url(value: str) -> str:
     return re.sub(r"(https?://)([^\s/@:]+):([^\s/@]+)@", r"\1[REDACTED]@", value or "", flags=re.I)
 
 
-def main() -> int:
-    config_path = Path(os.getenv("CHATGPT2API_CONFIG_FILE", "/app/config.json"))
-    if not config_path.exists():
-        print(f"Config file not found, creating {config_path}")
-        data: dict[str, Any] = {}
-    else:
-        try:
-            data = json.loads(config_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            print(f"Invalid JSON in {config_path}: {exc}", file=sys.stderr)
-            return 1
-        if not isinstance(data, dict):
-            print(f"Config root must be an object: {config_path}", file=sys.stderr)
-            return 1
+def _initialize_config(config_path: Path, backup_path: Path) -> int:
+    data, recovered = load_json_config(config_path, backup_path)
+    if recovered:
+        print(f"Recovered {config_path} from {backup_path}", file=sys.stderr)
 
     desired = _warp_runtime_defaults()
     existing = data.get("proxy_runtime")
@@ -154,20 +146,7 @@ def main() -> int:
         print("Proxy runtime already configured")
 
     if changed:
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
-        tmp_path = config_path.with_suffix(config_path.suffix + ".tmp")
-        try:
-            tmp_path.write_text(payload, encoding="utf-8")
-            tmp_path.replace(config_path)
-        except OSError as exc:
-            # Docker bind-mounted single files can reject atomic rename with EBUSY.
-            # Fall back to in-place write so the init job works with both file and
-            # directory mounts.
-            if getattr(exc, "errno", None) != 16:
-                raise
-            config_path.write_text(payload, encoding="utf-8")
-            tmp_path.unlink(missing_ok=True)
+        save_json_config(config_path, data, backup_path)
 
     runtime = data.get("proxy_runtime") if isinstance(data.get("proxy_runtime"), dict) else {}
     clearance = runtime.get("clearance") if isinstance(runtime.get("clearance"), dict) else {}
@@ -180,6 +159,17 @@ def main() -> int:
         f"flaresolverr_url={_mask_url(str(clearance.get('flaresolverr_url') or ''))}"
     )
     return 0
+
+
+def main() -> int:
+    config_path = Path(os.getenv("CHATGPT2API_CONFIG_FILE", "/app/config.json"))
+    backup_path = config_path.parent / "data" / "config.json.bak"
+    try:
+        with file_lock(config_path):
+            return _initialize_config(config_path, backup_path)
+    except (ConfigFileError, OSError) as exc:
+        print(f"Configuration initialization failed; original file or backup preserved: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

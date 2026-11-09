@@ -3,11 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 import itertools
+import os
+import shutil
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from threading import Lock
+from typing import Any, Iterator
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -24,9 +28,14 @@ INTERNAL_RESPONSE_KEYS = {"_account_email", "_conversation_id"}
 
 
 class LogService:
+    READ_CHUNK_SIZE = 64 * 1024
+    MAX_RECORD_SIZE = 4 * 1024 * 1024
+
     def __init__(self, path: Path):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_lock = Lock()
+        self._delete_lock = Lock()
 
     @staticmethod
     def _legacy_id(raw_line: str, line_number: int) -> str:
@@ -68,46 +77,126 @@ class LogService:
             "summary": summary,
             "detail": detail or data,
         }
-        with self.path.open("a", encoding="utf-8") as file:
-            file.write(self._serialize_item(item) + "\n")
+        payload = (self._serialize_item(item) + "\n").encode("utf-8")
+        with self._write_lock, self.path.open("ab") as file:
+            file.write(payload)
+
+    def _reverse_lines(self) -> Iterator[tuple[int, str]]:
+        try:
+            file = self.path.open("rb")
+        except FileNotFoundError:
+            return
+        with file:
+            position = file.seek(0, os.SEEK_END)
+            fragments: list[bytes] = []
+            fragment_size = 0
+            oversized = False
+            while position > 0:
+                start = max(0, position - self.READ_CHUNK_SIZE)
+                file.seek(start)
+                block = file.read(position - start)
+                end = len(block)
+                while True:
+                    newline = block.rfind(b"\n", 0, end)
+                    if newline < 0:
+                        if not oversized:
+                            fragment_size += end
+                            if fragment_size > self.MAX_RECORD_SIZE:
+                                fragments.clear()
+                                oversized = True
+                            else:
+                                fragments.append(block[:end])
+                        break
+                    raw = block[newline + 1:end]
+                    if not oversized and len(raw) + fragment_size <= self.MAX_RECORD_SIZE:
+                        if fragments:
+                            raw += b"".join(reversed(fragments))
+                        yield start + newline + 1, raw.rstrip(b"\r").decode("utf-8", errors="replace")
+                    fragments.clear()
+                    fragment_size = 0
+                    oversized = False
+                    end = newline
+                position = start
+            if fragments and not oversized:
+                yield 0, b"".join(reversed(fragments)).rstrip(b"\r").decode("utf-8", errors="replace")
 
     def list(self, type: str = "", start_date: str = "", end_date: str = "", limit: int = 200) -> list[dict[str, Any]]:
-        if not self.path.exists():
+        if limit <= 0:
             return []
         items: list[dict[str, Any]] = []
-        lines = self.path.read_text(encoding="utf-8").splitlines()
-        for line_number in range(len(lines) - 1, -1, -1):
-            item = self._parse_line(lines[line_number], line_number)
-            if item is None:
-                continue
-            if not self._matches_filters(item, type=type, start_date=start_date, end_date=end_date):
-                continue
-            items.append(item)
-            if len(items) >= limit:
-                break
+        lines = self._reverse_lines()
+        try:
+            for offset, raw_line in lines:
+                # Byte offsets keep legacy IDs reproducible without counting every earlier line.
+                item = self._parse_line(raw_line, offset)
+                if item is None or not self._matches_filters(item, type=type, start_date=start_date, end_date=end_date):
+                    continue
+                items.append(item)
+                if len(items) >= limit:
+                    break
+        finally:
+            lines.close()
         return items
 
     def delete(self, ids: list[str]) -> dict[str, int]:
         target_ids = {str(item or "").strip() for item in ids if str(item or "").strip()}
-        if not self.path.exists() or not target_ids:
+        if not target_ids:
             return {"removed": 0}
-        lines = self.path.read_text(encoding="utf-8").splitlines()
-        kept_lines: list[str] = []
-        removed = 0
-        for line_number, raw_line in enumerate(lines):
-            item = self._parse_line(raw_line, line_number)
-            if item is None:
-                kept_lines.append(raw_line)
-                continue
-            if str(item.get("id") or "") in target_ids:
-                removed += 1
-                continue
-            kept_lines.append(self._serialize_item(item))
-        content = "\n".join(kept_lines)
-        if content:
-            content += "\n"
-        self.path.write_text(content, encoding="utf-8")
-        return {"removed": removed}
+        with self._delete_lock:
+            with self._write_lock:
+                try:
+                    source = self.path.open("rb")
+                except FileNotFoundError:
+                    return {"removed": 0}
+                snapshot_end = source.seek(0, os.SEEK_END)
+                source.seek(0)
+            temp_path: Path | None = None
+            try:
+                with source:
+                    with tempfile.NamedTemporaryFile(mode="wb", dir=self.path.parent, delete=False) as output:
+                        temp_path = Path(output.name)
+                        removed = 0
+                        line_number = 0
+                        while source.tell() < snapshot_end:
+                            offset = source.tell()
+                            raw = source.readline(min(self.MAX_RECORD_SIZE + 1, snapshot_end - offset))
+                            if len(raw) > self.MAX_RECORD_SIZE:
+                                # Preserve huge/corrupt records without allocating an entire line.
+                                output.write(raw)
+                                while not raw.endswith(b"\n") and source.tell() < snapshot_end:
+                                    raw = source.readline(min(self.READ_CHUNK_SIZE, snapshot_end - source.tell()))
+                                    output.write(raw)
+                                line_number += 1
+                                continue
+                            raw_line = raw.rstrip(b"\r\n").decode("utf-8", errors="replace")
+                            item = self._parse_line(raw_line, offset)
+                            legacy = item is not None and str(item["id"]) == self._legacy_id(raw_line, offset)
+                            # Accept IDs returned by the old line-number-based reader as well.
+                            old_id = self._legacy_id(raw_line, line_number) if legacy else ""
+                            line_number += 1
+                            if item is not None and (str(item["id"]) in target_ids or old_id in target_ids):
+                                removed += 1
+                                continue
+                            if legacy:
+                                output.write((self._serialize_item(item) + "\n").encode("utf-8"))
+                            else:
+                                output.write(raw)
+                        if not removed:
+                            return {"removed": 0}
+                        # Writers can append during the slow rewrite; preserve their tail before swapping.
+                        with self._write_lock:
+                            shutil.copyfileobj(source, output, self.READ_CHUNK_SIZE)
+                            output.flush()
+                            os.fsync(output.fileno())
+                            os.chmod(temp_path, self.path.stat().st_mode & 0o777)
+                            source.close()
+                            output.close()
+                            os.replace(temp_path, self.path)
+                return {"removed": removed}
+            finally:
+                source.close()
+                if temp_path is not None:
+                    temp_path.unlink(missing_ok=True)
 
 
 log_service = LogService(DATA_DIR / "logs.jsonl")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import random
@@ -32,7 +33,7 @@ from utils.sentinel import (
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 base_dir = Path(__file__).resolve().parent
-config = {
+DEFAULT_CONFIG = {
     "mail": {
         "request_timeout": 30,
         "wait_timeout": 120,
@@ -49,13 +50,9 @@ config = {
     "total": 10,
     "threads": 3,
 }
+config = copy.deepcopy(DEFAULT_CONFIG)
 register_config_file = base_dir.parents[1] / "data" / "register.json"
 domain_stats_file = base_dir.parents[1] / "data" / "domain_stats.json"
-try:
-    saved_config = json.loads(register_config_file.read_text(encoding="utf-8"))
-    config.update({key: saved_config[key] for key in ("mail", "proxy", "total", "threads") if key in saved_config})
-except Exception:
-    pass
 
 auth_base = "https://auth.openai.com"
 platform_base = "https://platform.openai.com"
@@ -1411,9 +1408,10 @@ class PlatformRegistrar:
 
 def worker(index: int) -> dict:
     start = time.time()
-    ensure_not_cancelled()
-    registrar = PlatformRegistrar(config["proxy"])
+    registrar = None
     try:
+        ensure_not_cancelled()
+        registrar = PlatformRegistrar(config["proxy"])
         step(index, "任务启动")
         result = registrar.register(index)
         cost = time.time() - start
@@ -1434,6 +1432,7 @@ def worker(index: int) -> dict:
             stats["done"] += 1
             stats["fail"] += 1
         log(f"任务{index} 注册失败，本次耗时{cost:.1f}s，原因: {e}", "red")
-        return {"ok": False, "index": index, "error": str(e)}
+        return {"ok": False, "index": index, "error": str(e), "fatal": isinstance(e, mail_provider.MailConfigurationError)}
     finally:
-        registrar.close()
+        if registrar is not None:
+            registrar.close()

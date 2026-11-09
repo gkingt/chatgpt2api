@@ -14,12 +14,16 @@ from fastapi import HTTPException
 from services.proxy_service import proxy_settings
 from utils.log import logger
 
-BASE_IMAGE_MODELS = {"gpt-image-2", "codex-gpt-image-2"}
+IMAGE_26_MODELS = {"gpt-image-2.6-sunburst", "gpt-image-2.6-flare"}
+WEB_IMAGE_MODELS = {"gpt-image-2"} | IMAGE_26_MODELS
+CODEX_IMAGE_MODELS = {"codex-gpt-image-2"} | {f"codex-{model}" for model in IMAGE_26_MODELS}
+BASE_IMAGE_MODELS = WEB_IMAGE_MODELS | CODEX_IMAGE_MODELS
 IMAGE_MODEL_PLAN_TYPES = ("plus", "team", "pro")
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
 PREFIXED_CODEX_IMAGE_MODELS = {
-    f"{plan_type}-{CODEX_IMAGE_MODEL}"
+    f"{plan_type}-{model}"
     for plan_type in IMAGE_MODEL_PLAN_TYPES
+    for model in CODEX_IMAGE_MODELS
 }
 IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
 PUBLIC_IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
@@ -116,7 +120,7 @@ def split_image_model(model: object) -> tuple[str | None, str | None]:
         prefix = f"{plan_type}-"
         if normalized.startswith(prefix):
             base_model = normalized[len(prefix):]
-            if base_model == CODEX_IMAGE_MODEL:
+            if base_model in CODEX_IMAGE_MODELS:
                 return plan_type, base_model
     return None, None
 
@@ -128,7 +132,7 @@ def is_supported_image_model(model: object) -> bool:
 
 def is_codex_image_model(model: object) -> bool:
     _, base_model = split_image_model(model)
-    return base_model == CODEX_IMAGE_MODEL
+    return base_model in CODEX_IMAGE_MODELS
 
 
 def is_image_chat_request(body: dict[str, object]) -> bool:
@@ -465,5 +469,6 @@ def build_chat_image_markdown_content(image_result: dict[str, object]) -> str:
             continue
         b64_json = str(item.get("b64_json") or "").strip()
         if b64_json:
-            markdown_images.append(f"![image_{index}](data:image/png;base64,{b64_json})")
+            mime = str(item.get("mime_type") or "image/png")
+            markdown_images.append(f"![image_{index}](data:{mime};base64,{b64_json})")
     return "\n\n".join(markdown_images) if markdown_images else "Image generation completed."

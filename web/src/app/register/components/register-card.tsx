@@ -15,6 +15,8 @@ export function RegisterCard() {
   const config = useSettingsStore((state) => state.registerConfig);
   const isLoading = useSettingsStore((state) => state.isLoadingRegister);
   const isSaving = useSettingsStore((state) => state.isSavingRegister);
+  const isStopping = useSettingsStore((state) => state.isStoppingRegister);
+  const isDirty = useSettingsStore((state) => state.isRegisterDirty);
   const setProxy = useSettingsStore((state) => state.setRegisterProxy);
   const setTotal = useSettingsStore((state) => state.setRegisterTotal);
   const setThreads = useSettingsStore((state) => state.setRegisterThreads);
@@ -468,7 +470,7 @@ export function RegisterCard() {
                 <p className="mt-1 text-sm text-stone-500">SSE 实时推送当前状态。</p>
               </div>
               <Badge variant={config.enabled ? "success" : "secondary"} className="rounded-md">
-                {config.enabled ? "运行中" : "已停止"}
+                {config.stats?.stopping ? "停止中" : config.enabled ? "运行中" : "已停止"}
               </Badge>
             </div>
             <div className="grid grid-cols-4 gap-2">
@@ -489,9 +491,9 @@ export function RegisterCard() {
               ))}
             </div>
             <div className="grid grid-cols-3 gap-2">
-              <Button className="h-10 rounded-xl bg-stone-950 px-3 text-white hover:bg-stone-800" onClick={() => void toggle()} disabled={isSaving}>
-                {isSaving ? <LoaderCircle className="size-4 animate-spin" /> : config.enabled ? <Square className="size-4" /> : <Play className="size-4" />}
-                {config.enabled ? "停止" : "启动"}
+              <Button className="h-10 rounded-xl bg-stone-950 px-3 text-white hover:bg-stone-800" onClick={() => void toggle()} disabled={config.enabled ? isStopping : isSaving || stats.stopping || !providers.some((provider) => provider.enable)}>
+                {(config.enabled ? isStopping : isSaving) ? <LoaderCircle className="size-4 animate-spin" /> : config.enabled ? <Square className="size-4" /> : <Play className="size-4" />}
+                {stats.stopping ? "停止中" : config.enabled ? "停止" : "启动"}
               </Button>
               <Button variant="outline" className="h-10 rounded-xl border-stone-200 bg-white px-3 text-stone-700" onClick={() => void reset()} disabled={isSaving || config.enabled}>
                 <RotateCcw className="size-4" />
@@ -504,8 +506,12 @@ export function RegisterCard() {
             </div>
             <div className="flex items-center gap-2 border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
               <AlertTriangle className="size-4 shrink-0" />
-              启动之前注意先保存配置。
+              {isDirty ? "有未保存的修改；启动时会先保存当前配置。" : "启动时自动保存配置；连续失败会退避并保护停止。"}
             </div>
+            {!providers.some((provider) => provider.enable) && !config.enabled ? (
+              <p role="alert" className="text-sm text-rose-600">请先配置并启用至少一个邮箱提供商，当前禁止启动。</p>
+            ) : null}
+            {stats.last_error ? <p role="alert" className="break-words text-sm text-rose-600">{stats.last_error}</p> : null}
         </div>
 
         <div className="mt-4 flex min-h-0 flex-1 flex-col space-y-3 overflow-hidden border-t border-stone-200 pt-4">

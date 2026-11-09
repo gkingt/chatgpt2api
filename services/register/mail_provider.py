@@ -3035,16 +3035,45 @@ def _entries(mail_config: dict) -> list[dict]:
         counters[t] = cnt
         label = f"DDG-{cnt}" if t == "ddg_mail" else f"{t}#{idx}"
         configured_ref = str(item.get("id") or item.get("provider_ref") or "").strip()
-        provider_ref = configured_ref or f"{item['type']}#{idx}"
+        provider_ref = configured_ref or f"{t}#{idx}"
         result.append({**item, "provider_ref": provider_ref, "label": str(item.get("label") or label)})
     return result
+
+
+class MailConfigurationError(ValueError):
+    pass
 
 
 def _enabled_entries(mail_config: dict) -> list[dict]:
     items = [item for item in _entries(mail_config) if item.get("enable")]
     if not items:
-        raise RuntimeError("mail.providers 没有启用的 provider")
+        raise MailConfigurationError("mail.providers 没有启用的 provider，请先配置并启用至少一个邮箱提供商")
     return items
+
+
+def validate_config(mail_config: dict) -> None:
+    if not isinstance(mail_config, dict) or not isinstance(mail_config.get("providers"), list):
+        raise MailConfigurationError("mail.providers 必须是邮箱提供商列表")
+    supported = {
+        "cloudmail_gen", "cloudflare_temp_email", "ddg_mail", "tempmail_lol", "duckmail", "gptmail",
+        "moemail", "inbucket", "yyds_mail", "outlook_token", "mailslurp", "mailosaur", "mailnest",
+        "mail_tm", "mail_gw", "dropmail", "guerrilla_mail", "maildrop", "catchmail", "dustmail",
+        "cleantempmail", "testmail_app", "mailisk", "mailsac", "tempy_email", "qack", "smails", "agentmail",
+    }
+    for entry in _enabled_entries(mail_config):
+        kind = str(entry.get("type") or "")
+        if kind not in supported:
+            raise MailConfigurationError(f"不支持的 mail.provider: {kind}")
+        if kind == "outlook_token" and not _normalize_outlook_pool(entry.get("mailboxes") or entry.get("pool")):
+            raise MailConfigurationError("Outlook 邮箱池为空，请先导入邮箱凭据")
+        required = {
+            "agentmail": ("api_key",), "testmail_app": ("api_key", "namespace"),
+            "mailisk": ("api_key", "namespace"), "dustmail": ("api_key",),
+            "cleantempmail": ("api_key",), "cloudflare_temp_email": ("api_base", "domain"),
+        }.get(kind, ())
+        for key in required:
+            if not entry.get(key):
+                raise MailConfigurationError(f"{kind} 缺少必填配置: {key}")
 
 
 def _next_entry(mail_config: dict) -> dict:

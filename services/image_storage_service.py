@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import time
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -15,10 +16,11 @@ from fastapi import HTTPException
 from PIL import Image
 
 from services.config import DATA_DIR, config
+from utils.image_formats import IMAGE_MIME_TYPES, image_format
 
 IMAGE_INDEX_FILE = DATA_DIR / "image_index.json"
 IMAGE_INDEX_LOCK = Lock()
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"}
 
 
 class ImageStorageError(RuntimeError):
@@ -168,6 +170,9 @@ class ImageStorageService:
     def __init__(self, index_file: Path = IMAGE_INDEX_FILE):
         self.index_file = index_file
         self._index_lock = IMAGE_INDEX_LOCK
+        self._cached_index: dict[str, dict[str, object]] = {}
+        self._index_signature: tuple[int, int] | None = None
+        self._last_local_scan = float("-inf")
 
     def settings(self) -> dict[str, object]:
         return config.get_image_storage_settings()
@@ -176,11 +181,21 @@ class ImageStorageService:
         return _clean(self.settings().get("mode")) or "local"
 
     def _load_index(self) -> dict[str, dict[str, object]]:
+        try:
+            stat = self.index_file.stat()
+            signature = (stat.st_mtime_ns, stat.st_size)
+        except FileNotFoundError:
+            return {}
+        if signature == self._index_signature:
+            return self._cached_index
         raw = _read_json_object(self.index_file)
         items = raw.get("items")
         if not isinstance(items, dict):
             return {}
-        return {str(key): value for key, value in items.items() if isinstance(value, dict)}
+        result = {str(key): value for key, value in items.items() if isinstance(value, dict)}
+        self._cached_index = result
+        self._index_signature = signature
+        return result
 
     def _load_clean_index(self) -> dict[str, dict[str, object]]:
         items = self._load_index()
@@ -188,6 +203,17 @@ class ImageStorageService:
 
     def _save_index(self, items: dict[str, dict[str, object]]) -> None:
         _write_json_object(self.index_file, {"items": items})
+        stat = self.index_file.stat()
+        self._cached_index = deepcopy(items)
+        self._index_signature = (stat.st_mtime_ns, stat.st_size)
+
+    def index_snapshot(self) -> dict[str, dict[str, object]]:
+        with self._index_lock:
+            return deepcopy(self._load_clean_index())
+
+    def _index_item(self, rel: str) -> dict[str, object]:
+        with self._index_lock:
+            return dict(self._load_index().get(rel, {}))
 
     def _public_url(self, rel: str, base_url: str | None = None) -> str:
         settings = self.settings()
@@ -198,28 +224,22 @@ class ImageStorageService:
 
     def make_relative_path(self, image_data: bytes) -> str:
         file_hash = hashlib.md5(image_data).hexdigest()
-        filename = f"{int(time.time())}_{file_hash}.png"
+        extension = image_format(image_data)
+        filename = f"{int(time.time())}_{file_hash}.{extension}"
         relative_dir = Path(time.strftime("%Y"), time.strftime("%m"), time.strftime("%d"))
         return f"{relative_dir.as_posix()}/{filename}"
 
     def save(self, image_data: bytes, base_url: str | None = None) -> StoredImage:
-        config.cleanup_old_images()
         rel = self.make_relative_path(image_data)
         mode = self.mode()
         if mode not in {"local", "webdav", "both"}:
             mode = "local"
-        stored_local = False
+        stored_local = mode in {"local", "both"}
         stored_webdav = False
         remote_url = ""
 
-        if mode in {"local", "both"}:
-            path = _local_image_path(rel)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(image_data)
-            stored_local = True
-
         if mode in {"webdav", "both"}:
-            remote_url = WebDAVClient(self.settings()).put(rel, image_data)
+            remote_url = WebDAVClient(self.settings()).put(rel, image_data, IMAGE_MIME_TYPES[image_format(image_data)])
             stored_webdav = True
 
         dimensions = _image_dimensions(image_data)
@@ -238,6 +258,10 @@ class ImageStorageService:
         if dimensions:
             item["width"], item["height"] = dimensions
         with self._index_lock:
+            if stored_local:
+                path = _local_image_path(rel)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(image_data)
             items = self._load_clean_index()
             items[rel] = item
             self._save_index(items)
@@ -250,7 +274,7 @@ class ImageStorageService:
         path = _local_image_path(safe_rel)
         if path.is_file():
             return path.read_bytes()
-        item = self._load_clean_index().get(safe_rel, {})
+        item = self._index_item(safe_rel)
         if item.get("webdav"):
             return WebDAVClient(self.settings()).get(safe_rel)
         raise HTTPException(status_code=404, detail="image not found")
@@ -261,42 +285,52 @@ class ImageStorageService:
             return False
         if _local_image_path(safe_rel).is_file():
             return True
-        item = self._load_clean_index().get(safe_rel, {})
+        item = self._index_item(safe_rel)
         return bool(item.get("webdav"))
 
     def has_local(self, rel: str) -> bool:
         safe_rel = _safe_relative_path(rel)
         return _is_image_rel(safe_rel) and _local_image_path(safe_rel).is_file()
 
-    def list_items(self, base_url: str, start_date: str = "", end_date: str = "") -> list[dict[str, object]]:
+    def list_items(self, base_url: str, start_date: str = "", end_date: str = "", *, refresh: bool = False) -> list[dict[str, object]]:
         with self._index_lock:
             indexed = self._load_clean_index()
             root = config.images_dir
             changed = False
-            for path in root.rglob("*"):
+            scan_local = refresh or time.monotonic() - self._last_local_scan >= 30
+            for path in root.rglob("*") if scan_local else ():
                 if not path.is_file() or not _is_image_rel(path.name):
                     continue
                 rel = path.relative_to(root).as_posix()
                 if rel in indexed:
                     continue
+                if not path.resolve().is_relative_to(root.resolve()):
+                    continue
+                try:
+                    stat = path.stat()
+                except FileNotFoundError:
+                    continue
                 dimensions = None
                 try:
-                    dimensions = _image_dimensions(path.read_bytes())
+                    with Image.open(path) as image:
+                        dimensions = image.size
                 except Exception:
                     dimensions = None
                 indexed[rel] = {
                     "rel": rel,
                     "path": rel,
                     "name": path.name,
-                    "date": "-".join(rel.split("/")[:3]) if len(rel.split("/")) >= 4 else datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d"),
-                    "size": path.stat().st_size,
-                    "created_at": datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                    "date": "-".join(rel.split("/")[:3]) if len(rel.split("/")) >= 4 else datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d"),
+                    "size": stat.st_size,
+                    "created_at": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
                     "storage": "local",
                     "local": True,
                     "webdav": False,
                     **({"width": dimensions[0], "height": dimensions[1]} if dimensions else {}),
                 }
                 changed = True
+            if scan_local:
+                self._last_local_scan = time.monotonic()
 
             items: list[dict[str, object]] = []
             for rel, item in list(indexed.items()):
@@ -304,18 +338,24 @@ class ImageStorageService:
                     indexed.pop(rel, None)
                     changed = True
                     continue
-                local = _local_image_path(rel).is_file()
+                try:
+                    local_path = _local_image_path(rel)
+                    local_stat = local_path.stat() if local_path.is_file() else None
+                except (FileNotFoundError, HTTPException):
+                    local_stat = None
+                local = local_stat is not None
                 webdav = bool(item.get("webdav"))
                 if not local and not webdav:
                     indexed.pop(rel, None)
                     changed = True
                     continue
                 storage = "both" if local and webdav else ("webdav" if webdav else "local")
-                if item.get("local") != local or item.get("storage") != storage:
+                if item.get("local") != local or item.get("storage") != storage or (local_stat and item.get("size") != local_stat.st_size):
                     item = {
                         **item,
                         "local": local,
                         "storage": storage,
+                        **({"size": local_stat.st_size} if local_stat else {}),
                     }
                     indexed[rel] = item
                     changed = True
@@ -336,24 +376,40 @@ class ImageStorageService:
         return items
 
     def delete(self, rel: str) -> bool:
-        safe_rel = _safe_relative_path(rel)
-        removed = False
-        path = _local_image_path(safe_rel)
-        if path.is_file():
-            path.unlink()
-            removed = True
+        return bool(self.delete_many([rel]))
+
+    def delete_many(self, paths: list[str], *, local_only: bool = False) -> list[str]:
+        targets = list(dict.fromkeys(_safe_relative_path(rel) for rel in paths))
+        if any(not _is_image_rel(rel) for rel in targets):
+            raise HTTPException(status_code=404, detail="image not found")
+        # Validate every path before deleting anything, including symlink escapes.
+        local_paths = {rel: _local_image_path(rel) for rel in targets}
+        removed: list[str] = []
         with self._index_lock:
             items = self._load_clean_index()
-            item = items.get(safe_rel, {})
-            if item.get("webdav"):
-                try:
-                    removed = WebDAVClient(self.settings()).delete(safe_rel) or removed
-                except ImageStorageError:
-                    if not removed:
-                        raise
-            if safe_rel in items:
-                items.pop(safe_rel, None)
-                self._save_index(items)
+            changed = False
+            try:
+                for rel in targets:
+                    path = local_paths[rel]
+                    item = items.get(rel, {})
+                    local = path.is_file()
+                    webdav = bool(item.get("webdav"))
+                    # Delete remote first: a failed WebDAV operation must not lose the local copy or index.
+                    if webdav and not local_only:
+                        WebDAVClient(self.settings()).delete(rel)
+                    if local:
+                        path.unlink()
+                    if local_only and webdav:
+                        items[rel] = {**item, "local": False, "storage": "webdav"}
+                        changed = True
+                    elif rel in items and (not local_only or not webdav):
+                        items.pop(rel)
+                        changed = True
+                    if local or (webdav and not local_only) or (item and not local_only):
+                        removed.append(rel)
+            finally:
+                if changed:
+                    self._save_index(items)
         return removed
 
     def sync_all(self) -> dict[str, int]:
@@ -376,7 +432,7 @@ class ImageStorageService:
                     continue
                 try:
                     payload = path.read_bytes()
-                    remote_url = client.put(rel, payload)
+                    remote_url = client.put(rel, payload, IMAGE_MIME_TYPES[image_format(payload)])
                     dimensions = _image_dimensions(payload)
                     items[rel] = {
                         **item,

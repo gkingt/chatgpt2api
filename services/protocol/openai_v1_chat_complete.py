@@ -5,6 +5,7 @@ import uuid
 from typing import Any, Iterable, Iterator
 
 from fastapi import HTTPException
+from utils.image_formats import normalize_image_options
 
 from services.protocol.chat_completion_cache import cache_key, chat_completion_cache, normalize_text_messages
 from services.protocol.conversation import (
@@ -235,8 +236,11 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
         prompt=prompt,
         model=model,
         n=n,
+        size=body.get("size"),
+        quality=str(body.get("quality") or "auto"),
         response_format="b64_json",
         images=encode_images(images) or None,
+        **normalize_image_options(body, edit=bool(images)),
     )))
     response = completion_response(model, image_result_content(result), int(result.get("created") or 0) or None)
     usage = image_usage(
@@ -254,8 +258,11 @@ def image_chat_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         prompt=prompt,
         model=model,
         n=n,
+        size=body.get("size"),
+        quality=str(body.get("quality") or "auto"),
         response_format="b64_json",
         images=encode_images(images) or None,
+        **normalize_image_options(body, edit=bool(images)),
     ))
     yield from stream_image_chat_completion(image_outputs, model)
 

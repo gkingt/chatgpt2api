@@ -6,9 +6,9 @@ import json
 import os
 import sys
 from pathlib import Path
-import time
 
 from services.storage.base import StorageBackend
+from utils.json_store import file_lock, load_json_config, save_json_config
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
@@ -337,7 +337,10 @@ def _read_json_object(path: Path, *, name: str) -> dict[str, object]:
 
 def _load_settings() -> LoadedSettings:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    raw_config = _read_json_object(CONFIG_FILE, name="config.json")
+    if CONFIG_FILE.is_dir():
+        raw_config = _read_json_object(CONFIG_FILE, name="config.json")
+    else:
+        raw_config, _ = load_json_config(CONFIG_FILE, DATA_DIR / "config.json.bak")
     auth_key = _normalize_auth_key(os.getenv("CHATGPT2API_AUTH_KEY") or raw_config.get("auth-key"))
     if _is_invalid_auth_key(auth_key):
         raise ValueError(
@@ -359,6 +362,8 @@ def _load_settings() -> LoadedSettings:
 class ConfigStore:
     def __init__(self, path: Path):
         self.path = path
+        self.backup_path = DATA_DIR / "config.json.bak" if path == CONFIG_FILE else path.with_name(path.name + ".bak")
+        self._lock = file_lock(path)
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         self.data = self._load()
         self._storage_backend: StorageBackend | None = None
@@ -373,10 +378,15 @@ class ConfigStore:
             )
 
     def _load(self) -> dict[str, object]:
-        return _read_json_object(self.path, name="config.json")
+        if self.path.is_dir():
+            return _read_json_object(self.path, name="config.json")
+        data, recovered = load_json_config(self.path, self.backup_path)
+        if recovered:
+            print(f"Warning: recovered {self.path} from {self.backup_path}; check the original file.", file=sys.stderr)
+        return data
 
     def _save(self) -> None:
-        self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        save_json_config(self.path, self.data, self.backup_path)
 
     @property
     def auth_key(self) -> str:
@@ -399,6 +409,13 @@ class ConfigStore:
             return max(1, int(self.data.get("image_retention_days", 30)))
         except (TypeError, ValueError):
             return 30
+
+    @property
+    def image_min_free_mb(self) -> int:
+        try:
+            return max(0, int(self.data.get("image_min_free_mb", 500)))
+        except (TypeError, ValueError):
+            return 500
 
     @property
     def image_backend_model(self) -> str:
@@ -579,18 +596,9 @@ class ConfigStore:
         return path
 
     def cleanup_old_images(self) -> int:
-        cutoff = time.time() - self.image_retention_days * 86400
-        removed = 0
-        for path in self.images_dir.rglob("*"):
-            if path.is_file() and path.stat().st_mtime < cutoff:
-                path.unlink()
-                removed += 1
-        for path in sorted((p for p in self.images_dir.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
-            try:
-                path.rmdir()
-            except OSError:
-                pass
-        return removed
+        from services.image_service import cleanup_expired_images
+
+        return cleanup_expired_images(self.image_retention_days)
 
     @property
     def base_url(self) -> str:
@@ -662,7 +670,19 @@ class ConfigStore:
         return _normalize_third_party_apps_settings(self.data.get("third_party_apps"))
 
     def update(self, data: dict[str, object]) -> dict[str, object]:
+        with self._lock:
+            previous = self.data
+            try:
+                return self._update(data)
+            except Exception:
+                self.data = previous
+                raise
+
+    def _update(self, data: dict[str, object]) -> dict[str, object]:
         next_data = dict(self.data)
+        if self.path.exists():
+            latest, _ = load_json_config(self.path, self.backup_path)
+            next_data.update(latest)
         next_data.update(dict(data or {}))
         next_data["image_backend_model"] = _normalize_image_backend_model(next_data.get("image_backend_model"))
         next_data["image_backend_model_fallback_enabled"] = _normalize_bool(

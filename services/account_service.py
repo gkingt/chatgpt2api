@@ -256,6 +256,9 @@ class AccountService:
     def _account_matches_source_type(cls, account: dict, source_type: str | None = None) -> bool:
         if not source_type:
             return True
+        # Web credentials can be imported via token, password or OAuth login.
+        if source_type == "chatgpt_web":
+            return cls._normalize_source_type(account.get("source_type")) != "codex"
         return cls._normalize_source_type(account.get("source_type")) == cls._normalize_source_type(source_type)
 
     @classmethod

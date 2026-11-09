@@ -36,7 +36,6 @@ def create_app() -> FastAPI:
         health_thread = start_account_health_watcher(stop_event)
         cleanup_thread = start_image_cleanup_scheduler(stop_event)
         backup_service.start()
-        config.cleanup_old_images()
         try:
             yield
         finally:

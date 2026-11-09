@@ -106,10 +106,14 @@ const docs: ApiDoc[] = [
       ["size", "string", "可选，图片尺寸。"],
       ["quality", "string", "可选，默认 auto。"],
       ["response_format", "string", "可选，默认 b64_json。"],
+      ["output_format", "string", "实验性网页 gpt-image-2.6-sunburst / flare：png 或文生图 gif，帧参数通过提示词请求。Codex 2.6 另可请求 jpeg、webp、svg；上游支持不保证。"],
+      ["frame_count / frame_duration_ms", "number", "仅 GIF：2–16 帧（默认 9）；每帧 20–2000ms（默认 200），取整到 10ms。尺寸为 auto 或 16 的倍数。"],
+      ["complexity", "string", "仅 Codex 2.6 可选 low / medium / high。SVG 仅 Codex 文生图且 n=1；GIF/SVG 不支持流式、部分图片或压缩参数。上游不支持时不降级。"],
     ],
     output: [
       ["data", "array", "图片结果列表。"],
       ["data[].b64_json", "string", "base64 图片内容。"],
+      ["data[].output_format / mime_type", "string", "真实文件格式和 MIME 类型；GIF 保留动画，SVG 为静态矢量。"],
       ["data[].url", "string", "部分配置下返回图片 URL。"],
     ],
     example: (baseUrl: string, key: string) => `curl ${baseUrl}/images/generations \\
@@ -124,6 +128,7 @@ const docs: ApiDoc[] = [
     icon: FileArchive,
     input: [
       ["image", "file | file[] | URL", "参考图，支持 multipart 上传，也支持 JSON 图片链接。"],
+      ["output_format", "string", "实验性 Codex 2.6 可请求 GIF（动画参数同生成接口）；网页链路不支持 GIF 编辑。均不支持 SVG 输出或 SVG 参考图。"],
       ["prompt", "string", "编辑提示词。"],
       ["model", "string", "可选，默认 gpt-image-2。"],
       ["n", "number", "可选，生成数量，当前限制 1-4。"],
@@ -215,7 +220,7 @@ const docs: ApiDoc[] = [
   },
 ];
 
-const usableModels = ["gpt-image-2", "codex-gpt-image-2", "auto", "gpt-5", "gpt-5-1", "gpt-5-2", "gpt-5-3", "gpt-5-3-mini", "gpt-5-mini"];
+const usableModels = ["gpt-image-2", "gpt-image-2.6-sunburst", "gpt-image-2.6-flare", "codex-gpt-image-2", "auto", "gpt-5", "gpt-5-1", "gpt-5-2", "gpt-5-3", "gpt-5-3-mini", "gpt-5-mini"];
 
 function ParamTable({ rows }: { rows: ParamRow[] }) {
   return (
@@ -291,7 +296,7 @@ export function ApiDocsCard() {
         </div>
 
         <div className="space-y-2">
-          <div className="text-xs font-medium text-stone-600">常用模型，也可请求 /v1/models 获取</div>
+          <div className="text-xs font-medium text-stone-600">常用模型，实际可选项以 /v1/models 为准；2.6 为实验适配</div>
           <div className="flex flex-wrap gap-2">
             {usableModels.map((model) => (
               <span key={model} className="rounded-md border border-stone-200 bg-white px-2 py-1 font-mono text-xs text-stone-700">{model}</span>

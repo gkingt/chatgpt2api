@@ -15,6 +15,7 @@ from services.protocol.conversation import (
     stream_image_outputs_with_pool,
 )
 from utils.image_tokens import count_image_inputs_tokens, count_image_output_items_tokens, image_usage
+from utils.image_formats import normalize_image_options
 
 
 def _composite_mask(
@@ -49,6 +50,7 @@ def _composite_mask(
 
 
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
+    options = normalize_image_options(body, edit=True)
     prompt = str(body.get("prompt") or "")
     images = body.get("images") or []
     masks = body.get("mask") or []
@@ -74,6 +76,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         images=encoded_images,
         message_as_error=True,
         progress_callback=progress_callback,
+        **options,
     ))
     if body.get("stream"):
         return stream_image_chunks(outputs)

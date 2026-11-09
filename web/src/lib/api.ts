@@ -312,10 +312,17 @@ export type SystemLog = {
 
 export type ImageResponse = {
   created: number;
-  data: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;
+  data: Array<{ b64_json?: string; url?: string; revised_prompt?: string; mime_type?: string; output_format?: string }>;
 };
 
-export type ImageTask = {
+export type ImageOutputOptions = {
+  output_format?: "png" | "jpeg" | "webp" | "gif" | "svg";
+  frame_count?: number;
+  frame_duration_ms?: number;
+  complexity?: "low" | "medium" | "high";
+};
+
+export type ImageTask = ImageOutputOptions & {
   id: string;
   status: "queued" | "running" | "success" | "error";
   mode: "generate" | "edit";
@@ -325,7 +332,7 @@ export type ImageTask = {
   created_at: string;
   updated_at: string;
   conversation_id?: string;
-  data?: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;
+  data?: ImageResponse["data"];
   error?: string;
   progress?: string;
   elapsed_secs?: number;
@@ -363,6 +370,7 @@ export type OutlookPoolStats = {
 };
 
 export type RegisterConfig = {
+  config_revision?: number;
   enabled: boolean;
   mail: {
     request_timeout: number;
@@ -392,6 +400,9 @@ export type RegisterConfig = {
     started_at?: string;
     updated_at?: string;
     finished_at?: string;
+    last_error?: string;
+    retry_delay_seconds?: number;
+    stopping?: boolean;
   };
   logs?: Array<{
     time: string;
@@ -544,7 +555,7 @@ export async function editImage(files: File | File[], prompt: string, model?: Im
   );
 }
 
-export async function createImageGenerationTask(clientTaskId: string, prompt: string, model?: ImageModel, size?: string, quality = "auto") {
+export async function createImageGenerationTask(clientTaskId: string, prompt: string, model?: ImageModel, size?: string, quality = "auto", options: ImageOutputOptions = {}) {
   return httpRequest<ImageTask>("/api/image-tasks/generations", {
     method: "POST",
     body: {
@@ -553,6 +564,7 @@ export async function createImageGenerationTask(clientTaskId: string, prompt: st
       ...(model ? { model } : {}),
       ...(size ? { size } : {}),
       quality,
+      ...options,
     },
   });
 }
@@ -564,6 +576,7 @@ export async function createImageEditTask(
   model?: ImageModel,
   size?: string,
   quality = "auto",
+  options: ImageOutputOptions = {},
 ) {
   const formData = new FormData();
   const uploadFiles = Array.isArray(files) ? files : [files];
@@ -580,6 +593,7 @@ export async function createImageEditTask(
     formData.append("size", size);
   }
   formData.append("quality", quality);
+  Object.entries(options).forEach(([key, value]) => { if (value !== undefined) formData.append(key, String(value)); });
 
   return httpRequest<ImageTask>("/api/image-tasks/edits", {
     method: "POST",

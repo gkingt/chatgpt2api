@@ -65,6 +65,9 @@ class ImageTasksApiTests(unittest.TestCase):
         self.service_patcher = mock.patch.object(image_tasks_module, "image_task_service", self.fake_service)
         self.service_patcher.start()
         self.addCleanup(self.service_patcher.stop)
+        auth_patcher = mock.patch.object(image_tasks_module, "require_identity", return_value={"id": "test", "role": "admin"})
+        auth_patcher.start()
+        self.addCleanup(auth_patcher.stop)
         app = FastAPI()
         app.include_router(image_tasks_module.create_router())
         self.client = TestClient(app)
@@ -81,6 +84,26 @@ class ImageTasksApiTests(unittest.TestCase):
         self.assertEqual(payload["id"], "task-1")
         self.assertEqual(payload["status"], "success")
         self.assertEqual(len(self.fake_service.generation_calls), 1)
+
+    def test_generation_task_forwards_image26_options(self):
+        response = self.client.post("/api/image-tasks/generations", headers=AUTH_HEADERS, json={
+            "client_task_id": "gif", "prompt": "animate", "model": "codex-gpt-image-2.6-flare",
+            "output_format": "gif", "frame_count": 8, "frame_duration_ms": 300, "complexity": "low",
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        kwargs = self.fake_service.generation_calls[0][1]
+        self.assertEqual(kwargs["frame_count"], 8)
+        self.assertEqual(kwargs["output_format"], "gif")
+        self.assertEqual(kwargs["complexity"], "low")
+
+    def test_multipart_edit_forwards_gif_options_and_rejects_svg_output(self):
+        fields = {"client_task_id": "gif-edit", "prompt": "animate", "model": "codex-gpt-image-2.6-flare", "output_format": "gif", "frame_count": "8", "frame_duration_ms": "205"}
+        response = self.client.post("/api/image-tasks/edits", headers=AUTH_HEADERS, data=fields, files={"image": ("one.png", PNG_BYTES, "image/png")})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.fake_service.edit_calls[0][1]["frame_duration_ms"], 210)
+        fields["output_format"] = "svg"
+        response = self.client.post("/api/image-tasks/edits", headers=AUTH_HEADERS, data=fields, files={"image": ("one.png", PNG_BYTES, "image/png")})
+        self.assertEqual(response.status_code, 400)
 
     def test_create_edit_task_accepts_multiple_images(self):
         """测试图片编辑任务接口支持多个上传图片。"""

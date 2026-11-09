@@ -11,6 +11,7 @@ type LightboxImage = {
   src: string;
   sizeLabel?: string;
   dimensions?: string;
+  filename?: string;
 };
 
 type ImageLightboxProps = {
@@ -186,7 +187,7 @@ export function ImageLightbox({
     if (!current) return;
     const link = document.createElement("a");
     link.href = current.src;
-    link.download = `image-${current.id}.png`;
+    link.download = current.filename || `image-${current.id}.${current.src.match(/\.(gif|svg|webp|jpe?g)(?:[?#]|$)/i)?.[1] || "png"}`;
     link.click();
   }, [current]);
 
